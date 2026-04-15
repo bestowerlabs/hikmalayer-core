@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::HeaderMap,
     response::Json,
     routing::{get, post},
@@ -124,6 +124,58 @@ pub struct BlockchainStats {
     pub latest_hash: String,
     pub finalized_height: u64,
     pub finality_depth: u64,
+}
+
+#[derive(Deserialize, Default)]
+pub struct PaginationQuery {
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct ExplorerOverview {
+    pub total_blocks: usize,
+    pub finalized_height: u64,
+    pub pending_transactions: usize,
+    pub difficulty: usize,
+    pub latest_hash: String,
+    pub peers: usize,
+    pub validators: usize,
+    pub chain_valid: bool,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ExplorerBlockSummary {
+    pub index: u64,
+    pub hash: String,
+    pub previous_hash: String,
+    pub timestamp: String,
+    pub tx_count: usize,
+    pub validator: Option<String>,
+    pub difficulty: usize,
+    pub nonce: u64,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ExplorerBlockDetail {
+    pub block: Block,
+    pub pow_valid: bool,
+}
+
+#[derive(Serialize)]
+pub struct ExplorerBlockListResponse {
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub blocks: Vec<ExplorerBlockSummary>,
+}
+
+#[derive(Serialize)]
+pub struct ExplorerSearchResponse {
+    pub query: String,
+    pub block_by_hash: Option<ExplorerBlockDetail>,
+    pub block_by_index: Option<ExplorerBlockDetail>,
+    pub pending_matches: Vec<Transaction>,
 }
 
 #[derive(Serialize)]
@@ -285,6 +337,13 @@ pub fn api_routes() -> Router<AppState> {
         .route("/validate", get(validate_chain)) // Tutorial compatibility
         // Transaction routes
         .route("/transactions/pending", get(get_pending_transactions))
+        // Explorer routes (structured, pagination and search)
+        .route("/explorer/overview", get(get_explorer_overview))
+        .route("/explorer/blocks", get(get_explorer_blocks))
+        .route("/explorer/blocks/index/{index}", get(get_explorer_block_by_index))
+        .route("/explorer/blocks/hash/{hash}", get(get_explorer_block_by_hash))
+        .route("/explorer/search/{query}", get(search_explorer))
+        .route("/explorer/transactions/pending", get(get_pending_transactions_structured))
         // Staking routes
         .route("/staking/deposit", post(stake_tokens))
         .route("/staking/withdraw", post(withdraw_stake))
@@ -302,6 +361,32 @@ pub fn api_routes() -> Router<AppState> {
         .route("/slashing/evidence", get(list_slash_evidence))
         // Metrics
         .route("/metrics", get(get_metrics))
+}
+
+fn sanitize_pagination(input: PaginationQuery) -> (usize, usize) {
+    let offset = input.offset.unwrap_or(0);
+    let limit = input.limit.unwrap_or(20).clamp(1, 100);
+    (offset, limit)
+}
+
+fn to_block_summary(block: &Block) -> ExplorerBlockSummary {
+    ExplorerBlockSummary {
+        index: block.index,
+        hash: block.hash.clone(),
+        previous_hash: block.previous_hash.clone(),
+        timestamp: block.timestamp.to_rfc3339(),
+        tx_count: block.transactions.len(),
+        validator: block.validator.clone(),
+        difficulty: block.difficulty,
+        nonce: block.nonce,
+    }
+}
+
+fn to_block_detail(block: &Block) -> ExplorerBlockDetail {
+    ExplorerBlockDetail {
+        block: block.clone(),
+        pow_valid: block.has_valid_pow(),
+    }
 }
 
 // ===== CERTIFICATE ENDPOINTS =====
@@ -447,6 +532,126 @@ async fn get_blockchain_stats(State(state): State<AppState>) -> Json<BlockchainS
         latest_hash: chain.latest_hash(),
         finalized_height: chain.finalized_height,
         finality_depth: governance.finality_depth,
+    })
+}
+
+async fn get_explorer_overview(State(state): State<AppState>) -> Json<ExplorerOverview> {
+    let chain = state.chain.lock().await;
+    let pending = state.pending_transactions.lock().await;
+    let peers = state.peers.lock().await;
+    let stakers = state.stakers.lock().await;
+
+    Json(ExplorerOverview {
+        total_blocks: chain.blocks.len(),
+        finalized_height: chain.finalized_height,
+        pending_transactions: pending.len(),
+        difficulty: chain.difficulty,
+        latest_hash: chain.latest_hash(),
+        peers: peers.len(),
+        validators: stakers.len(),
+        chain_valid: chain.is_valid(),
+    })
+}
+
+async fn get_explorer_blocks(
+    State(state): State<AppState>,
+    Query(pagination): Query<PaginationQuery>,
+) -> Json<ExplorerBlockListResponse> {
+    let chain = state.chain.lock().await;
+    let (offset, limit) = sanitize_pagination(pagination);
+    let total = chain.blocks.len();
+    let safe_offset = offset.min(total);
+    let end = (safe_offset + limit).min(total);
+
+    // Return latest blocks first for explorer UX.
+    let mut blocks: Vec<ExplorerBlockSummary> = chain
+        .blocks
+        .iter()
+        .rev()
+        .skip(safe_offset)
+        .take(end.saturating_sub(safe_offset))
+        .map(to_block_summary)
+        .collect();
+
+    blocks.sort_by(|a, b| b.index.cmp(&a.index));
+
+    Json(ExplorerBlockListResponse {
+        total,
+        offset: safe_offset,
+        limit,
+        blocks,
+    })
+}
+
+async fn get_explorer_block_by_index(
+    State(state): State<AppState>,
+    Path(index): Path<usize>,
+) -> Json<Option<ExplorerBlockDetail>> {
+    let chain = state.chain.lock().await;
+    let found = chain.blocks.get(index).map(to_block_detail);
+    Json(found)
+}
+
+async fn get_explorer_block_by_hash(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> Json<Option<ExplorerBlockDetail>> {
+    // Security hardening: limit path length for hash lookup.
+    if hash.len() > 128 || hash.is_empty() {
+        return Json(None);
+    }
+    let chain = state.chain.lock().await;
+    let found = chain.blocks.iter().find(|block| block.hash == hash).map(to_block_detail);
+    Json(found)
+}
+
+async fn search_explorer(
+    State(state): State<AppState>,
+    Path(query): Path<String>,
+) -> Json<ExplorerSearchResponse> {
+    if query.len() > 128 {
+        return Json(ExplorerSearchResponse {
+            query,
+            block_by_hash: None,
+            block_by_index: None,
+            pending_matches: Vec::new(),
+        });
+    }
+
+    let chain = state.chain.lock().await;
+    let pending = state.pending_transactions.lock().await;
+
+    let block_by_hash = chain
+        .blocks
+        .iter()
+        .find(|block| block.hash == query || block.hash.starts_with(&query))
+        .map(to_block_detail);
+
+    let block_by_index = query
+        .parse::<usize>()
+        .ok()
+        .and_then(|index| chain.blocks.get(index))
+        .map(to_block_detail);
+
+    let pending_matches: Vec<Transaction> = pending
+        .iter()
+        .filter(|tx| {
+            tx.id == query
+                || tx.id.starts_with(&query)
+                || tx.to.contains(&query)
+                || tx
+                    .from
+                    .as_ref()
+                    .is_some_and(|value| value.contains(&query))
+        })
+        .cloned()
+        .collect();
+
+    Json(ExplorerSearchResponse {
+        query,
+        block_by_hash,
+        block_by_index,
+        pending_matches,
     })
 }
 
@@ -1337,4 +1542,9 @@ async fn get_pending_transactions(State(state): State<AppState>) -> Json<Vec<Str
     let pending = state.pending_transactions.lock().await;
     let transaction_strings: Vec<String> = pending.iter().map(|tx| format!("{:?}", tx)).collect();
     Json(transaction_strings)
+}
+
+async fn get_pending_transactions_structured(State(state): State<AppState>) -> Json<Vec<Transaction>> {
+    let pending = state.pending_transactions.lock().await;
+    Json(pending.clone())
 }

@@ -82,7 +82,7 @@ Hikmalayer Core is developed in phases:
 - **Phase 2**: PoS validator selection, staking, and validator identities.
 - **Phase 3**: Persistence, P2P gossip, governance, slashing, and async‑safe services.
 - **Phase 4**: Operational hardening, Dockerized multi-node deployment, monitoring, and benchmark validation. (Completed for API execution layer.)
-- **Phase 5 (planned)**: Public testnet with full P2P validator consensus and finalized-state tracking.
+- **Phase 5 (in progress)**: Public testnet with full P2P validator consensus and finalized-state tracking.
 
 
 ## Testing
@@ -235,7 +235,7 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 
 ## Project directory
 ```
-hikmalayer/
+hikmalayer-core/
 ├── bench/
 │   ├── benchmark.py
 │   └── results/

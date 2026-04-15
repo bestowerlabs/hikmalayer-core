@@ -93,6 +93,32 @@ export const getBlockchainStats = async () => {
   return api.get("/blockchain/stats");
 };
 
+// ===== EXPLORER (MODERN) =====
+
+export const getExplorerOverview = async () => {
+  return api.get("/explorer/overview");
+};
+
+export const getExplorerBlocks = async ({ offset = 0, limit = 20 } = {}) => {
+  return api.get("/explorer/blocks", { params: { offset, limit } });
+};
+
+export const getExplorerBlockByIndex = async (index) => {
+  return api.get(`/explorer/blocks/index/${index}`);
+};
+
+export const getExplorerBlockByHash = async (hash) => {
+  return api.get(`/explorer/blocks/hash/${encodeURIComponent(hash)}`);
+};
+
+export const searchExplorer = async (query) => {
+  return api.get(`/explorer/search/${encodeURIComponent(query)}`);
+};
+
+export const getPendingTransactionsStructured = async () => {
+  return api.get("/explorer/transactions/pending");
+};
+
 // ===== MINING OPERATIONS =====
 
 export const mineBlock = async () => {

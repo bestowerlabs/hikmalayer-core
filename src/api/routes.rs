@@ -75,7 +75,6 @@ pub struct StakeRequest {
     pub address: String,
     pub amount: u64,
     pub public_key: Option<String>,
-    pub private_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -296,8 +295,10 @@ async fn gossip_blocks(state: &AppState, blocks: Vec<Block>) -> Result<(), Strin
 }
 
 fn authorize_p2p(headers: &HeaderMap, state: &AppState) -> bool {
-    let Some(token) = state.p2p_token.as_ref() else {
-        return true;
+    // if no token configured, deny all requests
+    let token = match state.p2p_token.as_ref() {
+        Some(t) if !t.is_empty() => t,
+        _ => return false, // no token set = deny
     };
     headers
         .get("x-p2p-token")
@@ -306,8 +307,9 @@ fn authorize_p2p(headers: &HeaderMap, state: &AppState) -> bool {
 }
 
 fn authorize_admin(headers: &HeaderMap, state: &AppState) -> bool {
-    let Some(token) = state.admin_token.as_ref() else {
-        return true;
+    let token = match state.admin_token.as_ref() {
+        Some(t) if !t.is_empty() => t,
+        _ => return false, // no token set = deny
     };
     headers
         .get("x-admin-token")
@@ -728,14 +730,11 @@ async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
     let private_key = match &staker_entry.private_key {
         Some(value) => value.clone(),
         None => {
-            drop(chain);
-            drop(pending);
-            drop(stakers);
-            return Json(MiningResponse {
-                status: "error".to_string(),
-                message: "Validator missing private key".to_string(),
-                block_index: 0,
-                transactions_count: 0,
+        return Json(MiningResponse {
+            status: "error".to_string(),
+            message: "Validator missing private key — server no longer holds private keys. Submit pre-signed blocks via /p2p/block.".to_string(),
+            block_index: 0,
+            transactions_count: 0,
             });
         }
     };
@@ -870,7 +869,17 @@ async fn stake_tokens(
             total_stake: 0,
         });
     }
+    if payload.public_key.is_none() {
+        return Json(StakeResponse {
+            status: "error".to_string(),
+            message: "Validator registration requires a public_key. \
+                      Private keys must never be sent to the server, \
+                      sign blocks locally and submit pre-signed proposals."
+                .to_string(),
+            total_stake: 0,
 
+        });
+    }
     let mut token = state.token.lock().await;
     let transfer_success = token.transfer(&payload.address, STAKING_POOL_ACCOUNT, payload.amount);
     drop(token);
@@ -890,11 +899,9 @@ async fn stake_tokens(
     for staker in stakers.iter_mut() {
         if staker.address == payload.address {
             staker.stake += payload.amount;
+            // HM-01: only update public key, never accept private key
             if payload.public_key.is_some() {
                 staker.public_key = payload.public_key.clone();
-            }
-            if payload.private_key.is_some() {
-                staker.private_key = payload.private_key.clone();
             }
             found = true;
         }
@@ -902,10 +909,14 @@ async fn stake_tokens(
     }
 
     if !found {
-        if payload.public_key.is_none() || payload.private_key.is_none() {
+        // new validator registration requires public key only
+        if payload.public_key.is_none() {
             return Json(StakeResponse {
                 status: "error".to_string(),
-                message: "Validator registration requires public_key and private_key".to_string(),
+                message: "Validator registration requires a public_key. \
+                          Private keys must never be sent to the server \
+                          sign blocks locally and submit pre-signed proposals."
+                    .to_string(),
                 total_stake,
             });
         }
@@ -913,11 +924,12 @@ async fn stake_tokens(
             address: payload.address.clone(),
             stake: payload.amount,
             public_key: payload.public_key.clone(),
-            private_key: payload.private_key.clone(),
+            private_key: None, // HM-01: server never stores private keys
         });
         total_stake += payload.amount;
     }
 
+    drop(stakers);
     let _ = persist_state(&state).await;
 
     Json(StakeResponse {

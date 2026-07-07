@@ -2,13 +2,15 @@ use rand::Rng;
 use secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sha3::Keccak256;
 
+/// A registered validator. The server never stores or accepts private keys
+/// (HM-01): validators sign block proposals and account operations locally.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Staker {
     pub address: String,
     pub stake: u64,
     pub public_key: Option<String>,
-    pub private_key: Option<String>,
 }
 
 const SLASH_PERCENT: u64 = 10;
@@ -23,6 +25,13 @@ pub fn staker_set_hash(stakers: &[Staker]) -> String {
         }
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// Deterministic seed for validator selection at a given height. Salting the
+/// parent hash with the height means the same parent hash can never be reused
+/// to claim a different slot.
+pub fn selection_seed(previous_hash: &str, block_index: u64) -> String {
+    format!("{}:{}", previous_hash, block_index)
 }
 
 fn seed_to_u64(seed: &str) -> u64 {
@@ -66,9 +75,28 @@ pub fn select_staker(stakers: &[Staker]) -> Option<String> {
     select_staker_with_seed(&seed, stakers)
 }
 
-pub fn sign_block_hash(block_hash: &str, private_key_hex: &str) -> Result<String, String> {
-    let hash_bytes = hex::decode(block_hash).map_err(|err| err.to_string())?;
-    let message = Message::from_digest_slice(&hash_bytes).map_err(|err| err.to_string())?;
+/// Derive the canonical 0x-prefixed account address from a secp256k1 public
+/// key (Keccak-256 of the uncompressed key body, last 20 bytes — the same
+/// scheme the wallet auth flow uses).
+pub fn derive_address(public_key_hex: &str) -> Result<String, String> {
+    let public_key_bytes = hex::decode(public_key_hex).map_err(|err| err.to_string())?;
+    let public_key = PublicKey::from_slice(&public_key_bytes).map_err(|err| err.to_string())?;
+    let uncompressed = public_key.serialize_uncompressed();
+    let hash = Keccak256::digest(&uncompressed[1..]);
+    Ok(format!("0x{}", hex::encode(&hash[12..])))
+}
+
+/// Derive the uncompressed public key (hex) for a private key.
+pub fn derive_public_key(private_key_hex: &str) -> Result<String, String> {
+    let secret_key_bytes = hex::decode(private_key_hex).map_err(|err| err.to_string())?;
+    let secret_key = SecretKey::from_slice(&secret_key_bytes).map_err(|err| err.to_string())?;
+    let secp = Secp256k1::new();
+    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+    Ok(hex::encode(public_key.serialize_uncompressed()))
+}
+
+fn sign_digest(digest: &[u8], private_key_hex: &str) -> Result<String, String> {
+    let message = Message::from_digest_slice(digest).map_err(|err| err.to_string())?;
     let secret_key_bytes = hex::decode(private_key_hex).map_err(|err| err.to_string())?;
     let secret_key = SecretKey::from_slice(&secret_key_bytes).map_err(|err| err.to_string())?;
     let secp = Secp256k1::new();
@@ -76,12 +104,8 @@ pub fn sign_block_hash(block_hash: &str, private_key_hex: &str) -> Result<String
     Ok(hex::encode(signature.serialize_compact()))
 }
 
-pub fn verify_block_signature(block_hash: &str, public_key_hex: &str, signature_hex: &str) -> bool {
-    let hash_bytes = match hex::decode(block_hash) {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
-    };
-    let message = match Message::from_digest_slice(&hash_bytes) {
+fn verify_digest(digest: &[u8], public_key_hex: &str, signature_hex: &str) -> bool {
+    let message = match Message::from_digest_slice(digest) {
         Ok(msg) => msg,
         Err(_) => return false,
     };
@@ -105,6 +129,33 @@ pub fn verify_block_signature(block_hash: &str, public_key_hex: &str, signature_
     secp.verify_ecdsa(&message, &signature, &public_key).is_ok()
 }
 
+/// Sign a 32-byte block hash (hex) with a validator private key. Used by
+/// validator tooling only — the node itself never handles foreign keys.
+pub fn sign_block_hash(block_hash: &str, private_key_hex: &str) -> Result<String, String> {
+    let hash_bytes = hex::decode(block_hash).map_err(|err| err.to_string())?;
+    sign_digest(&hash_bytes, private_key_hex)
+}
+
+pub fn verify_block_signature(block_hash: &str, public_key_hex: &str, signature_hex: &str) -> bool {
+    let hash_bytes = match hex::decode(block_hash) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    verify_digest(&hash_bytes, public_key_hex, signature_hex)
+}
+
+/// Sign an arbitrary UTF-8 message (SHA-256 digest) — used for transfer,
+/// stake, and withdraw authorizations.
+pub fn sign_message(message: &str, private_key_hex: &str) -> Result<String, String> {
+    let digest = Sha256::digest(message.as_bytes());
+    sign_digest(&digest, private_key_hex)
+}
+
+pub fn verify_message(message: &str, public_key_hex: &str, signature_hex: &str) -> bool {
+    let digest = Sha256::digest(message.as_bytes());
+    verify_digest(&digest, public_key_hex, signature_hex)
+}
+
 pub fn slash_staker(stakers: &mut Vec<Staker>, address: &str) -> u64 {
     slash_staker_with_percent(stakers, address, SLASH_PERCENT)
 }
@@ -124,6 +175,12 @@ pub fn slash_staker_with_percent(stakers: &mut Vec<Staker>, address: &str, perce
 mod tests {
     use super::*;
 
+    fn test_keys() -> (String, String) {
+        let private_key = hex::encode([7u8; 32]);
+        let public_key = derive_public_key(&private_key).unwrap();
+        (public_key, private_key)
+    }
+
     #[test]
     fn test_select_staker() {
         let stakers = vec![
@@ -131,17 +188,69 @@ mod tests {
                 address: "Alice".to_string(),
                 stake: 100,
                 public_key: None,
-                private_key: None,
             },
             Staker {
                 address: "Bob".to_string(),
                 stake: 50,
                 public_key: None,
-                private_key: None,
             },
         ];
 
         let winner = select_staker_with_seed("seed", &stakers);
         assert!(winner.is_some());
+    }
+
+    #[test]
+    fn selection_is_deterministic_and_height_salted() {
+        let stakers = vec![
+            Staker {
+                address: "Alice".to_string(),
+                stake: 100,
+                public_key: None,
+            },
+            Staker {
+                address: "Bob".to_string(),
+                stake: 100,
+                public_key: None,
+            },
+        ];
+
+        let seed_a = selection_seed("parent-hash", 5);
+        let seed_b = selection_seed("parent-hash", 6);
+        assert_ne!(seed_a, seed_b);
+        assert_eq!(
+            select_staker_with_seed(&seed_a, &stakers),
+            select_staker_with_seed(&seed_a, &stakers)
+        );
+    }
+
+    #[test]
+    fn message_signatures_roundtrip() {
+        let (public_key, private_key) = test_keys();
+        let message = "hikmalayer-transfer:0xabc:0xdef:10:1";
+        let signature = sign_message(message, &private_key).unwrap();
+        assert!(verify_message(message, &public_key, &signature));
+        assert!(!verify_message("tampered", &public_key, &signature));
+    }
+
+    #[test]
+    fn derive_address_is_stable() {
+        let (public_key, _) = test_keys();
+        let address = derive_address(&public_key).unwrap();
+        assert!(address.starts_with("0x"));
+        assert_eq!(address.len(), 42);
+        assert_eq!(address, derive_address(&public_key).unwrap());
+    }
+
+    #[test]
+    fn slash_reduces_stake() {
+        let mut stakers = vec![Staker {
+            address: "Alice".to_string(),
+            stake: 100,
+            public_key: None,
+        }];
+        let slashed = slash_staker_with_percent(&mut stakers, "Alice", 25);
+        assert_eq!(slashed, 25);
+        assert_eq!(stakers[0].stake, 75);
     }
 }

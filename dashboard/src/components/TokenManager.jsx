@@ -74,13 +74,38 @@ const TokenManager = ({ refreshTrigger, onTokenTransfer }) => {
       return;
     }
 
+    if (transferData.from.toLowerCase() !== (account || "").toLowerCase()) {
+      setMessage("Transfers must be sent from your connected wallet address");
+      return;
+    }
+
     setLoading(true);
     setMessage("Transferring tokens...");
 
     try {
+      // Fetch the account's next nonce, then sign the canonical transfer
+      // message with the connected wallet (personal_sign). The node verifies
+      // the signature and rejects replays.
+      const nonceResponse = await fetch(
+        `${API_BASE}/tokens/nonce/${transferData.from}`
+      );
+      const { next_nonce } = await nonceResponse.json();
+
+      const signingMessage = `hikmalayer-transfer:${transferData.from}:${transferData.to}:${transferData.amount}:${next_nonce}`;
+      setMessage("Please sign the transfer in your wallet...");
+      const signature = await window.ethereum.request({
+        method: "personal_sign",
+        params: [signingMessage, account],
+      });
+
+      setMessage("Submitting signed transfer...");
       const response = await authenticatedFetch("/tokens/transfer", {
         method: "POST",
-        body: JSON.stringify(transferData),
+        body: JSON.stringify({
+          ...transferData,
+          nonce: next_nonce,
+          signature,
+        }),
       });
 
       const result = await response.json();

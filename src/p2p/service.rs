@@ -3,7 +3,7 @@ use std::time::Duration;
 use reqwest::Client;
 
 use crate::{
-    blockchain::block::Block,
+    blockchain::{block::Block, chain::Blockchain},
     p2p::protocol::{P2PEnvelope, P2PPayload},
 };
 
@@ -67,6 +67,22 @@ impl P2PService {
         }
 
         false
+    }
+
+    /// Fetch a peer's full chain for fork-choice evaluation.
+    pub async fn fetch_chain(&self, peer: &str) -> Option<Blockchain> {
+        let url = format!("{}/p2p/chain", peer.trim_end_matches('/'));
+        let mut request = self.client.get(url);
+
+        if let Some(token) = &self.p2p_token {
+            request = request.header("x-p2p-token", token);
+        }
+
+        let response = request.send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json::<Blockchain>().await.ok()
     }
 
     async fn send_once(&self, peer: &str, envelope: &P2PEnvelope) -> bool {

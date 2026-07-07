@@ -1,11 +1,12 @@
 use axum::{
     extract::{Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -14,13 +15,16 @@ use crate::{
     blockchain::{
         block::Block,
         chain::Blockchain,
-        transaction::{Transaction, TransactionType},
+        transaction::{Transaction, TransactionType, BLOCK_REWARD},
     },
-    consensus::pos::{self, Staker},
+    consensus::{
+        pos::{self, Staker},
+        pow,
+    },
     contract::contract::ContractExecutor,
     governance::GovernanceConfig,
     p2p::{
-        protocol::{P2PEnvelope, P2PPayload},
+        protocol::{P2PEnvelope, P2PPayload, SeenMessageCache},
         service::P2PService,
     },
     persistence::{save_state, AppSnapshot},
@@ -28,6 +32,27 @@ use crate::{
 };
 
 const STAKING_POOL_ACCOUNT: &str = "__staking_pool__";
+
+/// This node's own validator identity, loaded from the local environment.
+/// The key never leaves the node and is never accepted over the network.
+#[derive(Clone)]
+pub struct LocalValidatorKey {
+    pub address: String,
+    pub public_key: String,
+    pub private_key: String,
+}
+
+impl LocalValidatorKey {
+    pub fn from_private_key(private_key_hex: &str) -> Result<Self, String> {
+        let public_key = pos::derive_public_key(private_key_hex)?;
+        let address = pos::derive_address(&public_key)?;
+        Ok(Self {
+            address,
+            public_key,
+            private_key: private_key_hex.to_string(),
+        })
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -41,9 +66,12 @@ pub struct AppState {
     pub governance: Arc<Mutex<GovernanceConfig>>,
     pub slash_evidence: Arc<Mutex<Vec<crate::persistence::SlashEvidence>>>,
     pub metrics: Arc<Mutex<Metrics>>,
+    pub nonces: Arc<Mutex<HashMap<String, u64>>>,
+    pub seen_messages: Arc<Mutex<SeenMessageCache>>,
     pub p2p_token: Option<String>,
     pub admin_token: Option<String>,
     pub p2p_service: Arc<P2PService>,
+    pub validator_key: Option<LocalValidatorKey>,
 }
 
 #[derive(Deserialize)]
@@ -63,6 +91,16 @@ pub struct TokenTransferRequest {
     pub from: String,
     pub to: String,
     pub amount: u64,
+    #[serde(default)]
+    pub nonce: u64,
+    pub public_key: Option<String>,
+    pub signature: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct FaucetRequest {
+    pub to: String,
+    pub amount: u64,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +113,9 @@ pub struct StakeRequest {
     pub address: String,
     pub amount: u64,
     pub public_key: Option<String>,
+    #[serde(default)]
+    pub nonce: u64,
+    pub signature: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +153,15 @@ pub struct MiningResponse {
     pub message: String,
     pub block_index: u64,
     pub transactions_count: usize,
+}
+
+#[derive(Serialize)]
+pub struct ProposeBlockResponse {
+    pub status: String,
+    pub message: String,
+    pub selected_validator: Option<String>,
+    pub block: Option<Block>,
+    pub block_hash: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -227,6 +277,8 @@ pub struct SlashEvidenceResponse {
 pub struct Metrics {
     pub blocks_mined: u64,
     pub blocks_received: u64,
+    pub blocks_rejected: u64,
+    pub reorgs: u64,
     pub peers_registered: u64,
     pub slashes_submitted: u64,
     pub gossip_sent: u64,
@@ -244,26 +296,18 @@ async fn persist_state(state: &AppState) -> Result<(), String> {
     let peers = state.peers.lock().await;
     let governance = state.governance.lock().await;
     let slash_evidence = state.slash_evidence.lock().await;
-
-    let stakers_snapshot: Vec<Staker> = stakers
-        .iter()
-        .map(|staker| Staker {
-            address: staker.address.clone(),
-            stake: staker.stake,
-            public_key: staker.public_key.clone(),
-            private_key: None,
-        })
-        .collect();
+    let nonces = state.nonces.lock().await;
 
     let snapshot = AppSnapshot {
         chain: chain.clone(),
         token: token.clone(),
         contracts: contracts.clone(),
         pending_transactions: pending.clone(),
-        stakers: stakers_snapshot,
+        stakers: stakers.clone(),
         peers: peers.clone(),
         governance: governance.clone(),
         slash_evidence: slash_evidence.clone(),
+        nonces: nonces.clone(),
     };
 
     save_state(&snapshot).map_err(|err| format!("Failed to save state: {}", err))
@@ -317,20 +361,40 @@ fn authorize_admin(headers: &HeaderMap, state: &AppState) -> bool {
         .is_some_and(|value| value == token)
 }
 
+/// Consume a per-account nonce. The nonce must be exactly the last used
+/// nonce + 1, which makes every signed operation single-use.
+async fn consume_nonce(state: &AppState, account: &str, nonce: u64) -> Result<(), String> {
+    let mut nonces = state.nonces.lock().await;
+    let expected = nonces.get(account).copied().unwrap_or(0) + 1;
+    if nonce != expected {
+        return Err(format!(
+            "Invalid nonce for {}: expected {}, got {}",
+            account, expected, nonce
+        ));
+    }
+    nonces.insert(account.to_string(), nonce);
+    Ok(())
+}
+
 pub fn api_routes() -> Router<AppState> {
     Router::new()
         // Certificate routes
         .route("/certificates/issue", post(issue_certificate))
         .route("/certificates/verify", post(verify_certificate))
+        .route("/certificates/attest", post(attest_certificate))
         // Token routes
         .route("/tokens/transfer", post(transfer_tokens))
+        .route("/tokens/faucet", post(faucet_tokens))
         .route("/tokens/balance/{account}", get(get_token_balance))
+        .route("/tokens/nonce/{account}", get(get_account_nonce))
         // Blockchain routes
         .route("/blocks", get(get_blocks))
         .route("/blocks/{index}", get(get_block_by_index))
         .route("/blockchain/stats", get(get_blockchain_stats))
         // Mining routes
         .route("/mine", post(mine_block))
+        .route("/mine/propose", post(propose_block))
+        .route("/mine/submit", post(submit_block))
         .route("/mining/difficulty", get(get_mining_difficulty))
         .route("/mining/difficulty", post(set_mining_difficulty))
         // Validation routes
@@ -355,6 +419,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/p2p/peers/register", post(register_peer))
         .route("/p2p/block", post(receive_block))
         .route("/p2p/blocks", post(receive_blocks))
+        .route("/p2p/chain", get(get_p2p_chain))
         .route("/p2p/protocol", post(receive_protocol_message))
         // Governance & slashing routes
         .route("/governance/config", get(get_governance))
@@ -395,14 +460,22 @@ fn to_block_detail(block: &Block) -> ExplorerBlockDetail {
 
 async fn issue_certificate(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<CertificateRequest>,
 ) -> Json<ApiResponse> {
+    if !authorize_admin(&headers, &state) {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: "Unauthorized: certificate issuance requires the admin token".to_string(),
+        });
+    }
+
     // Update contract state
     let mut contracts = state.contracts.lock().await;
     contracts.issue_certificate(&payload.id, &payload.issued_to, &payload.description);
     drop(contracts);
 
-    // Create blockchain transaction
+    // Create blockchain transaction anchoring the issuance
     let transaction = Transaction::new(
         None, // No sender for certificate issuance
         payload.issued_to.clone(),
@@ -426,21 +499,53 @@ async fn issue_certificate(
     })
 }
 
+/// Read-only certificate lookup: reports whether the certificate exists and
+/// whether it has been attested. Does not mutate state.
 async fn verify_certificate(
     State(state): State<AppState>,
     Json(payload): Json<VerifyCertificateRequest>,
 ) -> Json<ApiResponse> {
+    let contracts = state.contracts.lock().await;
+    match contracts.certificates.get(&payload.id) {
+        Some(cert) => Json(ApiResponse {
+            status: "success".to_string(),
+            message: format!(
+                "Certificate {} issued to {} (attested: {})",
+                cert.id, cert.issued_to, cert.verified
+            ),
+        }),
+        None => Json(ApiResponse {
+            status: "error".to_string(),
+            message: format!("Certificate {} not found", payload.id),
+        }),
+    }
+}
+
+/// Admin-gated attestation: marks a certificate as verified.
+async fn attest_certificate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<VerifyCertificateRequest>,
+) -> Json<ApiResponse> {
+    if !authorize_admin(&headers, &state) {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: "Unauthorized: certificate attestation requires the admin token".to_string(),
+        });
+    }
+
     let mut contracts = state.contracts.lock().await;
     let success = contracts.verify_certificate(&payload.id);
+    drop(contracts);
 
     let _ = persist_state(&state).await;
 
     Json(ApiResponse {
         status: if success { "success" } else { "error" }.to_string(),
         message: if success {
-            format!("Certificate {} verified", payload.id)
+            format!("Certificate {} attested", payload.id)
         } else {
-            format!("Failed to verify certificate {}", payload.id)
+            format!("Certificate {} not found", payload.id)
         },
     })
 }
@@ -451,21 +556,79 @@ async fn transfer_tokens(
     State(state): State<AppState>,
     Json(payload): Json<TokenTransferRequest>,
 ) -> Json<ApiResponse> {
-    // Update token balances
+    if payload.amount == 0 {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: "Transfer amount must be greater than zero".to_string(),
+        });
+    }
+    if payload.to.trim().is_empty() {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: "Transfer recipient cannot be empty".to_string(),
+        });
+    }
+
+    // Every transfer must be authorized by the sender's key — either a raw
+    // secp256k1 signature (hikma-wallet) or an Ethereum personal_sign
+    // signature (MetaMask).
+    let signature = match &payload.signature {
+        Some(value) => value.clone(),
+        None => {
+            return Json(ApiResponse {
+                status: "error".to_string(),
+                message: "Transfer requires a signature and nonce (plus public_key for \
+                          raw secp256k1 signatures)"
+                    .to_string(),
+            });
+        }
+    };
+
+    let message = Transaction::transfer_signing_message(
+        &payload.from,
+        &payload.to,
+        payload.amount,
+        payload.nonce,
+    );
+    if !crate::blockchain::transaction::verify_transfer_signature(
+        &payload.from,
+        &message,
+        payload.public_key.as_deref(),
+        &signature,
+    ) {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: "Transfer signature verification failed (sender must match the signing key)"
+                .to_string(),
+        });
+    }
+
+    // Consume the nonce before executing so a replayed request can never
+    // execute twice.
+    if let Err(err) = consume_nonce(&state, &payload.from, payload.nonce).await {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: err,
+        });
+    }
+
+    // Execute the balance change
     let mut token = state.token.lock().await;
     let success = token.transfer(&payload.from, &payload.to, payload.amount);
     drop(token);
 
     if success {
-        // Create blockchain transaction
-        let transaction = Transaction::new(
+        // Anchor the signed transfer on-chain
+        let mut transaction = Transaction::new(
             Some(payload.from.clone()),
             payload.to.clone(),
             payload.amount,
             TransactionType::Transfer,
         );
+        transaction.nonce = payload.nonce;
+        transaction.public_key = payload.public_key.clone();
+        transaction.signature = Some(signature);
 
-        // Add to pending transactions
         let mut pending = state.pending_transactions.lock().await;
         pending.push(transaction);
         drop(pending);
@@ -483,11 +646,42 @@ async fn transfer_tokens(
         Json(ApiResponse {
             status: "error".to_string(),
             message: format!(
-                "Failed to transfer tokens from {} to {}",
+                "Failed to transfer tokens from {} to {} (insufficient balance)",
                 payload.from, payload.to
             ),
         })
     }
+}
+
+/// Admin-gated faucet for funding accounts on dev/test networks.
+async fn faucet_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<FaucetRequest>,
+) -> Json<ApiResponse> {
+    if !authorize_admin(&headers, &state) {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: "Unauthorized: faucet requires the admin token".to_string(),
+        });
+    }
+    if payload.amount == 0 || payload.to.trim().is_empty() {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: "Faucet requires a recipient and a non-zero amount".to_string(),
+        });
+    }
+
+    let mut token = state.token.lock().await;
+    token.mint(&payload.to, payload.amount);
+    drop(token);
+
+    let _ = persist_state(&state).await;
+
+    Json(ApiResponse {
+        status: "success".to_string(),
+        message: format!("Minted {} tokens to {}", payload.amount, payload.to),
+    })
 }
 
 async fn get_token_balance(
@@ -498,6 +692,24 @@ async fn get_token_balance(
     let balance = token.balance_of(&account);
 
     Json(BalanceResponse { account, balance })
+}
+
+#[derive(Serialize)]
+pub struct NonceStateResponse {
+    pub account: String,
+    pub next_nonce: u64,
+}
+
+async fn get_account_nonce(
+    State(state): State<AppState>,
+    Path(account): Path<String>,
+) -> Json<NonceStateResponse> {
+    let nonces = state.nonces.lock().await;
+    let next_nonce = nonces.get(&account).copied().unwrap_or(0) + 1;
+    Json(NonceStateResponse {
+        account,
+        next_nonce,
+    })
 }
 
 // ===== BLOCKCHAIN ENDPOINTS =====
@@ -659,128 +871,225 @@ async fn search_explorer(
 
 // ===== MINING ENDPOINTS =====
 
+/// Everything needed to build the next block for the PoS-selected validator.
+struct BlockPlan {
+    validator: String,
+    public_key: String,
+    staker_snapshot: Vec<Staker>,
+    staker_set_hash: String,
+    transactions: Vec<String>,
+    included_ids: Vec<String>,
+}
+
+/// Select the validator for the next slot and assemble the block payload
+/// (pending transactions plus the validator's reward transaction).
+fn plan_block(
+    chain: &Blockchain,
+    stakers: &[Staker],
+    pending: &[Transaction],
+) -> Result<BlockPlan, String> {
+    let has_only_genesis = chain.blocks.len() == 1;
+    if pending.is_empty() && !has_only_genesis {
+        return Err("No pending transactions to mine".to_string());
+    }
+
+    let next_index = chain.blocks.len() as u64;
+    let seed = pos::selection_seed(&chain.latest_hash(), next_index);
+    let validator = pos::select_staker_with_seed(&seed, stakers)
+        .ok_or_else(|| "No validators available. Stake tokens to become a validator.".to_string())?;
+
+    let staker_entry = stakers
+        .iter()
+        .find(|staker| staker.address == validator)
+        .ok_or_else(|| "Selected validator not registered".to_string())?;
+    let public_key = staker_entry
+        .public_key
+        .clone()
+        .ok_or_else(|| "Validator missing public key".to_string())?;
+
+    let staker_snapshot: Vec<Staker> = stakers.to_vec();
+    let staker_set_hash = pos::staker_set_hash(&staker_snapshot);
+
+    let mut transactions = Vec::with_capacity(pending.len() + 1);
+    let mut included_ids = Vec::with_capacity(pending.len());
+    for tx in pending {
+        let serialized = serde_json::to_string(tx)
+            .map_err(|err| format!("Failed to serialize transaction: {}", err))?;
+        transactions.push(serialized);
+        included_ids.push(tx.id.clone());
+    }
+    let reward = Transaction::new_reward(&validator);
+    transactions.push(
+        serde_json::to_string(&reward)
+            .map_err(|err| format!("Failed to serialize reward transaction: {}", err))?,
+    );
+
+    Ok(BlockPlan {
+        validator,
+        public_key,
+        staker_snapshot,
+        staker_set_hash,
+        transactions,
+        included_ids,
+    })
+}
+
+/// Apply local side effects of newly accepted blocks: mint the validator
+/// reward and drop any pending transactions that are now on-chain.
+async fn apply_accepted_blocks(state: &AppState, blocks: &[Block]) {
+    let mut token = state.token.lock().await;
+    for block in blocks {
+        if let Some(validator) = &block.validator {
+            token.mint(validator, BLOCK_REWARD);
+        }
+    }
+    drop(token);
+
+    let included_ids: HashSet<String> = blocks
+        .iter()
+        .flat_map(|block| block.transactions.iter())
+        .filter_map(|tx_str| serde_json::from_str::<Transaction>(tx_str).ok())
+        .map(|tx| tx.id)
+        .collect();
+
+    if !included_ids.is_empty() {
+        let mut pending = state.pending_transactions.lock().await;
+        pending.retain(|tx| !included_ids.contains(&tx.id));
+    }
+}
+
+/// Sync with peers after observing a block that does not extend our tip:
+/// fetch their chains and adopt the heaviest valid one (fork choice).
+async fn sync_with_peers(state: AppState) {
+    let peers = {
+        let peers = state.peers.lock().await;
+        peers.clone()
+    };
+    if peers.is_empty() {
+        return;
+    }
+
+    let finality_depth = {
+        let governance = state.governance.lock().await;
+        governance.finality_depth
+    };
+
+    for peer in peers {
+        let Some(remote_chain) = state.p2p_service.fetch_chain(&peer).await else {
+            continue;
+        };
+
+        let adopted = {
+            let mut chain = state.chain.lock().await;
+            match chain.try_adopt_chain(&remote_chain) {
+                Ok(true) => {
+                    chain.apply_finality(finality_depth);
+                    true
+                }
+                _ => false,
+            }
+        };
+
+        if adopted {
+            let mut metrics = state.metrics.lock().await;
+            metrics.reorgs += 1;
+            drop(metrics);
+            let _ = persist_state(&state).await;
+        }
+    }
+}
+
+/// Mine and sign a block with this node's own validator key. Only succeeds
+/// when PoS selected this node's validator for the next slot.
 async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
     let finality_depth = {
         let governance = state.governance.lock().await;
         governance.finality_depth
     };
+
+    let validator_key = match &state.validator_key {
+        Some(key) => key.clone(),
+        None => {
+            return Json(MiningResponse {
+                status: "error".to_string(),
+                message: "This node has no validator key (set VALIDATOR_PRIVATE_KEY). \
+                          External validators can use POST /mine/propose and /mine/submit."
+                    .to_string(),
+                block_index: 0,
+                transactions_count: 0,
+            });
+        }
+    };
+
     let mut pending = state.pending_transactions.lock().await;
     let mut chain = state.chain.lock().await;
     let stakers = state.stakers.lock().await;
 
-    // Since genesis block is auto-created, we only need to check for pending transactions
-    // Allow mining if there are pending transactions OR if there's only the genesis block
-    let has_only_genesis = chain.blocks.len() == 1;
+    let plan = match plan_block(&chain, &stakers, &pending) {
+        Ok(plan) => plan,
+        Err(message) => {
+            drop(stakers);
+            drop(chain);
+            drop(pending);
+            let status = if message.contains("No pending") {
+                "info"
+            } else {
+                "error"
+            };
+            return Json(MiningResponse {
+                status: status.to_string(),
+                message,
+                block_index: 0,
+                transactions_count: 0,
+            });
+        }
+    };
 
-    if pending.is_empty() && !has_only_genesis {
+    if plan.validator != validator_key.address {
+        let message = format!(
+            "PoS selected validator {} for this slot; this node's validator is {}. \
+             The selected validator must produce the block.",
+            plan.validator, validator_key.address
+        );
+        drop(stakers);
         drop(chain);
         drop(pending);
-        drop(stakers);
         return Json(MiningResponse {
             status: "info".to_string(),
-            message: "No pending transactions to mine".to_string(),
+            message,
             block_index: 0,
             transactions_count: 0,
         });
     }
 
-    let seed = chain.latest_hash();
-    let validator = pos::select_staker_with_seed(&seed, &stakers);
-    if validator.is_none() {
+    if plan.public_key != validator_key.public_key {
+        drop(stakers);
         drop(chain);
         drop(pending);
-        drop(stakers);
         return Json(MiningResponse {
             status: "error".to_string(),
-            message: "No validators available. Stake tokens to become a validator.".to_string(),
+            message: "Local validator key does not match this validator's registered public key"
+                .to_string(),
             block_index: 0,
             transactions_count: 0,
         });
     }
 
-    let validator = validator.unwrap();
-    let staker_entry = match stakers.iter().find(|staker| staker.address == validator) {
-        Some(value) => value,
-        None => {
-            drop(chain);
-            drop(pending);
-            drop(stakers);
-            return Json(MiningResponse {
-                status: "error".to_string(),
-                message: "Selected validator not registered".to_string(),
-                block_index: 0,
-                transactions_count: 0,
-            });
-        }
-    };
-    let public_key = match &staker_entry.public_key {
-        Some(value) => value.clone(),
-        None => {
-            drop(chain);
-            drop(pending);
-            drop(stakers);
-            return Json(MiningResponse {
-                status: "error".to_string(),
-                message: "Validator missing public key".to_string(),
-                block_index: 0,
-                transactions_count: 0,
-            });
-        }
-    };
-    let private_key = match &staker_entry.private_key {
-        Some(value) => value.clone(),
-        None => {
-        return Json(MiningResponse {
-            status: "error".to_string(),
-            message: "Validator missing private key — server no longer holds private keys. Submit pre-signed blocks via /p2p/block.".to_string(),
-            block_index: 0,
-            transactions_count: 0,
-            });
-        }
-    };
-    let staker_snapshot: Vec<Staker> = stakers
-        .iter()
-        .map(|staker| Staker {
-            address: staker.address.clone(),
-            stake: staker.stake,
-            public_key: staker.public_key.clone(),
-            private_key: None,
-        })
-        .collect();
-    let staker_set_hash = pos::staker_set_hash(&staker_snapshot);
-
-    let transactions_count: usize;
-    let transaction_strings: Vec<String>;
-
-    if has_only_genesis && pending.is_empty() {
-        // For the first user-initiated mining after genesis, create a welcome transaction
-        transaction_strings = vec![
-            "First mined block - Blockchain is now active!".to_string(),
-            format!("Validator: {}", validator),
-        ];
-        transactions_count = transaction_strings.len();
-    } else {
-        // Convert pending transactions to strings for the block
-        transaction_strings = pending.iter().map(|tx| format!("{:?}", tx)).collect();
-        transactions_count = transaction_strings.len();
-
-        // Clear pending transactions after copying them
-        pending.clear();
-    }
-
+    let transactions_count = plan.transactions.len();
     let mut block = chain.create_block(
-        transaction_strings,
-        Some(validator.clone()),
-        Some(public_key),
-        Some(staker_set_hash),
-        Some(staker_snapshot),
+        plan.transactions,
+        Some(plan.validator.clone()),
+        Some(plan.public_key),
+        Some(plan.staker_set_hash),
+        Some(plan.staker_snapshot),
     );
-    let signature = match pos::sign_block_hash(&block.hash, &private_key) {
+
+    let signature = match pos::sign_block_hash(&block.hash, &validator_key.private_key) {
         Ok(value) => value,
         Err(message) => {
+            drop(stakers);
             drop(chain);
             drop(pending);
-            drop(stakers);
             return Json(MiningResponse {
                 status: "error".to_string(),
                 message: format!("Failed to sign block: {}", message),
@@ -790,41 +1099,161 @@ async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
         }
     };
     block.validator_signature = Some(signature);
+
+    if let Err(message) = chain.validate_block_candidate(&block) {
+        drop(stakers);
+        drop(chain);
+        drop(pending);
+        return Json(MiningResponse {
+            status: "error".to_string(),
+            message: format!("Mined block failed validation: {}", message),
+            block_index: 0,
+            transactions_count: 0,
+        });
+    }
+
+    let accepted_block = block.clone();
     chain.add_mined_block(block);
     chain.apply_finality(finality_depth);
     let block_index = chain.blocks.len() as u64 - 1;
-    let block_to_gossip = chain.blocks.last().cloned();
 
-    // Release locks
+    // Included transactions leave the pending pool.
+    let included: HashSet<String> = plan.included_ids.into_iter().collect();
+    pending.retain(|tx| !included.contains(&tx.id));
+
+    drop(stakers);
     drop(chain);
     drop(pending);
-    drop(stakers);
+
+    // Reward the validator.
+    {
+        let mut token = state.token.lock().await;
+        token.mint(&validator_key.address, BLOCK_REWARD);
+    }
 
     let mut metrics = state.metrics.lock().await;
     metrics.blocks_mined += 1;
     drop(metrics);
 
     let _ = persist_state(&state).await;
-    if let Some(block) = block_to_gossip {
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            let _ = gossip_blocks(&state_clone, vec![block]).await;
-        });
-    }
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        let _ = gossip_blocks(&state_clone, vec![accepted_block]).await;
+    });
 
     Json(MiningResponse {
         status: "success".to_string(),
-        message: if has_only_genesis {
-            format!(
-                "Successfully mined the first block! 🎉 Validator {} secured the block.",
-                validator
-            )
-        } else {
-            format!(
-                "Successfully mined block with {} transactions. Validator: {}",
-                transactions_count, validator
-            )
-        },
+        message: format!(
+            "Successfully mined block {} with {} transactions. Validator: {}",
+            block_index, transactions_count, validator_key.address
+        ),
+        block_index,
+        transactions_count,
+    })
+}
+
+/// Build (and PoW-mine) an unsigned block candidate for the PoS-selected
+/// validator. The validator signs `block_hash` offline (hikma-wallet
+/// sign-block) and submits the signed block to /mine/submit. Chain state is
+/// not modified.
+async fn propose_block(State(state): State<AppState>) -> Json<ProposeBlockResponse> {
+    let pending = state.pending_transactions.lock().await;
+    let chain = state.chain.lock().await;
+    let stakers = state.stakers.lock().await;
+
+    let plan = match plan_block(&chain, &stakers, &pending) {
+        Ok(plan) => plan,
+        Err(message) => {
+            return Json(ProposeBlockResponse {
+                status: "error".to_string(),
+                message,
+                selected_validator: None,
+                block: None,
+                block_hash: None,
+            });
+        }
+    };
+
+    let block = chain.create_block(
+        plan.transactions,
+        Some(plan.validator.clone()),
+        Some(plan.public_key),
+        Some(plan.staker_set_hash),
+        Some(plan.staker_snapshot),
+    );
+
+    let block_hash = block.hash.clone();
+    Json(ProposeBlockResponse {
+        status: "success".to_string(),
+        message: format!(
+            "Block candidate created for validator {}. Sign block_hash with the validator's \
+             private key (hikma-wallet sign-block) and POST the block with validator_signature \
+             set to /mine/submit.",
+            plan.validator
+        ),
+        selected_validator: Some(plan.validator),
+        block: Some(block),
+        block_hash: Some(block_hash),
+    })
+}
+
+/// Accept a fully signed block produced via /mine/propose (or by any
+/// validator client). The block passes full consensus validation.
+async fn submit_block(
+    State(state): State<AppState>,
+    Json(block): Json<Block>,
+) -> Json<MiningResponse> {
+    let finality_depth = {
+        let governance = state.governance.lock().await;
+        governance.finality_depth
+    };
+
+    let mut chain = state.chain.lock().await;
+    if let Err(message) = chain.validate_block_candidate(&block) {
+        drop(chain);
+        let mut metrics = state.metrics.lock().await;
+        metrics.blocks_rejected += 1;
+        drop(metrics);
+        return Json(MiningResponse {
+            status: "error".to_string(),
+            message,
+            block_index: 0,
+            transactions_count: 0,
+        });
+    }
+
+    let accepted_block = block.clone();
+    let transactions_count = block.transactions.len();
+    chain.add_mined_block(block);
+    chain.apply_finality(finality_depth);
+    let block_index = chain.blocks.len() as u64 - 1;
+    drop(chain);
+
+    apply_accepted_blocks(&state, std::slice::from_ref(&accepted_block)).await;
+
+    let mut metrics = state.metrics.lock().await;
+    metrics.blocks_mined += 1;
+    drop(metrics);
+
+    let _ = persist_state(&state).await;
+
+    let state_clone = state.clone();
+    let gossip_block = accepted_block.clone();
+    tokio::spawn(async move {
+        let _ = gossip_blocks(&state_clone, vec![gossip_block]).await;
+    });
+
+    Json(MiningResponse {
+        status: "success".to_string(),
+        message: format!(
+            "Signed block accepted at height {}. Validator: {}",
+            block_index,
+            accepted_block
+                .validator
+                .as_deref()
+                .unwrap_or("unknown")
+        ),
         block_index,
         transactions_count,
     })
@@ -839,11 +1268,30 @@ async fn get_mining_difficulty(State(state): State<AppState>) -> Json<Difficulty
 
 async fn set_mining_difficulty(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<DifficultyRequest>,
 ) -> Json<ApiResponse> {
+    if !authorize_admin(&headers, &state) {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: "Unauthorized: changing difficulty requires the admin token".to_string(),
+        });
+    }
+    if !pow::is_difficulty_in_bounds(payload.difficulty) {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: format!(
+                "Difficulty must be between {} and {}",
+                pow::MIN_DIFFICULTY,
+                pow::MAX_DIFFICULTY
+            ),
+        });
+    }
+
     let mut chain = state.chain.lock().await;
     let old_difficulty = chain.difficulty;
     chain.difficulty = payload.difficulty;
+    drop(chain);
 
     let _ = persist_state(&state).await;
 
@@ -869,17 +1317,72 @@ async fn stake_tokens(
             total_stake: 0,
         });
     }
-    if payload.public_key.is_none() {
+
+    let public_key = match &payload.public_key {
+        Some(value) => value.clone(),
+        None => {
+            return Json(StakeResponse {
+                status: "error".to_string(),
+                message: "Validator registration requires a public_key. \
+                          Private keys must never be sent to the server; \
+                          sign the stake request locally."
+                    .to_string(),
+                total_stake: 0,
+            });
+        }
+    };
+    let signature = match &payload.signature {
+        Some(value) => value.clone(),
+        None => {
+            return Json(StakeResponse {
+                status: "error".to_string(),
+                message: "Staking requires a signature over \
+                          hikmalayer-stake:{address}:{amount}:{nonce}"
+                    .to_string(),
+                total_stake: 0,
+            });
+        }
+    };
+
+    // The staking address is bound to the key that signs for it.
+    let derived = match pos::derive_address(&public_key) {
+        Ok(value) => value,
+        Err(err) => {
+            return Json(StakeResponse {
+                status: "error".to_string(),
+                message: format!("Invalid public key: {}", err),
+                total_stake: 0,
+            });
+        }
+    };
+    if derived.to_lowercase() != payload.address.to_lowercase() {
         return Json(StakeResponse {
             status: "error".to_string(),
-            message: "Validator registration requires a public_key. \
-                      Private keys must never be sent to the server, \
-                      sign blocks locally and submit pre-signed proposals."
-                .to_string(),
+            message: "Staking address must be the address derived from public_key".to_string(),
             total_stake: 0,
-
         });
     }
+
+    let message = format!(
+        "hikmalayer-stake:{}:{}:{}",
+        payload.address, payload.amount, payload.nonce
+    );
+    if !pos::verify_message(&message, &public_key, &signature) {
+        return Json(StakeResponse {
+            status: "error".to_string(),
+            message: "Stake signature verification failed".to_string(),
+            total_stake: 0,
+        });
+    }
+
+    if let Err(err) = consume_nonce(&state, &payload.address, payload.nonce).await {
+        return Json(StakeResponse {
+            status: "error".to_string(),
+            message: err,
+            total_stake: 0,
+        });
+    }
+
     let mut token = state.token.lock().await;
     let transfer_success = token.transfer(&payload.address, STAKING_POOL_ACCOUNT, payload.amount);
     drop(token);
@@ -899,32 +1402,17 @@ async fn stake_tokens(
     for staker in stakers.iter_mut() {
         if staker.address == payload.address {
             staker.stake += payload.amount;
-            // HM-01: only update public key, never accept private key
-            if payload.public_key.is_some() {
-                staker.public_key = payload.public_key.clone();
-            }
+            staker.public_key = Some(public_key.clone());
             found = true;
         }
         total_stake += staker.stake;
     }
 
     if !found {
-        // new validator registration requires public key only
-        if payload.public_key.is_none() {
-            return Json(StakeResponse {
-                status: "error".to_string(),
-                message: "Validator registration requires a public_key. \
-                          Private keys must never be sent to the server \
-                          sign blocks locally and submit pre-signed proposals."
-                    .to_string(),
-                total_stake,
-            });
-        }
         stakers.push(Staker {
             address: payload.address.clone(),
             stake: payload.amount,
-            public_key: payload.public_key.clone(),
-            private_key: None, // HM-01: server never stores private keys
+            public_key: Some(public_key.clone()),
         });
         total_stake += payload.amount;
     }
@@ -951,14 +1439,29 @@ async fn withdraw_stake(
         });
     }
 
+    let signature = match &payload.signature {
+        Some(value) => value.clone(),
+        None => {
+            return Json(StakeResponse {
+                status: "error".to_string(),
+                message: "Withdrawal requires a signature over \
+                          hikmalayer-withdraw:{address}:{amount}:{nonce}"
+                    .to_string(),
+                total_stake: 0,
+            });
+        }
+    };
+
     let mut stakers = state.stakers.lock().await;
     let mut total_stake = 0;
     let mut available_stake = None;
+    let mut registered_key = None;
 
     for staker in stakers.iter() {
         total_stake += staker.stake;
         if staker.address == payload.address {
             available_stake = Some(staker.stake);
+            registered_key = staker.public_key.clone();
         }
     }
 
@@ -973,10 +1476,42 @@ async fn withdraw_stake(
         }
     };
 
+    // Withdrawals are authorized by the validator's registered key only.
+    let registered_key = match registered_key {
+        Some(key) => key,
+        None => {
+            return Json(StakeResponse {
+                status: "error".to_string(),
+                message: format!("No registered public key for {}", payload.address),
+                total_stake,
+            });
+        }
+    };
+
+    let message = format!(
+        "hikmalayer-withdraw:{}:{}:{}",
+        payload.address, payload.amount, payload.nonce
+    );
+    if !pos::verify_message(&message, &registered_key, &signature) {
+        return Json(StakeResponse {
+            status: "error".to_string(),
+            message: "Withdrawal signature verification failed".to_string(),
+            total_stake,
+        });
+    }
+
     if available_stake < payload.amount {
         return Json(StakeResponse {
             status: "error".to_string(),
             message: format!("Insufficient staked balance for {}", payload.address),
+            total_stake,
+        });
+    }
+
+    if let Err(err) = consume_nonce(&state, &payload.address, payload.nonce).await {
+        return Json(StakeResponse {
+            status: "error".to_string(),
+            message: err,
             total_stake,
         });
     }
@@ -1006,6 +1541,7 @@ async fn withdraw_stake(
         updated_total += staker.stake;
         true
     });
+    drop(stakers);
 
     let _ = persist_state(&state).await;
 
@@ -1075,6 +1611,44 @@ async fn register_peer(
     })
 }
 
+/// Serve the full chain to authenticated peers (used for fork choice).
+async fn get_p2p_chain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Blockchain>, StatusCode> {
+    if !authorize_p2p(&headers, &state) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let chain = state.chain.lock().await;
+    Ok(Json(chain.clone()))
+}
+
+/// Accept one block from a peer; on a tip mismatch, trigger fork-choice
+/// sync in the background.
+async fn accept_peer_block(state: &AppState, block: Block, finality_depth: u64) -> Result<u64, String> {
+    let mut chain = state.chain.lock().await;
+
+    if let Err(message) = chain.validate_block_candidate(&block) {
+        drop(chain);
+        if message.contains("chain tip") {
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                sync_with_peers(state_clone).await;
+            });
+        }
+        return Err(message);
+    }
+
+    let accepted = block.clone();
+    chain.add_mined_block(block);
+    chain.apply_finality(finality_depth);
+    let height = chain.blocks.len() as u64 - 1;
+    drop(chain);
+
+    apply_accepted_blocks(state, std::slice::from_ref(&accepted)).await;
+    Ok(height)
+}
+
 async fn receive_block(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1090,26 +1664,28 @@ async fn receive_block(
         let governance = state.governance.lock().await;
         governance.finality_depth
     };
-    let mut chain = state.chain.lock().await;
 
-    if let Err(message) = chain.validate_block_candidate(&block) {
-        return Json(ApiResponse {
-            status: "error".to_string(),
-            message,
-        });
+    match accept_peer_block(&state, block, finality_depth).await {
+        Ok(_) => {
+            let mut metrics = state.metrics.lock().await;
+            metrics.blocks_received += 1;
+            drop(metrics);
+            let _ = persist_state(&state).await;
+            Json(ApiResponse {
+                status: "success".to_string(),
+                message: "Block accepted".to_string(),
+            })
+        }
+        Err(message) => {
+            let mut metrics = state.metrics.lock().await;
+            metrics.blocks_rejected += 1;
+            drop(metrics);
+            Json(ApiResponse {
+                status: "error".to_string(),
+                message,
+            })
+        }
     }
-
-    chain.add_mined_block(block);
-    chain.apply_finality(finality_depth);
-    drop(chain);
-    let mut metrics = state.metrics.lock().await;
-    metrics.blocks_received += 1;
-    let _ = persist_state(&state).await;
-
-    Json(ApiResponse {
-        status: "success".to_string(),
-        message: "Block accepted".to_string(),
-    })
 }
 
 async fn receive_blocks(
@@ -1127,25 +1703,20 @@ async fn receive_blocks(
         let governance = state.governance.lock().await;
         governance.finality_depth
     };
-    let mut chain = state.chain.lock().await;
-    let mut accepted = 0u64;
 
+    let mut accepted = 0u64;
     for block in blocks {
-        if chain.validate_block_candidate(&block).is_ok() {
-            chain.add_mined_block(block);
+        if accept_peer_block(&state, block, finality_depth).await.is_ok() {
             accepted += 1;
         } else {
             break;
         }
     }
-    if accepted > 0 {
-        chain.apply_finality(finality_depth);
-    }
-    drop(chain);
 
     if accepted > 0 {
         let mut metrics = state.metrics.lock().await;
         metrics.blocks_received += accepted;
+        drop(metrics);
         let _ = persist_state(&state).await;
     }
 
@@ -1176,6 +1747,20 @@ async fn receive_protocol_message(
             status: "error".to_string(),
             message,
         });
+    }
+
+    // Replay protection: each envelope may only be processed once.
+    {
+        let mut seen = state.seen_messages.lock().await;
+        if !seen.insert(&envelope.message_id) {
+            drop(seen);
+            let mut metrics = state.metrics.lock().await;
+            metrics.protocol_messages_rejected += 1;
+            return Json(ApiResponse {
+                status: "error".to_string(),
+                message: "Duplicate P2P message rejected".to_string(),
+            });
+        }
     }
 
     {
@@ -1217,46 +1802,42 @@ async fn receive_protocol_message(
                 let governance = state.governance.lock().await;
                 governance.finality_depth
             };
-            let mut chain = state.chain.lock().await;
-            if let Err(message) = chain.validate_block_candidate(&block) {
-                let mut metrics = state.metrics.lock().await;
-                metrics.protocol_messages_rejected += 1;
-                return Json(ApiResponse {
-                    status: "error".to_string(),
-                    message,
-                });
+            match accept_peer_block(&state, block, finality_depth).await {
+                Ok(_) => {
+                    let mut metrics = state.metrics.lock().await;
+                    metrics.blocks_received += 1;
+                    drop(metrics);
+                    let _ = persist_state(&state).await;
+                    Json(ApiResponse {
+                        status: "success".to_string(),
+                        message: "Block accepted".to_string(),
+                    })
+                }
+                Err(message) => {
+                    let mut metrics = state.metrics.lock().await;
+                    metrics.blocks_rejected += 1;
+                    metrics.protocol_messages_rejected += 1;
+                    drop(metrics);
+                    Json(ApiResponse {
+                        status: "error".to_string(),
+                        message,
+                    })
+                }
             }
-            chain.add_mined_block(block);
-            chain.apply_finality(finality_depth);
-            drop(chain);
-            let mut metrics = state.metrics.lock().await;
-            metrics.blocks_received += 1;
-            drop(metrics);
-            let _ = persist_state(&state).await;
-            Json(ApiResponse {
-                status: "success".to_string(),
-                message: "Block accepted".to_string(),
-            })
         }
         P2PPayload::BlockBatch(blocks) => {
             let finality_depth = {
                 let governance = state.governance.lock().await;
                 governance.finality_depth
             };
-            let mut chain = state.chain.lock().await;
             let mut accepted = 0u64;
             for block in blocks {
-                if chain.validate_block_candidate(&block).is_ok() {
-                    chain.add_mined_block(block);
+                if accept_peer_block(&state, block, finality_depth).await.is_ok() {
                     accepted += 1;
                 } else {
                     break;
                 }
             }
-            if accepted > 0 {
-                chain.apply_finality(finality_depth);
-            }
-            drop(chain);
             if accepted > 0 {
                 let mut metrics = state.metrics.lock().await;
                 metrics.blocks_received += accepted;
@@ -1401,6 +1982,7 @@ async fn validate_blockchain(State(state): State<AppState>) -> Json<ValidationRe
     let (is_valid, slashed, details) = chain.validate_and_slash(&mut stakers);
 
     drop(stakers);
+    drop(chain);
     let _ = persist_state(&state).await;
 
     Json(ValidationResponse {
@@ -1439,82 +2021,40 @@ async fn validate_block(
     }
 
     if index == 0 {
-        // Genesis block is always valid
+        let genesis_valid = chain.blocks[0].has_valid_pow();
         return Json(ValidationResponse {
-            is_valid: true,
-            message: "Genesis block is valid".to_string(),
-            details: Some("Genesis block validation passed".to_string()),
+            is_valid: genesis_valid,
+            message: if genesis_valid {
+                "Genesis block is valid".to_string()
+            } else {
+                "Genesis block is invalid".to_string()
+            },
+            details: Some("Genesis block PoW validation".to_string()),
             slashed: Vec::new(),
         });
     }
 
-    let current_block = &chain.blocks[index];
-    let previous_block = &chain.blocks[index - 1];
     let mut slashed = Vec::new();
-    let mut error = None;
+    let result = chain.evaluate_slash_evidence(index as u64);
 
-    if current_block.previous_hash != previous_block.hash {
-        error = Some("Previous hash does not match".to_string());
-    } else if current_block.validator.is_none() {
-        error = Some("Missing validator".to_string());
-    } else if current_block.validator_public_key.is_none() {
-        error = Some("Missing validator public key".to_string());
-    } else if current_block.validator_signature.is_none() {
-        error = Some("Missing validator signature".to_string());
-    } else if current_block.staker_snapshot.is_none() || current_block.staker_set_hash.is_none() {
-        error = Some("Missing staker snapshot data".to_string());
-    } else {
-        let staker_snapshot = current_block.staker_snapshot.as_ref().unwrap();
-        let staker_hash = pos::staker_set_hash(staker_snapshot);
-        if Some(staker_hash) != current_block.staker_set_hash {
-            error = Some("Staker set hash mismatch".to_string());
-        } else {
-            let expected =
-                pos::select_staker_with_seed(&current_block.previous_hash, staker_snapshot);
-            if expected != current_block.validator {
-                if let Some(validator) = &current_block.validator {
-                    let amount = pos::slash_staker(&mut stakers, validator);
-                    if amount > 0 {
-                        slashed.push(SlashEvent {
-                            address: validator.clone(),
-                            amount,
-                        });
-                    }
-                }
-                error = Some("Validator does not match PoS selection".to_string());
-            } else if !pos::verify_block_signature(
-                &current_block.hash,
-                current_block.validator_public_key.as_ref().unwrap(),
-                current_block.validator_signature.as_ref().unwrap(),
-            ) {
-                if let Some(validator) = &current_block.validator {
-                    let amount = pos::slash_staker(&mut stakers, validator);
-                    if amount > 0 {
-                        slashed.push(SlashEvent {
-                            address: validator.clone(),
-                            amount,
-                        });
-                    }
-                }
-                error = Some("Block failed signature verification".to_string());
-            } else if !current_block.has_valid_pow() {
-                if let Some(validator) = &current_block.validator {
-                    let amount = pos::slash_staker(&mut stakers, validator);
-                    if amount > 0 {
-                        slashed.push(SlashEvent {
-                            address: validator.clone(),
-                            amount,
-                        });
-                    }
-                }
-                error = Some("Block failed PoW validation".to_string());
+    let (is_valid, error) = match result {
+        // evaluate_slash_evidence returns Ok(evidence) when misbehavior found
+        Ok(evidence) => {
+            let amount = pos::slash_staker(&mut stakers, &evidence.validator);
+            if amount > 0 {
+                slashed.push(SlashEvent {
+                    address: evidence.validator.clone(),
+                    amount,
+                });
             }
+            (false, Some(evidence.reason))
         }
-    }
-
-    let is_valid = error.is_none();
+        Err(message) if message.contains("does not contain slashable") => (true, None),
+        Err(message) => (false, Some(message)),
+    };
 
     drop(stakers);
+    drop(chain);
     let _ = persist_state(&state).await;
 
     Json(ValidationResponse {
@@ -1559,4 +2099,403 @@ async fn get_pending_transactions(State(state): State<AppState>) -> Json<Vec<Str
 async fn get_pending_transactions_structured(State(state): State<AppState>) -> Json<Vec<Transaction>> {
     let pending = state.pending_transactions.lock().await;
     Json(pending.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    const ADMIN_TOKEN: &str = "test-admin-token";
+    const P2P_TOKEN: &str = "test-p2p-token";
+
+    fn test_state(validator_key: Option<LocalValidatorKey>) -> AppState {
+        std::env::set_var(
+            "HIKMALAYER_STATE_PATH",
+            format!(
+                "{}/hikmalayer-test-state-{}.json",
+                std::env::temp_dir().display(),
+                uuid::Uuid::new_v4()
+            ),
+        );
+        AppState {
+            chain: Arc::new(Mutex::new(Blockchain::new(2))),
+            token: Arc::new(Mutex::new(Token::new("Test", "TST", 1000, "admin"))),
+            contracts: Arc::new(Mutex::new(ContractExecutor::new())),
+            pending_transactions: Arc::new(Mutex::new(Vec::new())),
+            auth_manager: Arc::new(Mutex::new(AuthManager::new())),
+            stakers: Arc::new(Mutex::new(Vec::new())),
+            peers: Arc::new(Mutex::new(Vec::new())),
+            governance: Arc::new(Mutex::new(GovernanceConfig::default())),
+            slash_evidence: Arc::new(Mutex::new(Vec::new())),
+            metrics: Arc::new(Mutex::new(Metrics::default())),
+            nonces: Arc::new(Mutex::new(HashMap::new())),
+            seen_messages: Arc::new(Mutex::new(SeenMessageCache::new(1024))),
+            p2p_token: Some(P2P_TOKEN.to_string()),
+            admin_token: Some(ADMIN_TOKEN.to_string()),
+            p2p_service: Arc::new(P2PService::new("node-test".to_string(), None).unwrap()),
+            validator_key,
+        }
+    }
+
+    fn admin_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-admin-token", HeaderValue::from_static(ADMIN_TOKEN));
+        headers
+    }
+
+    fn p2p_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-p2p-token", HeaderValue::from_static(P2P_TOKEN));
+        headers
+    }
+
+    fn test_wallet(seed: u8) -> (String, String, String) {
+        let private_key = hex::encode([seed; 32]);
+        let public_key = pos::derive_public_key(&private_key).unwrap();
+        let address = pos::derive_address(&public_key).unwrap();
+        (address, public_key, private_key)
+    }
+
+    async fn fund(state: &AppState, account: &str, amount: u64) {
+        let mut token = state.token.lock().await;
+        token.mint(account, amount);
+    }
+
+    async fn register_staker(state: &AppState, seed: u8, stake: u64) -> (String, String, String) {
+        let (address, public_key, private_key) = test_wallet(seed);
+        fund(state, &address, stake * 2).await;
+
+        let message = format!("hikmalayer-stake:{}:{}:{}", address, stake, 1);
+        let signature = pos::sign_message(&message, &private_key).unwrap();
+        let response = stake_tokens(
+            State(state.clone()),
+            Json(StakeRequest {
+                address: address.clone(),
+                amount: stake,
+                public_key: Some(public_key.clone()),
+                nonce: 1,
+                signature: Some(signature),
+            }),
+        )
+        .await;
+        assert_eq!(response.0.status, "success", "{}", response.0.message);
+        (address, public_key, private_key)
+    }
+
+    #[tokio::test]
+    async fn transfer_without_signature_is_rejected() {
+        let state = test_state(None);
+        let response = transfer_tokens(
+            State(state),
+            Json(TokenTransferRequest {
+                from: "admin".to_string(),
+                to: "0xabc".to_string(),
+                amount: 10,
+                nonce: 1,
+                public_key: None,
+                signature: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.0.status, "error");
+        assert!(response.0.message.contains("signature"));
+    }
+
+    #[tokio::test]
+    async fn signed_transfer_succeeds_and_replay_is_rejected() {
+        let state = test_state(None);
+        let (address, public_key, private_key) = test_wallet(11);
+        fund(&state, &address, 100).await;
+
+        let message = Transaction::transfer_signing_message(&address, "0xrecipient", 40, 1);
+        let signature = pos::sign_message(&message, &private_key).unwrap();
+        let request = || TokenTransferRequest {
+            from: address.clone(),
+            to: "0xrecipient".to_string(),
+            amount: 40,
+            nonce: 1,
+            public_key: Some(public_key.clone()),
+            signature: Some(signature.clone()),
+        };
+
+        let response = transfer_tokens(State(state.clone()), Json(request())).await;
+        assert_eq!(response.0.status, "success", "{}", response.0.message);
+        assert_eq!(state.token.lock().await.balance_of("0xrecipient"), 40);
+
+        // Replaying the exact same signed request must fail on the nonce.
+        let replay = transfer_tokens(State(state.clone()), Json(request())).await;
+        assert_eq!(replay.0.status, "error");
+        assert!(replay.0.message.contains("nonce"));
+        assert_eq!(state.token.lock().await.balance_of("0xrecipient"), 40);
+    }
+
+    #[tokio::test]
+    async fn transfer_with_wrong_sender_binding_is_rejected() {
+        let state = test_state(None);
+        let (_, public_key, private_key) = test_wallet(12);
+        let (victim, _, _) = test_wallet(13);
+        fund(&state, &victim, 100).await;
+
+        // Attacker signs correctly with their own key but claims the
+        // victim's account as sender.
+        let message = Transaction::transfer_signing_message(&victim, "0xattacker", 40, 1);
+        let signature = pos::sign_message(&message, &private_key).unwrap();
+        let response = transfer_tokens(
+            State(state.clone()),
+            Json(TokenTransferRequest {
+                from: victim.clone(),
+                to: "0xattacker".to_string(),
+                amount: 40,
+                nonce: 1,
+                public_key: Some(public_key),
+                signature: Some(signature),
+            }),
+        )
+        .await;
+        assert_eq!(response.0.status, "error");
+        assert_eq!(state.token.lock().await.balance_of(&victim), 100);
+    }
+
+    #[tokio::test]
+    async fn stake_requires_address_key_binding() {
+        let state = test_state(None);
+        let (_, public_key, private_key) = test_wallet(14);
+        fund(&state, "0xnot-my-address", 100).await;
+
+        let message = format!("hikmalayer-stake:{}:{}:{}", "0xnot-my-address", 50, 1);
+        let signature = pos::sign_message(&message, &private_key).unwrap();
+        let response = stake_tokens(
+            State(state),
+            Json(StakeRequest {
+                address: "0xnot-my-address".to_string(),
+                amount: 50,
+                public_key: Some(public_key),
+                nonce: 1,
+                signature: Some(signature),
+            }),
+        )
+        .await;
+        assert_eq!(response.0.status, "error");
+        assert!(response.0.message.contains("derived"));
+    }
+
+    #[tokio::test]
+    async fn withdraw_requires_registered_key_signature() {
+        let state = test_state(None);
+        let (address, _, private_key) = register_staker(&state, 15, 50).await;
+
+        // Unsigned withdrawal fails.
+        let response = withdraw_stake(
+            State(state.clone()),
+            Json(StakeRequest {
+                address: address.clone(),
+                amount: 20,
+                public_key: None,
+                nonce: 2,
+                signature: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.0.status, "error");
+
+        // Properly signed withdrawal succeeds.
+        let message = format!("hikmalayer-withdraw:{}:{}:{}", address, 20, 2);
+        let signature = pos::sign_message(&message, &private_key).unwrap();
+        let response = withdraw_stake(
+            State(state.clone()),
+            Json(StakeRequest {
+                address: address.clone(),
+                amount: 20,
+                public_key: None,
+                nonce: 2,
+                signature: Some(signature),
+            }),
+        )
+        .await;
+        assert_eq!(response.0.status, "success", "{}", response.0.message);
+    }
+
+    #[tokio::test]
+    async fn mine_with_local_validator_key_end_to_end() {
+        let state = test_state(None);
+        let (address, _, private_key) = register_staker(&state, 16, 100).await;
+
+        // Wire the local validator identity after registration.
+        let mut state = state;
+        state.validator_key = Some(LocalValidatorKey::from_private_key(&private_key).unwrap());
+
+        let balance_before = state.token.lock().await.balance_of(&address);
+        let response = mine_block(State(state.clone())).await;
+        assert_eq!(response.0.status, "success", "{}", response.0.message);
+        assert_eq!(response.0.block_index, 1);
+
+        let chain = state.chain.lock().await;
+        assert_eq!(chain.blocks.len(), 2);
+        assert!(chain.is_valid());
+        drop(chain);
+
+        // Block reward was minted.
+        let balance_after = state.token.lock().await.balance_of(&address);
+        assert_eq!(balance_after, balance_before + BLOCK_REWARD);
+    }
+
+    #[tokio::test]
+    async fn propose_and_submit_flow_produces_valid_block() {
+        let state = test_state(None);
+        let (_, _, private_key) = register_staker(&state, 17, 100).await;
+
+        let proposal = propose_block(State(state.clone())).await;
+        assert_eq!(proposal.0.status, "success", "{}", proposal.0.message);
+        let mut block = proposal.0.block.unwrap();
+        let block_hash = proposal.0.block_hash.unwrap();
+
+        // Validator signs the proposal offline.
+        block.validator_signature =
+            Some(pos::sign_block_hash(&block_hash, &private_key).unwrap());
+
+        let response = submit_block(State(state.clone()), Json(block)).await;
+        assert_eq!(response.0.status, "success", "{}", response.0.message);
+
+        let chain = state.chain.lock().await;
+        assert_eq!(chain.blocks.len(), 2);
+        assert!(chain.is_valid());
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_unsigned_or_forged_blocks() {
+        let state = test_state(None);
+        register_staker(&state, 18, 100).await;
+
+        let proposal = propose_block(State(state.clone())).await;
+        let mut block = proposal.0.block.unwrap();
+
+        // Unsigned submission fails.
+        let response = submit_block(State(state.clone()), Json(block.clone())).await;
+        assert_eq!(response.0.status, "error");
+
+        // Signature from a non-registered key fails.
+        let intruder_key = hex::encode([99u8; 32]);
+        block.validator_signature =
+            Some(pos::sign_block_hash(&block.hash, &intruder_key).unwrap());
+        let response = submit_block(State(state.clone()), Json(block)).await;
+        assert_eq!(response.0.status, "error");
+
+        assert_eq!(state.chain.lock().await.blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn difficulty_change_requires_admin_and_bounds() {
+        let state = test_state(None);
+
+        let response = set_mining_difficulty(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(DifficultyRequest { difficulty: 3 }),
+        )
+        .await;
+        assert_eq!(response.0.status, "error");
+
+        let response = set_mining_difficulty(
+            State(state.clone()),
+            admin_headers(),
+            Json(DifficultyRequest { difficulty: 99 }),
+        )
+        .await;
+        assert_eq!(response.0.status, "error");
+
+        let response = set_mining_difficulty(
+            State(state.clone()),
+            admin_headers(),
+            Json(DifficultyRequest { difficulty: 3 }),
+        )
+        .await;
+        assert_eq!(response.0.status, "success");
+        assert_eq!(state.chain.lock().await.difficulty, 3);
+    }
+
+    #[tokio::test]
+    async fn faucet_and_certificates_require_admin() {
+        let state = test_state(None);
+
+        let response = faucet_tokens(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(FaucetRequest {
+                to: "0xuser".to_string(),
+                amount: 10,
+            }),
+        )
+        .await;
+        assert_eq!(response.0.status, "error");
+
+        let response = faucet_tokens(
+            State(state.clone()),
+            admin_headers(),
+            Json(FaucetRequest {
+                to: "0xuser".to_string(),
+                amount: 10,
+            }),
+        )
+        .await;
+        assert_eq!(response.0.status, "success");
+        assert_eq!(state.token.lock().await.balance_of("0xuser"), 10);
+
+        let response = issue_certificate(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(CertificateRequest {
+                id: "cert-1".to_string(),
+                issued_to: "0xuser".to_string(),
+                description: "test".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.0.status, "error");
+    }
+
+    #[tokio::test]
+    async fn p2p_endpoints_reject_missing_token_and_replays() {
+        let state = test_state(None);
+
+        // Unauthorized block push.
+        let block = state.chain.lock().await.blocks[0].clone();
+        let response = receive_block(State(state.clone()), HeaderMap::new(), Json(block)).await;
+        assert_eq!(response.0.status, "error");
+
+        // Duplicate protocol envelope is rejected on the second delivery.
+        let envelope = P2PEnvelope::new("node-a".to_string(), P2PPayload::Ping);
+        let response = receive_protocol_message(
+            State(state.clone()),
+            p2p_headers(),
+            Json(envelope.clone()),
+        )
+        .await;
+        assert_eq!(response.0.status, "success");
+
+        let response =
+            receive_protocol_message(State(state.clone()), p2p_headers(), Json(envelope)).await;
+        assert_eq!(response.0.status, "error");
+        assert!(response.0.message.contains("Duplicate"));
+    }
+
+    #[tokio::test]
+    async fn peer_block_acceptance_pays_reward_and_clears_pending() {
+        let state = test_state(None);
+        let (address, _, private_key) = register_staker(&state, 19, 100).await;
+
+        // Build a signed block via propose.
+        let proposal = propose_block(State(state.clone())).await;
+        let mut block = proposal.0.block.unwrap();
+        block.validator_signature =
+            Some(pos::sign_block_hash(&block.hash, &private_key).unwrap());
+
+        let balance_before = state.token.lock().await.balance_of(&address);
+        let response = receive_block(State(state.clone()), p2p_headers(), Json(block)).await;
+        assert_eq!(response.0.status, "success", "{}", response.0.message);
+
+        let balance_after = state.token.lock().await.balance_of(&address);
+        assert_eq!(balance_after, balance_before + BLOCK_REWARD);
+        assert_eq!(state.chain.lock().await.blocks.len(), 2);
+    }
 }

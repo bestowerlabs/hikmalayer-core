@@ -5,9 +5,57 @@
 Hikmalayer is a hybrid PoS/PoW blockchain platform with REST execution APIs, staking, governance/slashing controls, and a dedicated P2P protocol endpoint for inter-node communication. This documentation provides API integration guidelines for operators and developers.
 
 **Base URL:** `http://127.0.0.1:3000`  
-**Version:** 1.0  
+**Version:** 2.0 (consensus v2 — signed transactions, fork choice)  
 **Protocol:** HTTP/HTTPS  
 **Content-Type:** `application/json`
+
+## ⚠️ Consensus v2 changes (breaking)
+
+The security model changed in v2. Where an example below conflicts with this
+section, this section is authoritative.
+
+**Authorization is deny-by-default.** `ADMIN_TOKEN` and `P2P_TOKEN` must be set
+on the node; endpoints gated by a token that is unset reject every request.
+
+- Admin-gated (`x-admin-token`): `/tokens/faucet`, `/certificates/issue`,
+  `/certificates/attest`, `/mining/difficulty` (POST), `/governance/config` (POST),
+  `/slashing/evidence`.
+- P2P-gated (`x-p2p-token`): `/p2p/*` including the new `GET /p2p/chain`.
+
+**Transfers must be signed.** `POST /tokens/transfer` body:
+
+```json
+{
+  "from": "0x…", "to": "0x…", "amount": 10, "nonce": 1,
+  "public_key": "…hex, uncompressed (raw scheme only)…",
+  "signature": "…hex…"
+}
+```
+
+The signature covers `hikmalayer-transfer:{from}:{to}:{amount}:{nonce}` in one
+of two schemes: raw secp256k1 (64-byte compact over SHA-256 of the message,
+`public_key` required, sender must be the key's derived address) or Ethereum
+`personal_sign` (65-byte, MetaMask; recovered address must equal `from`).
+Fetch the next nonce with `GET /tokens/nonce/{account}`. Sign offline with
+`hikma-wallet sign-transfer`.
+
+**Staking is signed and key-bound.** `POST /staking/deposit` requires
+`public_key`, `nonce`, and a signature over
+`hikmalayer-stake:{address}:{amount}:{nonce}`; `address` must be the address
+derived from `public_key`. `POST /staking/withdraw` requires a signature over
+`hikmalayer-withdraw:{address}:{amount}:{nonce}` by the registered key.
+
+**Mining.** `POST /mine` produces a block only when the node's own
+`VALIDATOR_PRIVATE_KEY` identity is the PoS-selected validator. External
+validators use `POST /mine/propose` (returns the PoW-mined unsigned block and
+its hash), sign the hash offline (`hikma-wallet sign-block`), and submit the
+signed block to `POST /mine/submit`. Every accepted block mints a fixed reward
+to its validator.
+
+**New endpoints:** `POST /tokens/faucet` (admin), `GET /tokens/nonce/{account}`,
+`POST /mine/propose`, `POST /mine/submit`, `GET /p2p/chain` (p2p),
+`POST /certificates/attest` (admin). `POST /certificates/verify` is now a
+read-only lookup.
 
 ## Quick Start
 
@@ -17,18 +65,19 @@ Hikmalayer is a hybrid PoS/PoW blockchain platform with REST execution APIs, sta
 - HTTP client (curl, Postman, or any REST client)
 - Basic understanding of blockchain concepts
 
-### Authorization Tokens (Optional)
+### Authorization Tokens
 
-Hikmalayer supports optional admin and P2P authorization headers:
+Hikmalayer uses deny-by-default admin and P2P authorization headers:
 
-- `ADMIN_TOKEN`: when set, governance and slashing endpoints require `x-admin-token`.
-- `P2P_TOKEN`: when set, P2P peer and block gossip endpoints require `x-p2p-token`.
+- `ADMIN_TOKEN`: admin endpoints (faucet, certificates, difficulty, governance, slashing) require `x-admin-token`. Unset = disabled.
+- `P2P_TOKEN`: P2P peer, chain-sync, and block gossip endpoints require `x-p2p-token`. Unset = disabled.
 
 ### Getting Started
 
-1. Start the Hikmalayer server: `cargo run`
+1. Start the Hikmalayer server: `ADMIN_TOKEN=… P2P_TOKEN=… VALIDATOR_PRIVATE_KEY=… cargo run`
 2. Verify the blockchain status: `GET /blockchain/stats`
-3. Begin issuing transactions and mining blocks
+3. Generate keys offline: `cargo run --bin hikma-wallet keygen`
+4. Fund, stake, transfer (signed), and mine blocks
 
 ---
 

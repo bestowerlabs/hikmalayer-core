@@ -78,13 +78,29 @@ async fn main() {
             .unwrap_or_default(),
     ));
     let metrics = Arc::new(Mutex::new(api::routes::Metrics::default()));
-    let p2p_token = std::env::var("P2P_TOKEN").ok();
-    let admin_token = std::env::var("ADMIN_TOKEN").ok();
+    fn load_token_list(current_var: &str, previous_var: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    if let Ok(current) = std::env::var(current_var) {
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+    }
+    if let Ok(previous) = std::env::var(previous_var) {
+        if !previous.is_empty() {
+            tokens.push(previous);
+        }
+    }
+    tokens
+}
+
+let p2p_tokens = load_token_list("P2P_TOKEN_CURRENT", "P2P_TOKEN_PREVIOUS");
+let admin_tokens = load_token_list("ADMIN_TOKEN_CURRENT", "ADMIN_TOKEN_PREVIOUS");
+    
 
     let p2p_service = Arc::new(
         P2PService::new(
             std::env::var("NODE_ID").unwrap_or_else(|_| "node-local".to_string()),
-            p2p_token.clone(),
+            p2p_tokens.first().cloned(),
         )
         .unwrap_or_else(|err| panic!("{}", err)),
     );
@@ -109,8 +125,8 @@ async fn main() {
         governance,
         slash_evidence,
         metrics,
-        p2p_token,
-        admin_token,
+        p2p_tokens,
+        admin_tokens,
         p2p_service,
     };
 

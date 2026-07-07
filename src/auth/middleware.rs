@@ -5,28 +5,47 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: String,
+    exp: usize,
+    iat: usize,
+}
 
 pub async fn auth_middleware(
     headers: HeaderMap,
-    State(_state): State<crate::api::routes::AppState>,
+    State(state): State<crate::api::routes::AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // Extract Authorization header
-    if let Some(auth_header) = headers.get("authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if auth_str.starts_with("Bearer ") {
-                let token = &auth_str[7..];
+    let auth_header = headers
+        .get("authorization")
+        .ok_or(StatusCode::UNAUTHORIZED)?;
 
-                // Here you'd verify the token against your AuthManager
-                // For now, we'll just check if it's not empty
-                if !token.is_empty() {
-                    // Add user info to request extensions if needed
-                    return Ok(next.run(request).await);
-                }
-            }
-        }
+    let auth_str = auth_header
+        .to_str()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    if !auth_str.starts_with("Bearer ") {
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
-    Err(StatusCode::UNAUTHORIZED)
+    let token = &auth_str[7..];
+
+    let secret = std::env::var("HIKMALAYER_JWT_SECRET")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let decoded = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &Validation::new(Algorithm::HS256),
+    )
+    .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    // Token is real and valid — let the request through.
+    let _ = decoded.claims;
+    Ok(next.run(request).await)
 }

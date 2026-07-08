@@ -101,6 +101,24 @@ pub struct Transaction {
     /// Equivocation proof (Slash transactions only).
     #[serde(default)]
     pub slash_proof: Option<SlashProof>,
+    /// sr25519 VRF public key (Stake transactions only): registered on-chain
+    /// alongside the identity key for leader-election randomness.
+    #[serde(default)]
+    pub vrf_public_key: Option<String>,
+    /// Credential registry action (Certificate transactions only).
+    #[serde(default)]
+    pub credential: Option<CredentialAction>,
+}
+
+/// Issue or revoke an on-chain verifiable credential. Only the hash of the
+/// credential document goes on-chain; the document stays private.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialAction {
+    pub id: String,
+    pub subject: String,
+    pub data_hash: String,
+    #[serde(default)]
+    pub revoke: bool,
 }
 
 impl Transaction {
@@ -121,6 +139,8 @@ impl Transaction {
             public_key: None,
             signature: None,
             slash_proof: None,
+            vrf_public_key: None,
+            credential: None,
         }
     }
 
@@ -135,8 +155,25 @@ impl Transaction {
     }
 
     /// Canonical message a validator signs to authorize a stake deposit.
-    pub fn stake_signing_message(address: &str, amount: u64, nonce: u64) -> String {
-        format!("hikmalayer-stake:{}:{}:{}", address, amount, nonce)
+    /// Binds the VRF public key so it cannot be substituted in transit.
+    pub fn stake_signing_message(
+        address: &str,
+        amount: u64,
+        nonce: u64,
+        vrf_public_key: &str,
+    ) -> String {
+        format!(
+            "hikmalayer-stake:{}:{}:{}:{}",
+            address, amount, nonce, vrf_public_key
+        )
+    }
+
+    /// Canonical message an issuer signs to issue or revoke a credential.
+    pub fn credential_signing_message(action: &CredentialAction, nonce: u64) -> String {
+        format!(
+            "hikmalayer-credential:{}:{}:{}:{}:{}",
+            action.id, action.subject, action.data_hash, action.revoke, nonce
+        )
     }
 
     /// Canonical message a validator signs to authorize a stake withdrawal.
@@ -169,7 +206,12 @@ impl Transaction {
                 if self.amount == 0 {
                     return Err("Stake amount must be greater than zero".to_string());
                 }
-                let message = Self::stake_signing_message(from, self.amount, self.nonce);
+                let vrf_public_key = self
+                    .vrf_public_key
+                    .as_ref()
+                    .ok_or_else(|| "Stake transaction missing VRF public key".to_string())?;
+                let message =
+                    Self::stake_signing_message(from, self.amount, self.nonce, vrf_public_key);
                 self.verify_sender_signature(from, &message)
             }
             TransactionType::Withdraw => {
@@ -201,6 +243,22 @@ impl Transaction {
             TransactionType::Certificate => {
                 if self.amount != 0 {
                     return Err("Certificate transaction must not carry value".to_string());
+                }
+                // Credential actions must be signed by the issuer; legacy
+                // anchor transactions (no payload) need no signature.
+                if let Some(action) = &self.credential {
+                    let issuer = self
+                        .from
+                        .as_ref()
+                        .ok_or_else(|| "Credential action missing issuer".to_string())?;
+                    if action.id.trim().is_empty() || action.id.len() > 128 {
+                        return Err("Credential id must be 1-128 characters".to_string());
+                    }
+                    if action.subject.len() > 256 || action.data_hash.len() > 128 {
+                        return Err("Credential fields exceed size limits".to_string());
+                    }
+                    let message = Self::credential_signing_message(action, self.nonce);
+                    self.verify_sender_signature(issuer, &message)?;
                 }
                 Ok(())
             }
@@ -333,7 +391,9 @@ mod tests {
         );
         tx.nonce = 1;
         tx.public_key = Some(public_key);
-        let message = Transaction::stake_signing_message(&from, 100, 1);
+        let vrf_key = crate::consensus::vrf::derive_vrf_public_key(&private_key).unwrap();
+        tx.vrf_public_key = Some(vrf_key.clone());
+        let message = Transaction::stake_signing_message(&from, 100, 1, &vrf_key);
         tx.signature = Some(pos::sign_message(&message, &private_key).unwrap());
         assert!(tx.verify_for_block("validator-1").is_ok());
 

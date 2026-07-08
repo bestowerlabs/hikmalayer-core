@@ -24,6 +24,15 @@ pub struct Block {
     pub validator: Option<String>,
     pub validator_public_key: Option<String>,
     pub validator_signature: Option<String>,
+    /// VRF output for this slot's input, feeding the randomness beacon.
+    /// Self-authenticating: for a fixed (key, input) the output is unique,
+    /// so it needs no hash commitment — the proof pins it.
+    #[serde(default)]
+    pub vrf_output: Option<String>,
+    /// Proof that `vrf_output` is the unique VRF evaluation by the
+    /// validator's registered VRF key over the slot input.
+    #[serde(default)]
+    pub vrf_proof: Option<String>,
 }
 
 use crate::consensus::pow;
@@ -121,6 +130,8 @@ impl Block {
             validator,
             validator_public_key,
             validator_signature,
+            vrf_output: None,
+            vrf_proof: None,
         }
     }
 

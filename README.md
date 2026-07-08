@@ -15,7 +15,16 @@ signing conventions. It provides:
   primitive (secp256k1), not an external-chain dependency.
 - **On-chain validator set.** Staking and withdrawals are signed on-chain transactions;
   the validator set is derived from state, not node-local bookkeeping.
-- PoS validator selection (stake-weighted, height-salted deterministic seed) verified
+- **VRF randomness beacon (unbiasable leader election).** Every block carries an
+  sr25519 VRF proof; outputs fold into an on-chain beacon that seeds stake-weighted
+  leader selection. A VRF output is unique per (key, slot) — there is nothing for a
+  validator to grind.
+- **⭐ Proof-of-Credential — on-chain verifiable credentials.** Issue, verify, and
+  revoke credentials as first-class consensus objects. Only a hash of the credential
+  document goes on-chain (privacy by design); any third party verifies a credential
+  against the block-committed state root without trusting a node. Built for the
+  chain's mission: digital identity anchoring and credential verification.
+- PoS validator selection (stake-weighted, seeded by the VRF beacon) verified
   against the on-chain validator set at each block's parent state.
 - PoW mining and PoW validation for every block, with bounded difficulty.
 - Deterministic genesis, Merkle-root transaction commitment, and full-chain replay.
@@ -116,18 +125,18 @@ flowchart TD
     C -->|"gossip tx to peers"| C
 
     C --> D{"Next block slot"}
-    D -->|"PoS: stake-weighted selection from<br/>on-chain validator set at parent<br/>seed = parent hash : height"| E["🎯 Selected validator"]
+    D -->|"PoS: stake-weighted selection from<br/>on-chain validator set at parent<br/>seed = VRF randomness beacon : height"| E["🎯 Selected validator"]
 
     E -->|"node holds its own key<br/>(VALIDATOR_PRIVATE_KEY)"| F["POST /mine"]
     E -->|"external validator"| G["POST /mine/propose<br/>→ sign block hash offline →<br/>POST /mine/submit"]
 
-    F --> EX["🧮 Execute txs against parent state<br/>→ new balances, stakes, nonces<br/>→ compute STATE ROOT"]
+    F --> EX["🧮 Execute txs against parent state<br/>→ new balances, stakes, nonces,<br/>credentials → compute STATE ROOT"]
     G --> EX
     EX --> H["⛏️ PoW: SHA-256 mining<br/>(commits state root + merkle root)"]
-    H --> I["✍️ Validator signs the block hash<br/>(key never leaves the validator)"]
+    H --> I["✍️ Validator signs the block hash<br/>+ attaches VRF output & proof<br/>(keys never leave the validator)"]
 
     I --> J{"🔍 Full consensus validation<br/>(every node, independently)"}
-    J -->|"checks"| J1["• index + previous-hash linkage<br/>• PoS slot matches on-chain validator<br/>• signer key = validator's on-chain key<br/>• Merkle root commits to txs<br/>• PoW hash + difficulty bounds<br/>• re-execute every tx on parent state<br/>• STATE ROOT matches execution<br/>• exactly one correct reward tx<br/>• timestamp within skew"]
+    J -->|"checks"| J1["• index + previous-hash linkage<br/>• PoS slot matches on-chain validator<br/>• signer key = validator's on-chain key<br/>• VRF proof valid for this exact slot<br/>• Merkle root commits to txs<br/>• PoW hash + difficulty bounds<br/>• re-execute every tx on parent state<br/>• STATE ROOT matches execution<br/>• exactly one correct reward tx<br/>• timestamp within skew"]
 
     J -->|valid| K["✅ Append block<br/>+ adopt executed state<br/>(reward already in state)"]
     J -->|invalid| L["❌ Reject<br/>(equivocation → on-chain slash)"]
@@ -147,7 +156,8 @@ Key consensus rules:
 | Rule | Mechanism |
 |---|---|
 | Native identity | `hkm` + SHA-256(secp256k1 pubkey)[..20]; messages signed under the Hikmalayer signing domain — no external-chain conventions |
-| Who may produce the next block | Stake-weighted PoS from the **on-chain** validator set, seeded by `parent_hash:height` |
+| Who may produce the next block | Stake-weighted PoS from the **on-chain** validator set, seeded by the **VRF randomness beacon** at the parent (`beacon:height`) |
+| Why leader election is unbiasable | Each block's sr25519 VRF output is unique per (validator key, slot) and folds into the beacon — a producer cannot grind future assignments (residual bias: withhold-and-forfeit only) |
 | Proof the right validator produced it | secp256k1 signature over the block hash, checked against the validator's **on-chain** registered key |
 | State agreement | Every block commits a **state root**; nodes re-execute all transactions and reject any block whose root ≠ executed state |
 | Tamper evidence | Merkle root over transactions, both roots committed into the PoW-mined hash |
@@ -165,8 +175,14 @@ Key consensus rules:
 - **No private keys on the node.** Validators keep keys offline (`hikma-wallet`) or in the
   node's local environment (`VALIDATOR_PRIVATE_KEY` — the node's *own* identity only).
   The API never accepts a private key.
-- **Replicated state, verified everywhere.** No node can forge a balance: state is a pure
-  function of the blocks and every node checks the committed state root by re-execution.
+- **Replicated state, verified everywhere.** No node can forge a balance or a credential:
+  state is a pure function of the blocks and every node checks the committed state root
+  by re-execution.
+- **Unbiasable randomness.** Leader election is seeded by a VRF beacon (audited
+  sr25519/schnorrkel, as used by Polkadot) — validator-unique, publicly verifiable,
+  nothing to grind.
+- **Rotating, constant-time authorization tokens.** Admin/P2P tokens support
+  `*_TOKEN_CURRENT`/`*_TOKEN_PREVIOUS` rotation and are compared in constant time.
 - **Signed everything.** Transfers, stakes, and withdrawals require native signatures;
   staking addresses are cryptographically bound to their keys
   (`address = hkm + SHA-256(pubkey)[..20]`).
@@ -174,6 +190,42 @@ Key consensus rules:
   (faucet, certificates, difficulty, governance) require `x-admin-token`. Unset = disabled.
 - **Bounded resources.** Difficulty is clamped (1–5) so a bad difficulty can neither
   disable PoW nor stall the node; explorer inputs are length-limited.
+
+## ⭐ Flagship: Proof-of-Credential
+
+Hikmalayer's differentiator is a **credential layer built into consensus** — not a
+smart contract bolted on top. Universities, licensing bodies, and employers issue
+credentials as signed on-chain transactions; anyone verifies them against the
+chain's state root in one call.
+
+```bash
+# 1. Issuer signs the credential action offline (only the DOCUMENT HASH goes on-chain)
+hikma-wallet sign-credential degree-2026-001 hkm<student> $(sha256sum diploma.pdf | cut -d' ' -f1) false <nonce> <issuer_key>
+
+# 2. Submit — it becomes a consensus object when mined
+curl -X POST localhost:3000/credentials/issue -d '{
+  "id": "degree-2026-001", "subject": "hkm<student>",
+  "data_hash": "<sha256 of the document>", "issuer": "hkm<issuer>",
+  "nonce": 1, "public_key": "<issuer pub>", "signature": "<sig>"
+}'
+
+# 3. Anyone, anywhere verifies — and gets a portable, state-root-bound proof
+curl localhost:3000/credentials/degree-2026-001/proof
+#   → { credential, height, state_root, block_hash }
+
+# 4. Revocation is a first-class on-chain operation (issuer-only, instant)
+curl -X POST localhost:3000/credentials/revoke -d '{ "id": "degree-2026-001", … }'
+```
+
+Why it stands out:
+
+| | Typical chains | Hikmalayer |
+|---|---|---|
+| Credential logic | Smart-contract per issuer | Native consensus objects |
+| Verification | Requires contract ABI + indexer | One HTTP call, checked against the state root |
+| Privacy | Data often on-chain | Only the document hash on-chain |
+| Revocation | Contract-specific | Protocol-level, issuer-signed, instant |
+| Trust needed | The RPC node | None — the proof binds to the replicated state root |
 
 ## Running a node
 
@@ -316,6 +368,8 @@ Current implementation provides:
 - Replicated on-chain state machine with per-block **state-root** commitment  
 - Native `hkm…` identity and signing domain (no external-chain dependency)  
 - On-chain validator set: staking & withdrawal are signed on-chain transactions  
+- VRF randomness beacon (sr25519) seeding unbiasable leader election  
+- Proof-of-Credential: native on-chain verifiable credentials with state-root proofs  
 - Hybrid PoS validator selection + PoW block finalization (enforced end-to-end)  
 - Deterministic genesis + Merkle-committed transactions  
 - Signed transactions with on-chain nonce replay protection  
@@ -365,7 +419,8 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 | Phase 4 | ✅ Complete (Execution + Ops) |
 | Phase 5 | ✅ Consensus layer complete (gossip, fork choice, finality, signed txs) |
 | Phase 6 | ✅ Replicated on-chain state machine, native identity, on-chain validator set & slashing |
-| Phase 7 | 🚧 Mainnet hardening (VRF election, fee market, audit — see `docs/mainnet_readiness.md`) |
+| Phase 7 | ✅ VRF randomness beacon (unbiasable leader election) + Proof-of-Credential registry |
+| Phase 8 | 🚧 Mainnet hardening (unbonding, fee market, P2P identity, audit — see `docs/mainnet_readiness.md`) |
 
 
 

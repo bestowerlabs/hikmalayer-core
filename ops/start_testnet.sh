@@ -32,7 +32,7 @@ done
 
 dev_privkey() { printf "%064x" "$1"; }
 
-pubkey_of() { "${WALLET}" sign-stake x 1 1 "$1" | awk '/public_key:/{print $2}'; }
+pubkey_of() { "${WALLET}" sign-stake x 1 1 "$1" | awk '$1=="public_key:"{print $2}'; }
 address_of() { "${WALLET}" address "$1" | awk '{print $2}'; }
 
 echo "Registering validators 2..5 on-chain via the bootnode..."
@@ -48,12 +48,14 @@ for i in 2 3 4 5; do
     -d "{\"to\":\"${addr}\",\"amount\":300}" >/dev/null
   curl -s -X POST "${BOOT}/mine" >/dev/null
 
-  # Sign and submit the on-chain stake, then mine it in.
+  # Sign and submit the on-chain stake (binds the VRF key), then mine it in.
   nonce=$(curl -s "${BOOT}/tokens/nonce/${addr}" | sed 's/.*"next_nonce":\([0-9]*\).*/\1/')
-  sig=$("${WALLET}" sign-stake "${addr}" 100 "${nonce}" "${sk}" | awk '/signature:/{print $2}')
+  stake_out=$("${WALLET}" sign-stake "${addr}" 100 "${nonce}" "${sk}")
+  sig=$(echo "${stake_out}" | awk '/signature:/{print $2}')
+  vrf_pub=$(echo "${stake_out}" | awk '/vrf_public_key:/{print $2}')
   curl -s -X POST "${BOOT}/staking/deposit" \
     -H "Content-Type: application/json" \
-    -d "{\"address\":\"${addr}\",\"amount\":100,\"public_key\":\"${pub}\",\"nonce\":${nonce},\"signature\":\"${sig}\"}" >/dev/null
+    -d "{\"address\":\"${addr}\",\"amount\":100,\"public_key\":\"${pub}\",\"vrf_public_key\":\"${vrf_pub}\",\"nonce\":${nonce},\"signature\":\"${sig}\"}" >/dev/null
   curl -s -X POST "${BOOT}/mine" >/dev/null
 
   echo "  registered ${addr} (stake 100)"

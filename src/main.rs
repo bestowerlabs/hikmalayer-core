@@ -19,16 +19,26 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_GENESIS_SUPPLY);
 
+    let vrf_key = std::env::var("GENESIS_VALIDATOR_VRF_PUBLIC_KEY")
+        .ok()
+        .filter(|v| !v.is_empty());
+
     match (
         std::env::var("GENESIS_TREASURY_ADDRESS").ok().filter(|v| !v.is_empty()),
         std::env::var("GENESIS_VALIDATOR_PUBLIC_KEY").ok().filter(|v| !v.is_empty()),
     ) {
         (Some(treasury), validator_key) => {
-            Blockchain::new_with_genesis(difficulty, treasury, validator_key, supply)
+            Blockchain::new_with_genesis(difficulty, treasury, validator_key, vrf_key, supply)
         }
         (None, Some(validator_key)) => {
             let treasury = pos::derive_address(&validator_key).unwrap_or_default();
-            Blockchain::new_with_genesis(difficulty, treasury, Some(validator_key), supply)
+            Blockchain::new_with_genesis(
+                difficulty,
+                treasury,
+                Some(validator_key),
+                vrf_key,
+                supply,
+            )
         }
         (None, None) => {
             eprintln!(

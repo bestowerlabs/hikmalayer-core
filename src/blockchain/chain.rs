@@ -1,7 +1,7 @@
 use super::block::Block;
 use super::state::ChainState;
 use super::transaction::{Transaction, TransactionType};
-use crate::consensus::{pos, pow};
+use crate::consensus::{pos, pow, vrf};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +22,10 @@ pub fn dev_genesis_private_key() -> String {
 
 fn default_genesis_validator_public_key() -> Option<String> {
     pos::derive_public_key(&dev_genesis_private_key()).ok()
+}
+
+fn default_genesis_validator_vrf_public_key() -> Option<String> {
+    vrf::derive_vrf_public_key(&dev_genesis_private_key()).ok()
 }
 
 fn default_genesis_treasury() -> String {
@@ -46,12 +50,18 @@ pub struct Blockchain {
     pub genesis_treasury: String,
     #[serde(default = "default_genesis_validator_public_key")]
     pub genesis_validator_public_key: Option<String>,
+    #[serde(default = "default_genesis_validator_vrf_public_key")]
+    pub genesis_validator_vrf_public_key: Option<String>,
     #[serde(default = "default_genesis_supply")]
     pub genesis_supply: u64,
     /// Current chain state: derived from the blocks, never persisted.
     /// Rebuilt via `rebuild_state` after deserialization.
     #[serde(skip)]
     pub state: ChainState,
+    /// Randomness beacon at the current tip: a fold of every block's VRF
+    /// output, seeding unbiasable leader election. Derived, never persisted.
+    #[serde(skip)]
+    pub randomness: String,
 }
 
 /// A validation failure. `slashable` distinguishes provable validator
@@ -86,6 +96,7 @@ impl Blockchain {
             difficulty,
             default_genesis_treasury(),
             default_genesis_validator_public_key(),
+            default_genesis_validator_vrf_public_key(),
             default_genesis_supply(),
         )
     }
@@ -94,23 +105,29 @@ impl Blockchain {
         difficulty: usize,
         genesis_treasury: String,
         genesis_validator_public_key: Option<String>,
+        genesis_validator_vrf_public_key: Option<String>,
         genesis_supply: u64,
     ) -> Self {
         let difficulty = pow::clamp_difficulty(difficulty);
         let state = ChainState::genesis(
             &genesis_treasury,
             genesis_validator_public_key.as_deref(),
+            genesis_validator_vrf_public_key.as_deref(),
             genesis_supply,
         );
         let genesis_block = Block::genesis(difficulty, state.state_root());
+        // The beacon starts at the (deterministic) genesis hash.
+        let randomness = genesis_block.hash.clone();
         Blockchain {
             blocks: vec![genesis_block],
             difficulty,
             finalized_height: 0,
             genesis_treasury,
             genesis_validator_public_key,
+            genesis_validator_vrf_public_key,
             genesis_supply,
             state,
+            randomness,
         }
     }
 
@@ -118,6 +135,7 @@ impl Blockchain {
         ChainState::genesis(
             &self.genesis_treasury,
             self.genesis_validator_public_key.as_deref(),
+            self.genesis_validator_vrf_public_key.as_deref(),
             self.genesis_supply,
         )
     }
@@ -150,8 +168,13 @@ impl Blockchain {
         )
     }
 
-    /// Append a fully validated block and adopt its post-state.
+    /// Append a fully validated block, adopt its post-state, and fold its
+    /// VRF output into the randomness beacon.
     pub fn commit_block(&mut self, block: Block, post_state: ChainState) {
+        self.randomness = vrf::next_randomness(
+            &self.randomness,
+            block.vrf_output.as_deref().unwrap_or_default(),
+        );
         self.blocks.push(block);
         self.state = post_state;
     }
@@ -182,13 +205,14 @@ impl Blockchain {
     }
 
     /// Full consensus validation of a single non-genesis block against its
-    /// expected position and the state at its parent. On success returns the
-    /// post-execution state.
+    /// expected position, the state at its parent, and the randomness beacon
+    /// at its parent. On success returns the post-execution state.
     fn validate_block_at(
         block: &Block,
         expected_index: u64,
         expected_previous_hash: &str,
         parent_state: &ChainState,
+        parent_randomness: &str,
     ) -> Result<ChainState, BlockError> {
         if block.index != expected_index {
             return Err(BlockError::structural(
@@ -215,10 +239,12 @@ impl Blockchain {
             ));
         }
 
-        // PoS: the validator set is the ON-CHAIN set at the parent state.
+        // PoS: the validator set is the ON-CHAIN set at the parent state,
+        // and the slot seed comes from the VRF randomness beacon — the
+        // producer of the parent block could not grind it.
         let validator_set = parent_state.validator_set();
-        let seed = pos::selection_seed(&block.previous_hash, block.index);
-        let expected_validator = pos::select_staker_with_seed(&seed, &validator_set);
+        let slot_input = vrf::slot_input(parent_randomness, block.index);
+        let expected_validator = pos::select_staker_with_seed(&slot_input, &validator_set);
         if expected_validator.is_none() {
             return Err(BlockError::structural(
                 "No validators registered at parent state",
@@ -246,6 +272,27 @@ impl Blockchain {
         let signature = block.validator_signature.as_ref().unwrap();
         if !pos::verify_block_signature(&block.hash, public_key, signature) {
             return Err(BlockError::slashable("Block signature verification failed"));
+        }
+
+        // VRF: the block must carry the unique, verifiable randomness
+        // contribution of its validator for this exact slot.
+        let registered_vrf_key = parent_state
+            .stakers
+            .get(validator)
+            .map(|info| info.vrf_public_key.as_str())
+            .unwrap_or_default();
+        if registered_vrf_key.is_empty() {
+            return Err(BlockError::structural(
+                "Validator has no registered VRF key",
+            ));
+        }
+        let (Some(vrf_output), Some(vrf_proof)) = (&block.vrf_output, &block.vrf_proof) else {
+            return Err(BlockError::structural(
+                "Block missing VRF output or proof",
+            ));
+        };
+        if !vrf::verify(&slot_input, registered_vrf_key, vrf_output, vrf_proof) {
+            return Err(BlockError::slashable("Block VRF verification failed"));
         }
 
         if !block.has_valid_merkle_root() {
@@ -307,13 +354,36 @@ impl Blockchain {
             self.blocks.len() as u64,
             &self.latest_hash(),
             &self.state,
+            &self.randomness,
         )
         .map_err(|err| err.reason)
     }
 
+    /// The VRF input for the next slot at the current tip. Exposed so the
+    /// selected validator can compute its VRF proof offline.
+    pub fn next_slot_input(&self) -> String {
+        vrf::slot_input(&self.randomness, self.blocks.len() as u64)
+    }
+
+    /// Cheap integrity probe for hot read endpoints: verifies the tip
+    /// commitment against the live state without replaying the chain.
+    /// Full replay validation remains available via `validate_full`.
+    pub fn quick_integrity(&self) -> bool {
+        match self.blocks.last() {
+            Some(tip) => {
+                tip.state_root == self.state.state_root()
+                    && tip.has_valid_pow()
+                    && (self.blocks.len() < 2
+                        || tip.previous_hash == self.blocks[self.blocks.len() - 2].hash)
+            }
+            None => false,
+        }
+    }
+
     /// Validate the entire chain from genesis by replaying the state
-    /// machine. Returns the final state, or the first failure.
-    pub fn validate_full(&self) -> Result<ChainState, (usize, BlockError)> {
+    /// machine and the randomness beacon. Returns the final (state,
+    /// randomness), or the first failure.
+    pub fn validate_full(&self) -> Result<(ChainState, String), (usize, BlockError)> {
         let genesis = self
             .blocks
             .first()
@@ -330,13 +400,19 @@ impl Blockchain {
             ));
         }
 
+        let mut randomness = genesis.hash.clone();
         for i in 1..self.blocks.len() {
             let current = &self.blocks[i];
             let previous = &self.blocks[i - 1];
-            state = Self::validate_block_at(current, i as u64, &previous.hash, &state)
-                .map_err(|error| (i, error))?;
+            state =
+                Self::validate_block_at(current, i as u64, &previous.hash, &state, &randomness)
+                    .map_err(|error| (i, error))?;
+            randomness = vrf::next_randomness(
+                &randomness,
+                current.vrf_output.as_deref().unwrap_or_default(),
+            );
         }
-        Ok(state)
+        Ok((state, randomness))
     }
 
     pub fn is_valid(&self) -> bool {
@@ -347,8 +423,9 @@ impl Blockchain {
     /// adoption). Fails if the stored chain does not validate.
     pub fn rebuild_state(&mut self) -> Result<(), String> {
         match self.validate_full() {
-            Ok(state) => {
+            Ok((state, randomness)) => {
                 self.state = state;
+                self.randomness = randomness;
                 Ok(())
             }
             Err((index, error)) => Err(format!("Block {}: {}", index, error.reason)),
@@ -431,8 +508,10 @@ impl Blockchain {
             finalized_height: 0,
             genesis_treasury: self.genesis_treasury.clone(),
             genesis_validator_public_key: self.genesis_validator_public_key.clone(),
+            genesis_validator_vrf_public_key: self.genesis_validator_vrf_public_key.clone(),
             genesis_supply: self.genesis_supply,
             state: ChainState::default(),
+            randomness: String::new(),
         };
         replay
             .rebuild_state()
@@ -440,6 +519,7 @@ impl Blockchain {
 
         self.blocks = replay.blocks;
         self.state = replay.state;
+        self.randomness = replay.randomness;
         Ok(true)
     }
 }
@@ -493,8 +573,8 @@ mod tests {
     /// transactions (plus the mandatory reward).
     fn mine_block_with(chain: &mut Blockchain, extra: Vec<Transaction>) -> Result<(), String> {
         let validator_set = chain.state.validator_set();
-        let seed = pos::selection_seed(&chain.latest_hash(), chain.blocks.len() as u64);
-        let validator = pos::select_staker_with_seed(&seed, &validator_set)
+        let slot_input = chain.next_slot_input();
+        let validator = pos::select_staker_with_seed(&slot_input, &validator_set)
             .ok_or("no validators".to_string())?;
         let public_key = chain.state.stakers.get(&validator).unwrap().public_key.clone();
 
@@ -520,6 +600,9 @@ mod tests {
             .find(|(addr, _)| *addr == validator)
             .map(|(_, key)| key)
             .ok_or("no key for selected validator".to_string())?;
+        let (vrf_output, vrf_proof) = vrf::prove(&slot_input, &private_key)?;
+        block.vrf_output = Some(vrf_output);
+        block.vrf_proof = Some(vrf_proof);
         block.validator_signature = Some(pos::sign_block_hash(&block.hash, &private_key).unwrap());
 
         let post_state = chain.validate_block_candidate(&block)?;
@@ -597,7 +680,9 @@ mod tests {
         );
         stake.nonce = 1;
         stake.public_key = Some(v_pub.clone());
-        let message = Transaction::stake_signing_message(&v_addr, 300, 1);
+        let v_vrf = vrf::derive_vrf_public_key(&v_key).unwrap();
+        stake.vrf_public_key = Some(v_vrf.clone());
+        let message = Transaction::stake_signing_message(&v_addr, 300, 1, &v_vrf);
         stake.signature = Some(pos::sign_message(&message, &v_key).unwrap());
         mine_block_with(&mut chain, vec![stake]).unwrap();
 
@@ -628,6 +713,10 @@ mod tests {
             Some(t_pub),
             post.state_root(),
         );
+        let (vrf_output, vrf_proof) =
+            vrf::prove(&chain.next_slot_input(), &t_key).unwrap();
+        block.vrf_output = Some(vrf_output);
+        block.vrf_proof = Some(vrf_proof);
         block.validator_signature = Some(pos::sign_block_hash(&block.hash, &t_key).unwrap());
 
         let error = chain.validate_block_candidate(&block).unwrap_err();
@@ -736,6 +825,65 @@ mod tests {
 
         let error = chain.validate_block_candidate(&block).unwrap_err();
         assert!(error.contains("future"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn rejects_missing_or_forged_vrf() {
+        let chain = Blockchain::default();
+        let (t_addr, t_pub, t_key) = treasury();
+        let reward = Transaction::new_reward(&t_addr);
+        let mut post = chain.state.clone();
+        post.apply_transaction(&reward).unwrap();
+
+        let mut block = chain.create_block(
+            vec![serde_json::to_string(&reward).unwrap()],
+            Some(t_addr),
+            Some(t_pub),
+            post.state_root(),
+        );
+        block.validator_signature =
+            Some(pos::sign_block_hash(&block.hash, &t_key).unwrap());
+
+        // No VRF material at all.
+        let error = chain.validate_block_candidate(&block).unwrap_err();
+        assert!(error.contains("VRF"), "unexpected error: {error}");
+
+        // VRF proof produced by the WRONG key.
+        let intruder = hex::encode([9u8; 32]);
+        let (output, proof) = vrf::prove(&chain.next_slot_input(), &intruder).unwrap();
+        block.vrf_output = Some(output);
+        block.vrf_proof = Some(proof);
+        let error = chain.validate_block_candidate(&block).unwrap_err();
+        assert!(
+            error.contains("VRF verification failed"),
+            "unexpected error: {error}"
+        );
+
+        // VRF proof over the WRONG slot input.
+        let (output, proof) = vrf::prove("some-other-input", &t_key).unwrap();
+        block.vrf_output = Some(output);
+        block.vrf_proof = Some(proof);
+        let error = chain.validate_block_candidate(&block).unwrap_err();
+        assert!(
+            error.contains("VRF verification failed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn randomness_beacon_evolves_and_replays() {
+        let mut chain = Blockchain::default();
+        let genesis_randomness = chain.randomness.clone();
+        mine_valid_block(&mut chain);
+        let after_one = chain.randomness.clone();
+        assert_ne!(genesis_randomness, after_one);
+        mine_valid_block(&mut chain);
+        assert_ne!(after_one, chain.randomness);
+
+        // Replay reconstructs the exact same beacon.
+        let runtime = chain.randomness.clone();
+        chain.rebuild_state().unwrap();
+        assert_eq!(chain.randomness, runtime);
     }
 
     #[test]

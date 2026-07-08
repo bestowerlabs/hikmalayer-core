@@ -16,9 +16,9 @@ use crate::{
         block::Block,
         chain::Blockchain,
         state::ChainState,
-        transaction::{SlashProof, Transaction, TransactionType},
+        transaction::{CredentialAction, SlashProof, Transaction, TransactionType},
     },
-    consensus::{pos, pow},
+    consensus::{pos, pow, vrf},
     contract::contract::ContractExecutor,
     governance::GovernanceConfig,
     p2p::{
@@ -34,6 +34,7 @@ use crate::{
 pub struct LocalValidatorKey {
     pub address: String,
     pub public_key: String,
+    pub vrf_public_key: String,
     pub private_key: String,
 }
 
@@ -41,9 +42,11 @@ impl LocalValidatorKey {
     pub fn from_private_key(private_key_hex: &str) -> Result<Self, String> {
         let public_key = pos::derive_public_key(private_key_hex)?;
         let address = pos::derive_address(&public_key)?;
+        let vrf_public_key = vrf::derive_vrf_public_key(private_key_hex)?;
         Ok(Self {
             address,
             public_key,
+            vrf_public_key,
             private_key: private_key_hex.to_string(),
         })
     }
@@ -100,6 +103,22 @@ pub struct FaucetRequest {
 }
 
 #[derive(Deserialize)]
+pub struct CredentialWriteRequest {
+    pub id: String,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub data_hash: String,
+    #[serde(default)]
+    pub revoke: bool,
+    pub issuer: String,
+    #[serde(default)]
+    pub nonce: u64,
+    pub public_key: Option<String>,
+    pub signature: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct DifficultyRequest {
     pub difficulty: usize,
 }
@@ -109,6 +128,7 @@ pub struct StakeRequest {
     pub address: String,
     pub amount: u64,
     pub public_key: Option<String>,
+    pub vrf_public_key: Option<String>,
     #[serde(default)]
     pub nonce: u64,
     pub signature: Option<String>,
@@ -158,6 +178,9 @@ pub struct ProposeBlockResponse {
     pub selected_validator: Option<String>,
     pub block: Option<Block>,
     pub block_hash: Option<String>,
+    /// VRF input the selected validator must prove over
+    /// (hikma-wallet vrf-prove).
+    pub vrf_input: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -444,6 +467,11 @@ pub fn api_routes() -> Router<AppState> {
         .route("/certificates/issue", post(issue_certificate))
         .route("/certificates/verify", post(verify_certificate))
         .route("/certificates/attest", post(attest_certificate))
+        // On-chain verifiable credentials (Proof-of-Credential)
+        .route("/credentials/issue", post(issue_credential))
+        .route("/credentials/revoke", post(revoke_credential))
+        .route("/credentials/{id}", get(get_credential))
+        .route("/credentials/{id}/proof", get(get_credential_proof))
         // Token routes
         .route("/tokens/transfer", post(transfer_tokens))
         .route("/tokens/faucet", post(faucet_tokens))
@@ -609,6 +637,132 @@ async fn attest_certificate(
         } else {
             format!("Certificate {} not found", payload.id)
         },
+    })
+}
+
+// ===== ON-CHAIN VERIFIABLE CREDENTIALS (Proof-of-Credential) =====
+
+#[derive(Serialize)]
+pub struct CredentialResponse {
+    pub status: String,
+    pub message: String,
+    pub credential: Option<crate::blockchain::state::CredentialRecord>,
+}
+
+#[derive(Serialize)]
+pub struct CredentialProofResponse {
+    pub status: String,
+    pub credential: Option<crate::blockchain::state::CredentialRecord>,
+    /// Chain height at which this proof was produced.
+    pub height: u64,
+    /// State root committing to the credential registry at `height`.
+    pub state_root: String,
+    /// Hash of the block that committed `state_root` (PoW + validator
+    /// signed) — the anchor a third party checks against the network.
+    pub block_hash: String,
+}
+
+/// Queue a signed credential action (issue or revoke) as an on-chain
+/// transaction. Permissionless: any account can issue credentials it signs;
+/// only the on-chain issuer can revoke.
+async fn queue_credential_action(
+    state: &AppState,
+    payload: CredentialWriteRequest,
+    revoke: bool,
+) -> Json<CredentialResponse> {
+    let action = CredentialAction {
+        id: payload.id.clone(),
+        subject: payload.subject.clone(),
+        data_hash: payload.data_hash.clone(),
+        revoke,
+    };
+
+    let mut tx = Transaction::new(
+        Some(payload.issuer.clone()),
+        payload.subject.clone(),
+        0,
+        TransactionType::Certificate,
+    );
+    tx.nonce = payload.nonce;
+    tx.public_key = payload.public_key.clone();
+    tx.signature = payload.signature.clone();
+    tx.credential = Some(action);
+
+    match queue_transaction(state, tx).await {
+        Ok(()) => Json(CredentialResponse {
+            status: "success".to_string(),
+            message: format!(
+                "Credential {} {} queued; it takes effect when mined into a block",
+                payload.id,
+                if revoke { "revocation" } else { "issuance" }
+            ),
+            credential: None,
+        }),
+        Err(message) => Json(CredentialResponse {
+            status: "error".to_string(),
+            message,
+            credential: None,
+        }),
+    }
+}
+
+async fn issue_credential(
+    State(state): State<AppState>,
+    Json(payload): Json<CredentialWriteRequest>,
+) -> Json<CredentialResponse> {
+    queue_credential_action(&state, payload, false).await
+}
+
+async fn revoke_credential(
+    State(state): State<AppState>,
+    Json(payload): Json<CredentialWriteRequest>,
+) -> Json<CredentialResponse> {
+    queue_credential_action(&state, payload, true).await
+}
+
+async fn get_credential(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<CredentialResponse> {
+    let chain = state.chain.lock().await;
+    match chain.state.credentials.get(&id) {
+        Some(record) => Json(CredentialResponse {
+            status: "success".to_string(),
+            message: if record.revoked {
+                format!("Credential {} is REVOKED", id)
+            } else {
+                format!("Credential {} is valid", id)
+            },
+            credential: Some(record.clone()),
+        }),
+        None => Json(CredentialResponse {
+            status: "error".to_string(),
+            message: format!("Credential {} not found", id),
+            credential: None,
+        }),
+    }
+}
+
+/// Portable credential proof: the record plus the chain commitment
+/// (height, state root, committing block hash). A third party verifies the
+/// state root against any honest node — or replays the chain — without
+/// trusting this node.
+async fn get_credential_proof(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<CredentialProofResponse> {
+    let chain = state.chain.lock().await;
+    let credential = chain.state.credentials.get(&id).cloned();
+    Json(CredentialProofResponse {
+        status: if credential.is_some() {
+            "success".to_string()
+        } else {
+            "error".to_string()
+        },
+        credential,
+        height: chain.blocks.len() as u64 - 1,
+        state_root: chain.state.state_root(),
+        block_hash: chain.latest_hash(),
     })
 }
 
@@ -778,7 +932,7 @@ async fn get_blockchain_stats(State(state): State<AppState>) -> Json<BlockchainS
         total_blocks: chain.blocks.len(),
         pending_transactions: pending.len(),
         difficulty: chain.difficulty,
-        is_valid: chain.is_valid(),
+        is_valid: chain.quick_integrity(),
         latest_hash: chain.latest_hash(),
         finalized_height: chain.finalized_height,
         finality_depth: governance.finality_depth,
@@ -817,7 +971,7 @@ async fn get_explorer_overview(State(state): State<AppState>) -> Json<ExplorerOv
         latest_hash: chain.latest_hash(),
         peers: peers.len(),
         validators: chain.state.validator_set().len(),
-        chain_valid: chain.is_valid(),
+        chain_valid: chain.quick_integrity(),
     })
 }
 
@@ -929,6 +1083,7 @@ async fn search_explorer(
 struct BlockPlan {
     validator: String,
     public_key: String,
+    slot_input: String,
     transactions: Vec<String>,
     state_root: String,
     included_ids: Vec<String>,
@@ -943,9 +1098,9 @@ fn plan_block(chain: &Blockchain, pending: &[Transaction]) -> Result<BlockPlan, 
     }
 
     let validator_set = chain.state.validator_set();
-    let next_index = chain.blocks.len() as u64;
-    let seed = pos::selection_seed(&chain.latest_hash(), next_index);
-    let validator = pos::select_staker_with_seed(&seed, &validator_set)
+    // Slot seed from the VRF randomness beacon: unbiasable by grinding.
+    let slot_input = chain.next_slot_input();
+    let validator = pos::select_staker_with_seed(&slot_input, &validator_set)
         .ok_or_else(|| "No validators available. Stake tokens to become a validator.".to_string())?;
     let public_key = chain
         .state
@@ -984,6 +1139,7 @@ fn plan_block(chain: &Blockchain, pending: &[Transaction]) -> Result<BlockPlan, 
     Ok(BlockPlan {
         validator,
         public_key,
+        slot_input,
         transactions,
         state_root: post_state.state_root(),
         included_ids,
@@ -1135,6 +1291,24 @@ async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
         plan.state_root,
     );
 
+    // VRF contribution for this slot (unique — nothing to grind).
+    match vrf::prove(&plan.slot_input, &validator_key.private_key) {
+        Ok((output, proof)) => {
+            block.vrf_output = Some(output);
+            block.vrf_proof = Some(proof);
+        }
+        Err(message) => {
+            drop(chain);
+            drop(pending);
+            return Json(MiningResponse {
+                status: "error".to_string(),
+                message: format!("Failed to compute VRF proof: {}", message),
+                block_index: 0,
+                transactions_count: 0,
+            });
+        }
+    }
+
     let signature = match pos::sign_block_hash(&block.hash, &validator_key.private_key) {
         Ok(value) => value,
         Err(message) => {
@@ -1215,6 +1389,7 @@ async fn propose_block(State(state): State<AppState>) -> Json<ProposeBlockRespon
                 selected_validator: None,
                 block: None,
                 block_hash: None,
+                vrf_input: None,
             });
         }
     };
@@ -1231,13 +1406,15 @@ async fn propose_block(State(state): State<AppState>) -> Json<ProposeBlockRespon
         status: "success".to_string(),
         message: format!(
             "Block candidate created for validator {}. Sign block_hash with the validator's \
-             private key (hikma-wallet sign-block) and POST the block with validator_signature \
-             set to /mine/submit.",
+             private key (hikma-wallet sign-block), compute the VRF proof over vrf_input \
+             (hikma-wallet vrf-prove), set validator_signature, vrf_output, and vrf_proof \
+             on the block, and POST it to /mine/submit.",
             plan.validator
         ),
         selected_validator: Some(plan.validator),
         block: Some(block),
         block_hash: Some(block_hash),
+        vrf_input: Some(plan.slot_input),
     })
 }
 
@@ -1373,6 +1550,7 @@ async fn stake_tokens(
     );
     tx.nonce = payload.nonce;
     tx.public_key = payload.public_key.clone();
+    tx.vrf_public_key = payload.vrf_public_key.clone();
     tx.signature = payload.signature.clone();
 
     match queue_transaction(&state, tx).await {
@@ -2119,11 +2297,16 @@ mod tests {
         assert_eq!(proposal.0.status, "success", "{}", proposal.0.message);
         let mut block = proposal.0.block.unwrap();
         let selected = proposal.0.selected_validator.unwrap();
+        let vrf_input = proposal.0.vrf_input.unwrap();
         let key = keyring
             .iter()
             .find(|(addr, _)| *addr == selected)
             .map(|(_, key)| key.clone())
             .expect("no key for selected validator");
+        // The validator's offline steps: VRF proof + block signature.
+        let (vrf_output, vrf_proof) = vrf::prove(&vrf_input, &key).unwrap();
+        block.vrf_output = Some(vrf_output);
+        block.vrf_proof = Some(vrf_proof);
         block.validator_signature =
             Some(pos::sign_block_hash(&block.hash, &key).unwrap());
         let response = submit_block(State(state.clone()), Json(block)).await;
@@ -2183,7 +2366,9 @@ mod tests {
             .await
             .0
             .next_nonce;
-        let message = Transaction::stake_signing_message(&address, stake, nonce);
+        let vrf_public_key = vrf::derive_vrf_public_key(&private_key).unwrap();
+        let message =
+            Transaction::stake_signing_message(&address, stake, nonce, &vrf_public_key);
         let signature = pos::sign_message(&message, &private_key).unwrap();
         let response = stake_tokens(
             State(state.clone()),
@@ -2191,6 +2376,7 @@ mod tests {
                 address: address.clone(),
                 amount: stake,
                 public_key: Some(public_key.clone()),
+                vrf_public_key: Some(vrf_public_key),
                 nonce,
                 signature: Some(signature),
             }),
@@ -2307,6 +2493,7 @@ mod tests {
                 address: address.clone(),
                 amount: 50,
                 public_key: None,
+                vrf_public_key: None,
                 nonce: 99,
                 signature: None,
             }),
@@ -2327,6 +2514,7 @@ mod tests {
                 address: address.clone(),
                 amount: 50,
                 public_key: None,
+                vrf_public_key: None,
                 nonce,
                 signature: Some(signature),
             }),
@@ -2427,6 +2615,11 @@ mod tests {
             block.state_root.clone(),
         );
         let mut forged = rebuilt;
+        let vrf_input = state.chain.lock().await.next_slot_input();
+        let (vrf_output, vrf_proof) =
+            vrf::prove(&vrf_input, &treasury.private_key).unwrap();
+        forged.vrf_output = Some(vrf_output);
+        forged.vrf_proof = Some(vrf_proof);
         forged.validator_signature =
             Some(pos::sign_block_hash(&forged.hash, &treasury.private_key).unwrap());
 
@@ -2577,6 +2770,118 @@ mod tests {
         let response =
             receive_protocol_message(State(state.clone()), p2p_headers(), Json(envelope)).await;
         assert_eq!(response.0.status, "error");
+    }
+
+    #[tokio::test]
+    async fn credential_lifecycle_on_chain() {
+        let state = test_state(true);
+        let issuer = test_wallet(21);
+
+        // Unsigned issuance never enters the pool.
+        let response = issue_credential(
+            State(state.clone()),
+            Json(CredentialWriteRequest {
+                id: "cred-1".to_string(),
+                subject: "hkmsubject".to_string(),
+                data_hash: "abc123".to_string(),
+                revoke: false,
+                issuer: issuer.0.clone(),
+                nonce: 1,
+                public_key: None,
+                signature: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.0.status, "error");
+
+        // Signed issuance queues and executes on-chain.
+        let action = CredentialAction {
+            id: "cred-1".to_string(),
+            subject: "hkmsubject".to_string(),
+            data_hash: "abc123".to_string(),
+            revoke: false,
+        };
+        let message = Transaction::credential_signing_message(&action, 1);
+        let signature = pos::sign_message(&message, &issuer.2).unwrap();
+        let response = issue_credential(
+            State(state.clone()),
+            Json(CredentialWriteRequest {
+                id: "cred-1".to_string(),
+                subject: "hkmsubject".to_string(),
+                data_hash: "abc123".to_string(),
+                revoke: false,
+                issuer: issuer.0.clone(),
+                nonce: 1,
+                public_key: Some(issuer.1.clone()),
+                signature: Some(signature),
+            }),
+        )
+        .await;
+        assert_eq!(response.0.status, "success", "{}", response.0.message);
+        mine_next(&state, &base_keyring()).await;
+
+        // Readable, with a portable proof bound to the state root.
+        let lookup = get_credential(State(state.clone()), Path("cred-1".to_string())).await;
+        assert_eq!(lookup.0.status, "success");
+        assert!(!lookup.0.credential.as_ref().unwrap().revoked);
+
+        let proof = get_credential_proof(State(state.clone()), Path("cred-1".to_string())).await;
+        assert_eq!(proof.0.status, "success");
+        let chain = state.chain.lock().await;
+        assert_eq!(proof.0.state_root, chain.state.state_root());
+        assert_eq!(proof.0.block_hash, chain.latest_hash());
+        drop(chain);
+
+        // Only the issuer can revoke: a stranger's signed revoke is queued
+        // but rejected by the state machine (never applies).
+        let stranger = test_wallet(22);
+        let revoke_action = CredentialAction {
+            id: "cred-1".to_string(),
+            subject: String::new(),
+            data_hash: String::new(),
+            revoke: true,
+        };
+        let message = Transaction::credential_signing_message(&revoke_action, 1);
+        let signature = pos::sign_message(&message, &stranger.2).unwrap();
+        let response = revoke_credential(
+            State(state.clone()),
+            Json(CredentialWriteRequest {
+                id: "cred-1".to_string(),
+                subject: String::new(),
+                data_hash: String::new(),
+                revoke: true,
+                issuer: stranger.0.clone(),
+                nonce: 1,
+                public_key: Some(stranger.1.clone()),
+                signature: Some(signature),
+            }),
+        )
+        .await;
+        assert_eq!(response.0.status, "error", "{}", response.0.message);
+
+        // The real issuer revokes (nonce 2).
+        let message = Transaction::credential_signing_message(&revoke_action, 2);
+        let signature = pos::sign_message(&message, &issuer.2).unwrap();
+        let response = revoke_credential(
+            State(state.clone()),
+            Json(CredentialWriteRequest {
+                id: "cred-1".to_string(),
+                subject: String::new(),
+                data_hash: String::new(),
+                revoke: true,
+                issuer: issuer.0.clone(),
+                nonce: 2,
+                public_key: Some(issuer.1.clone()),
+                signature: Some(signature),
+            }),
+        )
+        .await;
+        assert_eq!(response.0.status, "success", "{}", response.0.message);
+        mine_next(&state, &base_keyring()).await;
+
+        let lookup = get_credential(State(state.clone()), Path("cred-1".to_string())).await;
+        assert!(lookup.0.credential.as_ref().unwrap().revoked);
+        assert!(lookup.0.message.contains("REVOKED"));
     }
 
     #[tokio::test]

@@ -25,6 +25,23 @@ pub const GENESIS_VALIDATOR_STAKE: u64 = 1_000;
 pub struct StakeInfo {
     pub stake: u64,
     pub public_key: String,
+    /// sr25519 VRF public key used for unbiasable leader-election
+    /// randomness. Registered on-chain with the stake.
+    #[serde(default)]
+    pub vrf_public_key: String,
+}
+
+/// An on-chain verifiable credential: the issuer anchors a hash of the
+/// credential document (the document itself stays private/off-chain) bound
+/// to a subject. Revocation is a first-class on-chain operation by the
+/// issuer. Any third party can verify a credential against the state root.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CredentialRecord {
+    pub issuer: String,
+    pub subject: String,
+    pub data_hash: String,
+    pub issued_at: String,
+    pub revoked: bool,
 }
 
 /// Deterministic chain state. All maps are `BTreeMap` so serialization —
@@ -34,6 +51,9 @@ pub struct ChainState {
     pub balances: BTreeMap<String, u64>,
     pub stakers: BTreeMap<String, StakeInfo>,
     pub nonces: BTreeMap<String, u64>,
+    /// On-chain verifiable credentials, keyed by credential ID.
+    #[serde(default)]
+    pub credentials: BTreeMap<String, CredentialRecord>,
     /// "{validator}:{height}" offenses already punished (prevents double
     /// slashing from the same equivocation proof).
     pub slashed_offenses: BTreeMap<String, u64>,
@@ -43,11 +63,12 @@ pub struct ChainState {
 
 impl ChainState {
     /// State at genesis: the entire initial supply is allocated to the
-    /// treasury, and (when its key is known) the treasury is registered as
+    /// treasury, and (when its keys are known) the treasury is registered as
     /// the genesis validator so the chain can bootstrap block production.
     pub fn genesis(
         treasury_address: &str,
         treasury_public_key: Option<&str>,
+        treasury_vrf_public_key: Option<&str>,
         initial_supply: u64,
     ) -> Self {
         let mut state = ChainState {
@@ -71,6 +92,7 @@ impl ChainState {
                 StakeInfo {
                     stake,
                     public_key: public_key.to_string(),
+                    vrf_public_key: treasury_vrf_public_key.unwrap_or_default().to_string(),
                 },
             );
         }
@@ -159,12 +181,17 @@ impl ChainState {
                     .public_key
                     .as_ref()
                     .ok_or_else(|| "Stake missing public key".to_string())?;
+                let vrf_public_key = tx
+                    .vrf_public_key
+                    .as_ref()
+                    .ok_or_else(|| "Stake missing VRF public key".to_string())?;
                 self.consume_nonce(from, tx.nonce)?;
                 self.debit(from, tx.amount)?;
                 self.credit(STAKING_POOL_ACCOUNT, tx.amount);
                 let entry = self.stakers.entry(from.clone()).or_default();
                 entry.stake += tx.amount;
                 entry.public_key = public_key.clone();
+                entry.vrf_public_key = vrf_public_key.clone();
                 Ok(())
             }
             TransactionType::Withdraw => {
@@ -211,7 +238,44 @@ impl ChainState {
                 self.total_supply += tx.amount;
                 Ok(())
             }
-            TransactionType::Certificate => Ok(()),
+            TransactionType::Certificate => {
+                // Legacy anchor transactions (no credential payload) remain
+                // valid no-ops; credential actions mutate the registry.
+                let Some(action) = &tx.credential else {
+                    return Ok(());
+                };
+                let issuer = tx
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "Credential action missing issuer".to_string())?;
+                self.consume_nonce(issuer, tx.nonce)?;
+
+                if action.revoke {
+                    let record = self
+                        .credentials
+                        .get_mut(&action.id)
+                        .ok_or_else(|| format!("Credential {} not found", action.id))?;
+                    if record.issuer != *issuer {
+                        return Err("Only the issuer can revoke a credential".to_string());
+                    }
+                    record.revoked = true;
+                } else {
+                    if self.credentials.contains_key(&action.id) {
+                        return Err(format!("Credential {} already exists", action.id));
+                    }
+                    self.credentials.insert(
+                        action.id.clone(),
+                        CredentialRecord {
+                            issuer: issuer.clone(),
+                            subject: action.subject.clone(),
+                            data_hash: action.data_hash.clone(),
+                            issued_at: tx.timestamp.to_rfc3339(),
+                            revoked: false,
+                        },
+                    );
+                }
+                Ok(())
+            }
             TransactionType::Slash => {
                 let proof = tx
                     .slash_proof
@@ -273,7 +337,8 @@ mod tests {
 
     fn genesis_state() -> (ChainState, String, String, String) {
         let (address, public_key, private_key) = wallet(1);
-        let state = ChainState::genesis(&address, Some(&public_key), 1_000_000);
+        let vrf_key = crate::consensus::vrf::derive_vrf_public_key(&private_key).unwrap();
+        let state = ChainState::genesis(&address, Some(&public_key), Some(&vrf_key), 1_000_000);
         (state, address, public_key, private_key)
     }
 
@@ -358,6 +423,8 @@ mod tests {
         );
         stake.nonce = 1;
         stake.public_key = Some(public_key.clone());
+        stake.vrf_public_key =
+            Some(crate::consensus::vrf::derive_vrf_public_key(&private_key).unwrap());
         state.apply_transaction(&stake).unwrap();
         assert_eq!(state.validator_set().len(), 2);
         assert_eq!(state.balance_of(&address), 200);

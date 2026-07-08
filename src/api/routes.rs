@@ -59,9 +59,8 @@ pub struct AppState {
     pub governance: Arc<Mutex<GovernanceConfig>>,
     pub slash_evidence: Arc<Mutex<Vec<crate::persistence::SlashEvidence>>>,
     pub metrics: Arc<Mutex<Metrics>>,
-    pub seen_messages: Arc<Mutex<SeenMessageCache>>,
-    pub p2p_token: Option<String>,
-    pub admin_token: Option<String>,
+    pub p2p_tokens: Vec<String>,
+    pub admin_tokens: Vec<String>,
     pub p2p_service: Arc<P2PService>,
     pub validator_key: Option<LocalValidatorKey>,
     /// Treasury key for dev/test faucet operation (never required in
@@ -341,44 +340,36 @@ async fn gossip_blocks(state: &AppState, blocks: Vec<Block>) -> Result<(), Strin
     Ok(())
 }
 
-async fn gossip_transaction(state: &AppState, transaction: Transaction) {
-    let targets = {
-        let peers = state.peers.lock().await;
-        peers.clone()
-    };
-    if targets.is_empty() {
-        return;
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    use std::cmp::min;
+    if a.len() != b.len() {
+        return false;
     }
-    let (sent, failed) = state
-        .p2p_service
-        .broadcast_transaction(targets, transaction)
-        .await;
-    let mut metrics = state.metrics.lock().await;
-    metrics.gossip_sent += sent;
-    metrics.gossip_failed += failed;
+    let mut result = 0u8;
+    for i in 0..min(a.len(), b.len()) {
+        result |= a.as_bytes()[i] ^ b.as_bytes()[i];
+    }
+    result == 0
 }
 
 fn authorize_p2p(headers: &HeaderMap, state: &AppState) -> bool {
-    // if no token configured, deny all requests
-    let token = match state.p2p_token.as_ref() {
-        Some(t) if !t.is_empty() => t,
-        _ => return false, // no token set = deny
+    if state.p2p_tokens.is_empty() {
+        return false;
+    }
+    let Some(supplied) = headers.get("x-p2p-token").and_then(|v| v.to_str().ok()) else {
+        return false;
     };
-    headers
-        .get("x-p2p-token")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == token)
+    state.p2p_tokens.iter().any(|t| constant_time_eq(t, supplied))
 }
 
 fn authorize_admin(headers: &HeaderMap, state: &AppState) -> bool {
-    let token = match state.admin_token.as_ref() {
-        Some(t) if !t.is_empty() => t,
-        _ => return false, // no token set = deny
+    if state.admin_tokens.is_empty() {
+        return false;
+    }
+    let Some(supplied) = headers.get("x-admin-token").and_then(|v| v.to_str().ok()) else {
+        return false;
     };
-    headers
-        .get("x-admin-token")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == token)
+    state.admin_tokens.iter().any(|t| constant_time_eq(t, supplied))
 }
 
 /// Chain state with all queued (not yet mined) transactions applied — the

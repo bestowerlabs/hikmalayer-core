@@ -101,64 +101,30 @@ async fn main() {
             .map(|state| state.slash_evidence.clone())
             .unwrap_or_default(),
     ));
-    let metrics = Arc::new(Mutex::new(Metrics::default()));
-    let seen_messages = Arc::new(Mutex::new(SeenMessageCache::new(8192)));
-
-    let p2p_token = std::env::var("P2P_TOKEN").ok().filter(|t| !t.is_empty());
-    let admin_token = std::env::var("ADMIN_TOKEN").ok().filter(|t| !t.is_empty());
-
-    if p2p_token.is_none() {
-        eprintln!("⚠️  P2P_TOKEN is not set: all P2P endpoints will reject requests.");
+    let metrics = Arc::new(Mutex::new(api::routes::Metrics::default()));
+    fn load_token_list(current_var: &str, previous_var: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    if let Ok(current) = std::env::var(current_var) {
+        if !current.is_empty() {
+            tokens.push(current);
+        }
     }
-    if admin_token.is_none() {
-        eprintln!("⚠️  ADMIN_TOKEN is not set: all admin endpoints will reject requests.");
+    if let Ok(previous) = std::env::var(previous_var) {
+        if !previous.is_empty() {
+            tokens.push(previous);
+        }
     }
+    tokens
+}
 
-    // This node's validator identity. The private key never leaves the node.
-    let validator_key = match std::env::var("VALIDATOR_PRIVATE_KEY") {
-        Ok(private_key) if !private_key.is_empty() => {
-            match LocalValidatorKey::from_private_key(&private_key) {
-                Ok(key) => {
-                    println!("🔑 Local validator identity: {}", key.address);
-                    Some(key)
-                }
-                Err(err) => {
-                    eprintln!("❌ Invalid VALIDATOR_PRIVATE_KEY: {}. Continuing without a local validator identity.", err);
-                    None
-                }
-            }
-        }
-        _ => {
-            eprintln!(
-                "ℹ️  VALIDATOR_PRIVATE_KEY not set: this node cannot mine directly. \
-                 Validators can still use /mine/propose + /mine/submit."
-            );
-            None
-        }
-    };
-
-    // Optional treasury key enabling the dev faucet (signed treasury
-    // transfers). Never set this on a production node.
-    let treasury_key = match std::env::var("TREASURY_PRIVATE_KEY") {
-        Ok(private_key) if !private_key.is_empty() => {
-            match LocalValidatorKey::from_private_key(&private_key) {
-                Ok(key) => {
-                    println!("🚰 Faucet enabled for treasury: {}", key.address);
-                    Some(key)
-                }
-                Err(err) => {
-                    eprintln!("❌ Invalid TREASURY_PRIVATE_KEY: {}. Faucet disabled.", err);
-                    None
-                }
-            }
-        }
-        _ => None,
-    };
+let p2p_tokens = load_token_list("P2P_TOKEN_CURRENT", "P2P_TOKEN_PREVIOUS");
+let admin_tokens = load_token_list("ADMIN_TOKEN_CURRENT", "ADMIN_TOKEN_PREVIOUS");
+    
 
     let p2p_service = Arc::new(
         P2PService::new(
             std::env::var("NODE_ID").unwrap_or_else(|_| "node-local".to_string()),
-            p2p_token.clone(),
+            p2p_tokens.first().cloned(),
         )
         .unwrap_or_else(|err| panic!("{}", err)),
     );
@@ -181,9 +147,8 @@ async fn main() {
         governance,
         slash_evidence,
         metrics,
-        seen_messages,
-        p2p_token,
-        admin_token,
+        p2p_tokens,
+        admin_tokens,
         p2p_service,
         validator_key,
         treasury_key,

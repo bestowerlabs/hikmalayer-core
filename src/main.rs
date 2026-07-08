@@ -1,36 +1,65 @@
 use axum::http::Method;
 use hikmalayer::api::routes::{api_routes, AppState, LocalValidatorKey, Metrics};
 use hikmalayer::auth::{routes::auth_routes, AuthManager};
-use hikmalayer::blockchain::{chain::Blockchain, transaction::Transaction};
-use hikmalayer::consensus::pos::Staker;
+use hikmalayer::blockchain::chain::{Blockchain, DEFAULT_GENESIS_SUPPLY};
+use hikmalayer::consensus::pos;
 use hikmalayer::contract::contract::ContractExecutor;
 use hikmalayer::p2p::{protocol::SeenMessageCache, service::P2PService};
 use hikmalayer::persistence::load_state;
-use hikmalayer::token::fungible::Token;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
+fn fresh_chain(difficulty: usize) -> Blockchain {
+    // Genesis network parameters. When unset, the well-known DEV defaults
+    // apply — suitable for local networks only.
+    let supply = std::env::var("GENESIS_SUPPLY")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_GENESIS_SUPPLY);
+
+    match (
+        std::env::var("GENESIS_TREASURY_ADDRESS").ok().filter(|v| !v.is_empty()),
+        std::env::var("GENESIS_VALIDATOR_PUBLIC_KEY").ok().filter(|v| !v.is_empty()),
+    ) {
+        (Some(treasury), validator_key) => {
+            Blockchain::new_with_genesis(difficulty, treasury, validator_key, supply)
+        }
+        (None, Some(validator_key)) => {
+            let treasury = pos::derive_address(&validator_key).unwrap_or_default();
+            Blockchain::new_with_genesis(difficulty, treasury, Some(validator_key), supply)
+        }
+        (None, None) => {
+            eprintln!(
+                "⚠️  GENESIS_TREASURY_ADDRESS not set: using the well-known DEV genesis. \
+                 Configure real genesis parameters for any shared network."
+            );
+            Blockchain::new(difficulty)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let difficulty = 2;
 
-    // Initialize Blockchain, Token, Contracts, and Pending Transactions
+    // Load persisted node state; chain state (balances/stakes/nonces) is
+    // deterministically rebuilt from the block history.
     let snapshot = load_state();
-    let chain = Arc::new(Mutex::new(
-        snapshot
-            .as_ref()
-            .map(|state| state.chain.clone())
-            .unwrap_or_else(|| Blockchain::new(difficulty)),
-    ));
-    let token = Arc::new(Mutex::new(
-        snapshot
-            .as_ref()
-            .map(|state| state.token.clone())
-            .unwrap_or_else(|| Token::new("Metacation Token", "MCT", 1000, "admin")),
-    ));
+    let mut loaded_chain = snapshot
+        .as_ref()
+        .map(|state| state.chain.clone())
+        .unwrap_or_else(|| fresh_chain(difficulty));
+    if let Err(err) = loaded_chain.rebuild_state() {
+        eprintln!(
+            "⚠️  Persisted chain failed state replay ({}). Starting from a fresh genesis.",
+            err
+        );
+        loaded_chain = fresh_chain(difficulty);
+    }
+    let chain = Arc::new(Mutex::new(loaded_chain));
+
     let contracts = Arc::new(Mutex::new(
         snapshot
             .as_ref()
@@ -41,15 +70,9 @@ async fn main() {
         snapshot
             .as_ref()
             .map(|state| state.pending_transactions.clone())
-            .unwrap_or_else(Vec::<Transaction>::new),
+            .unwrap_or_default(),
     ));
     let auth_manager = Arc::new(Mutex::new(AuthManager::new()));
-    let stakers = Arc::new(Mutex::new(
-        snapshot
-            .as_ref()
-            .map(|state| state.stakers.clone())
-            .unwrap_or_else(Vec::<Staker>::new),
-    ));
 
     // Peers: persisted peers plus any BOOTNODES from the environment.
     let mut initial_peers = snapshot
@@ -77,12 +100,6 @@ async fn main() {
             .as_ref()
             .map(|state| state.slash_evidence.clone())
             .unwrap_or_default(),
-    ));
-    let nonces = Arc::new(Mutex::new(
-        snapshot
-            .as_ref()
-            .map(|state| state.nonces.clone())
-            .unwrap_or_else(HashMap::new),
     ));
     let metrics = Arc::new(Mutex::new(Metrics::default()));
     let seen_messages = Arc::new(Mutex::new(SeenMessageCache::new(8192)));
@@ -120,6 +137,24 @@ async fn main() {
         }
     };
 
+    // Optional treasury key enabling the dev faucet (signed treasury
+    // transfers). Never set this on a production node.
+    let treasury_key = match std::env::var("TREASURY_PRIVATE_KEY") {
+        Ok(private_key) if !private_key.is_empty() => {
+            match LocalValidatorKey::from_private_key(&private_key) {
+                Ok(key) => {
+                    println!("🚰 Faucet enabled for treasury: {}", key.address);
+                    Some(key)
+                }
+                Err(err) => {
+                    eprintln!("❌ Invalid TREASURY_PRIVATE_KEY: {}. Faucet disabled.", err);
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     let p2p_service = Arc::new(
         P2PService::new(
             std::env::var("NODE_ID").unwrap_or_else(|_| "node-local".to_string()),
@@ -135,32 +170,23 @@ async fn main() {
     {
         let mut chain = chain.lock().await;
         chain.apply_finality(finality_depth);
-        if !chain.is_valid() {
-            eprintln!(
-                "⚠️  Loaded chain state failed validation (possibly a pre-upgrade format). \
-                 Starting from a fresh genesis. Old state remains on disk until overwritten."
-            );
-            *chain = Blockchain::new(difficulty);
-        }
     }
 
     let app_state = AppState {
         chain,
-        token,
         contracts,
         pending_transactions,
         auth_manager,
-        stakers,
         peers,
         governance,
         slash_evidence,
         metrics,
-        nonces,
         seen_messages,
         p2p_token,
         admin_token,
         p2p_service,
         validator_key,
+        treasury_key,
     };
 
     // Configure CORS to allow React app on localhost:5173
@@ -196,31 +222,35 @@ async fn main() {
     println!("📋 Available endpoints:");
     println!("  🔐 AUTHENTICATION:");
     println!("      🎫 POST /auth/nonce");
-    println!("      ✅ POST /auth/verify");
+    println!("      ✅ POST /auth/verify (native signature)");
     println!("      🚪 DELETE /auth/logout");
     println!("  🎓 CERTIFICATES:");
     println!("      📜 POST /certificates/issue (admin)");
     println!("      🔍 POST /certificates/verify");
     println!("      ✅ POST /certificates/attest (admin)");
     println!("  💰 TOKENS:");
-    println!("      💸 POST /tokens/transfer (signed)");
-    println!("      🚰 POST /tokens/faucet (admin)");
+    println!("      💸 POST /tokens/transfer (signed, executes on-chain)");
+    println!("      🚰 POST /tokens/faucet (admin + treasury key)");
     println!("      📊 GET  /tokens/balance/{{account}}");
     println!("      🔢 GET  /tokens/nonce/{{account}}");
     println!("  📦 BLOCKCHAIN:");
     println!("      📚 GET  /blocks");
     println!("      🔢 GET  /blocks/{{index}}");
     println!("      📊 GET  /blockchain/stats");
+    println!("      🌳 GET  /blockchain/state (state root & supply)");
     println!("  ⛏️  MINING:");
     println!("      ⚡ POST /mine (local validator key)");
     println!("      📝 POST /mine/propose");
     println!("      📮 POST /mine/submit (signed block)");
     println!("      ⚙️  GET  /mining/difficulty");
     println!("      ⚙️  POST /mining/difficulty (admin)");
-    println!("  🧮 STAKING:");
-    println!("      ➕ POST /staking/deposit (signed)");
-    println!("      ➖ POST /staking/withdraw (signed)");
+    println!("  🧮 STAKING (on-chain):");
+    println!("      ➕ POST /staking/deposit (signed stake tx)");
+    println!("      ➖ POST /staking/withdraw (signed withdraw tx)");
     println!("      👥 GET  /staking/validators");
+    println!("  ⚔️  SLASHING:");
+    println!("      🧾 POST /slashing/equivocation (permissionless proof)");
+    println!("      🗂  POST /slashing/evidence (admin diagnostics)");
     println!("  ✔️  VALIDATION:");
     println!("      🔍 GET  /blockchain/validate");
     println!("      🔎 GET  /blocks/{{index}}/validate");
@@ -228,7 +258,7 @@ async fn main() {
     println!("  📄 TRANSACTIONS:");
     println!("      ⏳ GET  /transactions/pending");
     println!();
-    println!("🌟 Hybrid PoS+PoW chain with signed transactions and fork choice!");
+    println!("🌟 Hybrid PoS+PoW chain with a replicated on-chain state machine!");
 
     let listener = TcpListener::bind(("0.0.0.0", port)).await.unwrap();
 

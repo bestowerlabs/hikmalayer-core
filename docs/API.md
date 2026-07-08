@@ -5,57 +5,77 @@
 Hikmalayer is a hybrid PoS/PoW blockchain platform with REST execution APIs, staking, governance/slashing controls, and a dedicated P2P protocol endpoint for inter-node communication. This documentation provides API integration guidelines for operators and developers.
 
 **Base URL:** `http://127.0.0.1:3000`  
-**Version:** 2.0 (consensus v2 — signed transactions, fork choice)  
+**Version:** 3.0 (native identity + replicated on-chain state machine)  
 **Protocol:** HTTP/HTTPS  
 **Content-Type:** `application/json`
 
-## ⚠️ Consensus v2 changes (breaking)
+## ⚠️ Consensus v3 changes (breaking)
 
-The security model changed in v2. Where an example below conflicts with this
-section, this section is authoritative.
+Where an example below conflicts with this section, this section is
+authoritative.
+
+**Native identity — no Ethereum.** Addresses are `hkm` + hex(SHA-256(uncompressed
+secp256k1 public key)[..20]) — 43 characters. There is no `0x`/keccak address and
+no `personal_sign`/Ethereum message prefix. All signatures are native compact
+secp256k1 over the Hikmalayer signing domain. Generate identities and signatures
+with `hikma-wallet`.
+
+**On-chain state machine.** Balances, the validator set, and per-account nonces
+are chain state — a deterministic function of the blocks. A transfer/stake/withdraw
+is *queued* on submission and only takes effect when mined into a block; `GET
+/tokens/balance/{account}` reflects on-chain state. `GET /blockchain/state`
+returns the height, **state root**, total supply, and validator count.
 
 **Authorization is deny-by-default.** `ADMIN_TOKEN` and `P2P_TOKEN` must be set
-on the node; endpoints gated by a token that is unset reject every request.
+on the node; endpoints gated by an unset token reject every request.
 
 - Admin-gated (`x-admin-token`): `/tokens/faucet`, `/certificates/issue`,
   `/certificates/attest`, `/mining/difficulty` (POST), `/governance/config` (POST),
   `/slashing/evidence`.
-- P2P-gated (`x-p2p-token`): `/p2p/*` including the new `GET /p2p/chain`.
+- P2P-gated (`x-p2p-token`): `/p2p/*` including `GET /p2p/chain`.
 
 **Transfers must be signed.** `POST /tokens/transfer` body:
 
 ```json
 {
-  "from": "0x…", "to": "0x…", "amount": 10, "nonce": 1,
-  "public_key": "…hex, uncompressed (raw scheme only)…",
-  "signature": "…hex…"
+  "from": "hkm…", "to": "hkm…", "amount": 10, "nonce": 1,
+  "public_key": "…uncompressed secp256k1 hex…",
+  "signature": "…hikma-wallet sign-transfer output…"
 }
 ```
 
-The signature covers `hikmalayer-transfer:{from}:{to}:{amount}:{nonce}` in one
-of two schemes: raw secp256k1 (64-byte compact over SHA-256 of the message,
-`public_key` required, sender must be the key's derived address) or Ethereum
-`personal_sign` (65-byte, MetaMask; recovered address must equal `from`).
-Fetch the next nonce with `GET /tokens/nonce/{account}`. Sign offline with
-`hikma-wallet sign-transfer`.
+The signature covers `hikmalayer-transfer:{from}:{to}:{amount}:{nonce}`; the
+`public_key` must derive to `from`. Fetch the next nonce with
+`GET /tokens/nonce/{account}`, sign offline with `hikma-wallet sign-transfer`.
 
-**Staking is signed and key-bound.** `POST /staking/deposit` requires
-`public_key`, `nonce`, and a signature over
-`hikmalayer-stake:{address}:{amount}:{nonce}`; `address` must be the address
-derived from `public_key`. `POST /staking/withdraw` requires a signature over
-`hikmalayer-withdraw:{address}:{amount}:{nonce}` by the registered key.
+**Staking is on-chain, signed, and key-bound.** `POST /staking/deposit` submits a
+signed Stake transaction (`public_key`, `nonce`, signature over
+`hikmalayer-stake:{address}:{amount}:{nonce}`; `address` must derive from
+`public_key`). `POST /staking/withdraw` submits a signed Withdraw transaction
+(signature over `hikmalayer-withdraw:{address}:{amount}:{nonce}` by the
+validator's on-chain key). Both take effect when mined; the validator set is
+derived from state.
+
+**Faucet.** `POST /tokens/faucet` (admin) is a signed transfer from the treasury
+account; it requires the node to hold `TREASURY_PRIVATE_KEY` (dev only).
 
 **Mining.** `POST /mine` produces a block only when the node's own
 `VALIDATOR_PRIVATE_KEY` identity is the PoS-selected validator. External
-validators use `POST /mine/propose` (returns the PoW-mined unsigned block and
-its hash), sign the hash offline (`hikma-wallet sign-block`), and submit the
-signed block to `POST /mine/submit`. Every accepted block mints a fixed reward
-to its validator.
+validators use `POST /mine/propose` (returns the PoW-mined unsigned block, whose
+`state_root` already reflects execution, plus its hash), sign the hash offline
+(`hikma-wallet sign-block`), and submit to `POST /mine/submit`. Every accepted
+block mints a fixed reward to its validator.
 
-**New endpoints:** `POST /tokens/faucet` (admin), `GET /tokens/nonce/{account}`,
-`POST /mine/propose`, `POST /mine/submit`, `GET /p2p/chain` (p2p),
-`POST /certificates/attest` (admin). `POST /certificates/verify` is now a
-read-only lookup.
+**Slashing.** `POST /slashing/equivocation` is permissionless: submit a
+`{ "block_a": <Block>, "block_b": <Block> }` proof that a validator signed two
+different blocks at the same height. It becomes an on-chain Slash transaction and
+burns the offender's stake when mined.
+
+**New/changed endpoints:** `GET /blockchain/state`, `POST /slashing/equivocation`,
+`POST /tokens/faucet` (admin), `GET /tokens/nonce/{account}`, `POST /mine/propose`,
+`POST /mine/submit`, `GET /p2p/chain` (p2p), `POST /certificates/attest` (admin).
+`POST /certificates/verify` is a read-only lookup. `POST /auth/verify` now also
+requires a `public_key` field (native signature).
 
 ## Quick Start
 

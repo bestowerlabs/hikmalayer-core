@@ -15,7 +15,11 @@ services:
     environment:
       <<: *common-env
       NODE_ID: bootnode
+      # Dev genesis: key 0x…01 is the genesis validator (treasury). The
+      # bootnode holds it so it can bootstrap block production and run the
+      # faucet. NEVER use these keys outside a local test network.
       VALIDATOR_PRIVATE_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
+      TREASURY_PRIVATE_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
     ports:
       - "3000:3000"
 

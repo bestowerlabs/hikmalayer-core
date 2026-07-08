@@ -39,6 +39,19 @@ impl P2PService {
             .await
     }
 
+    /// Gossip a pending transaction so any selected validator can mine it.
+    pub async fn broadcast_transaction(
+        &self,
+        peers: Vec<String>,
+        transaction: crate::blockchain::transaction::Transaction,
+    ) -> (u64, u64) {
+        let envelope = P2PEnvelope::new(
+            self.node_id.clone(),
+            P2PPayload::Transaction(transaction),
+        );
+        self.broadcast_envelope(peers, envelope).await
+    }
+
     async fn broadcast_envelope(&self, peers: Vec<String>, envelope: P2PEnvelope) -> (u64, u64) {
         let mut sent = 0u64;
         let mut failed = 0u64;

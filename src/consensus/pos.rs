@@ -2,7 +2,14 @@ use rand::Rng;
 use secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sha3::Keccak256;
+
+/// Native Hikmalayer address prefix. Addresses are derived with the chain's
+/// own hash (SHA-256) — no external chain conventions.
+pub const ADDRESS_PREFIX: &str = "hkm";
+
+/// Domain-separation prefix for signed messages, so a Hikmalayer signature
+/// can never be replayed as (or confused with) another system's signature.
+pub const MESSAGE_PREFIX: &str = "\x19Hikmalayer Signed Message:\n";
 
 /// A registered validator. The server never stores or accepts private keys
 /// (HM-01): validators sign block proposals and account operations locally.
@@ -14,18 +21,6 @@ pub struct Staker {
 }
 
 const SLASH_PERCENT: u64 = 10;
-
-pub fn staker_set_hash(stakers: &[Staker]) -> String {
-    let mut hasher = Sha256::new();
-    for staker in stakers {
-        hasher.update(staker.address.as_bytes());
-        hasher.update(staker.stake.to_be_bytes());
-        if let Some(public_key) = &staker.public_key {
-            hasher.update(public_key.as_bytes());
-        }
-    }
-    format!("{:x}", hasher.finalize())
-}
 
 /// Deterministic seed for validator selection at a given height. Salting the
 /// parent hash with the height means the same parent hash can never be reused
@@ -75,15 +70,14 @@ pub fn select_staker(stakers: &[Staker]) -> Option<String> {
     select_staker_with_seed(&seed, stakers)
 }
 
-/// Derive the canonical 0x-prefixed account address from a secp256k1 public
-/// key (Keccak-256 of the uncompressed key body, last 20 bytes — the same
-/// scheme the wallet auth flow uses).
+/// Derive the canonical native account address from a secp256k1 public key:
+/// `hkm` + hex of the first 20 bytes of SHA-256 over the uncompressed key.
 pub fn derive_address(public_key_hex: &str) -> Result<String, String> {
     let public_key_bytes = hex::decode(public_key_hex).map_err(|err| err.to_string())?;
     let public_key = PublicKey::from_slice(&public_key_bytes).map_err(|err| err.to_string())?;
     let uncompressed = public_key.serialize_uncompressed();
-    let hash = Keccak256::digest(&uncompressed[1..]);
-    Ok(format!("0x{}", hex::encode(&hash[12..])))
+    let hash = Sha256::digest(uncompressed);
+    Ok(format!("{}{}", ADDRESS_PREFIX, hex::encode(&hash[..20])))
 }
 
 /// Derive the uncompressed public key (hex) for a private key.
@@ -144,16 +138,20 @@ pub fn verify_block_signature(block_hash: &str, public_key_hex: &str, signature_
     verify_digest(&hash_bytes, public_key_hex, signature_hex)
 }
 
-/// Sign an arbitrary UTF-8 message (SHA-256 digest) — used for transfer,
-/// stake, and withdraw authorizations.
+/// Digest of a message under the native Hikmalayer signing domain.
+fn message_digest(message: &str) -> [u8; 32] {
+    let prefixed = format!("{}{}{}", MESSAGE_PREFIX, message.len(), message);
+    Sha256::digest(prefixed.as_bytes()).into()
+}
+
+/// Sign an arbitrary UTF-8 message under the native signing domain — used
+/// for transfer, stake, and withdraw authorizations.
 pub fn sign_message(message: &str, private_key_hex: &str) -> Result<String, String> {
-    let digest = Sha256::digest(message.as_bytes());
-    sign_digest(&digest, private_key_hex)
+    sign_digest(&message_digest(message), private_key_hex)
 }
 
 pub fn verify_message(message: &str, public_key_hex: &str, signature_hex: &str) -> bool {
-    let digest = Sha256::digest(message.as_bytes());
-    verify_digest(&digest, public_key_hex, signature_hex)
+    verify_digest(&message_digest(message), public_key_hex, signature_hex)
 }
 
 pub fn slash_staker(stakers: &mut Vec<Staker>, address: &str) -> u64 {
@@ -234,11 +232,11 @@ mod tests {
     }
 
     #[test]
-    fn derive_address_is_stable() {
+    fn derive_address_is_native_and_stable() {
         let (public_key, _) = test_keys();
         let address = derive_address(&public_key).unwrap();
-        assert!(address.starts_with("0x"));
-        assert_eq!(address.len(), 42);
+        assert!(address.starts_with(ADDRESS_PREFIX));
+        assert_eq!(address.len(), ADDRESS_PREFIX.len() + 40);
         assert_eq!(address, derive_address(&public_key).unwrap());
     }
 

@@ -1,14 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
 use crate::{
     blockchain::{chain::Blockchain, transaction::Transaction},
-    consensus::pos::Staker,
     contract::contract::ContractExecutor,
     governance::GovernanceConfig,
-    token::fungible::Token,
 };
 
 const DEFAULT_STATE_PATH: &str = "data/state.json";
@@ -17,23 +14,19 @@ fn state_path() -> String {
     std::env::var("HIKMALAYER_STATE_PATH").unwrap_or_else(|_| DEFAULT_STATE_PATH.to_string())
 }
 
+/// Persisted node state. Balances, stakes, and nonces are NOT stored — they
+/// are chain state, deterministically rebuilt from the blocks at startup.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppSnapshot {
     pub chain: Blockchain,
-    pub token: Token,
     pub contracts: ContractExecutor,
     pub pending_transactions: Vec<Transaction>,
-    pub stakers: Vec<Staker>,
     #[serde(default)]
     pub peers: Vec<String>,
     #[serde(default)]
     pub governance: GovernanceConfig,
     #[serde(default)]
     pub slash_evidence: Vec<SlashEvidence>,
-    /// Per-account transaction nonces (replay protection for signed
-    /// transfers, stakes, and withdrawals).
-    #[serde(default)]
-    pub nonces: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

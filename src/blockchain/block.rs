@@ -14,6 +14,9 @@ pub struct Block {
     pub transactions: Vec<String>,
     #[serde(default)]
     pub merkle_root: String,
+    /// Commitment to the full chain state AFTER executing this block.
+    #[serde(default)]
+    pub state_root: String,
     pub previous_hash: String,
     pub difficulty: usize,
     pub nonce: u64,
@@ -21,8 +24,6 @@ pub struct Block {
     pub validator: Option<String>,
     pub validator_public_key: Option<String>,
     pub validator_signature: Option<String>,
-    pub staker_set_hash: Option<String>,
-    pub staker_snapshot: Option<Vec<crate::consensus::pos::Staker>>,
 }
 
 use crate::consensus::pow;
@@ -57,6 +58,7 @@ pub fn compute_merkle_root(transactions: &[String]) -> String {
 }
 
 impl Block {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         index: u64,
         transactions: Vec<String>,
@@ -65,8 +67,7 @@ impl Block {
         validator: Option<String>,
         validator_public_key: Option<String>,
         validator_signature: Option<String>,
-        staker_set_hash: Option<String>,
-        staker_snapshot: Option<Vec<crate::consensus::pos::Staker>>,
+        state_root: String,
     ) -> Self {
         Self::new_at(
             Utc::now(),
@@ -77,11 +78,11 @@ impl Block {
             validator,
             validator_public_key,
             validator_signature,
-            staker_set_hash,
-            staker_snapshot,
+            state_root,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_at(
         timestamp: DateTime<Utc>,
         index: u64,
@@ -91,18 +92,17 @@ impl Block {
         validator: Option<String>,
         validator_public_key: Option<String>,
         validator_signature: Option<String>,
-        staker_set_hash: Option<String>,
-        staker_snapshot: Option<Vec<crate::consensus::pos::Staker>>,
+        state_root: String,
     ) -> Self {
         let difficulty = pow::clamp_difficulty(difficulty);
         let merkle_root = compute_merkle_root(&transactions);
         let data = Block::hash_payload(
             &index,
             &merkle_root,
+            &state_root,
             &timestamp,
             &validator,
             &validator_public_key,
-            &staker_set_hash,
             &previous_hash,
         );
 
@@ -113,6 +113,7 @@ impl Block {
             timestamp,
             transactions,
             merkle_root,
+            state_root,
             previous_hash,
             difficulty,
             nonce,
@@ -120,14 +121,12 @@ impl Block {
             validator,
             validator_public_key,
             validator_signature,
-            staker_set_hash,
-            staker_snapshot,
         }
     }
 
-    /// Deterministic genesis block: identical on every node for a given
-    /// difficulty, which anchors fork choice and cross-node sync.
-    pub fn genesis(difficulty: usize) -> Self {
+    /// Deterministic genesis block committing to the genesis state root:
+    /// identical on every node for the same network parameters.
+    pub fn genesis(difficulty: usize, state_root: String) -> Self {
         let timestamp = DateTime::<Utc>::from_timestamp(GENESIS_TIMESTAMP, 0)
             .expect("genesis timestamp is valid");
         Self::new_at(
@@ -139,28 +138,27 @@ impl Block {
             None,
             None,
             None,
-            None,
-            None,
+            state_root,
         )
     }
 
     fn hash_payload(
         index: &u64,
         merkle_root: &str,
+        state_root: &str,
         timestamp: &DateTime<Utc>,
         validator: &Option<String>,
         validator_public_key: &Option<String>,
-        staker_set_hash: &Option<String>,
         previous_hash: &str,
     ) -> String {
         format!(
-            "{:?}{}{:?}{:?}{:?}{:?}{}",
+            "{:?}{}{}{:?}{:?}{:?}{}",
             index,
             merkle_root,
+            state_root,
             timestamp,
             validator,
             validator_public_key,
-            staker_set_hash,
             previous_hash
         )
     }
@@ -169,10 +167,10 @@ impl Block {
         let data = Block::hash_payload(
             &self.index,
             &self.merkle_root,
+            &self.state_root,
             &self.timestamp,
             &self.validator,
             &self.validator_public_key,
-            &self.staker_set_hash,
             &self.previous_hash,
         );
         let candidate = format!("{}{}", data, self.nonce);
@@ -205,8 +203,7 @@ mod tests {
             Some("validator-1".to_string()),
             Some("validator-pubkey".to_string()),
             None,
-            Some("staker-set-hash".to_string()),
-            None,
+            "state-root".to_string(),
         );
         assert_eq!(block.index, 1);
         assert!(block.has_valid_pow());
@@ -215,10 +212,26 @@ mod tests {
 
     #[test]
     fn genesis_is_deterministic() {
-        let a = Block::genesis(2);
-        let b = Block::genesis(2);
+        let a = Block::genesis(2, "root".to_string());
+        let b = Block::genesis(2, "root".to_string());
         assert_eq!(a.hash, b.hash);
         assert!(a.has_valid_pow());
+    }
+
+    #[test]
+    fn tampering_with_state_root_breaks_pow() {
+        let mut block = Block::new(
+            1,
+            vec!["Tx".to_string()],
+            "abc".to_string(),
+            2,
+            None,
+            None,
+            None,
+            "root".to_string(),
+        );
+        block.state_root = "forged-root".to_string();
+        assert!(!block.has_valid_pow());
     }
 
     #[test]
@@ -231,8 +244,7 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
+            "root".to_string(),
         );
         block.transactions = vec!["Forged".to_string()];
         assert!(!block.has_valid_merkle_root());
@@ -253,8 +265,7 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
+            "root".to_string(),
         );
         block.difficulty = 0;
         assert!(!block.has_valid_pow());

@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::token::fungible::Token;
-
 /// Represents a simple on-chain certificate
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Certificate {
@@ -49,22 +47,4 @@ impl ContractExecutor {
         }
     }
 
-    /// Issues tokens as a reward for certificate verification
-    pub fn reward_certificate_holder(&self, token: &mut Token, cert_id: &str, amount: u64) -> bool {
-        if let Some(cert) = self.certificates.get(cert_id) {
-            if cert.verified {
-                token.mint(&cert.issued_to, amount);
-                println!(
-                    "Rewarded {} {} tokens for certificate {}",
-                    cert.issued_to, amount, cert_id
-                );
-                return true;
-            } else {
-                println!("Certificate {} is not verified yet.", cert_id);
-            }
-        } else {
-            println!("Certificate {} not found.", cert_id);
-        }
-        false
-    }
 }

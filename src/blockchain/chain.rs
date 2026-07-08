@@ -1,14 +1,38 @@
 use super::block::Block;
+use super::state::ChainState;
 use super::transaction::{Transaction, TransactionType};
-use crate::consensus::{
-    pos::{self, Staker},
-    pow,
-};
+use crate::consensus::{pos, pow};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Maximum tolerated clock skew (seconds) for incoming block timestamps.
 pub const MAX_TIMESTAMP_SKEW_SECONDS: i64 = 120;
+
+/// Default initial supply for networks that do not configure one.
+pub const DEFAULT_GENESIS_SUPPLY: u64 = 1_000_000;
+
+/// Well-known development key (32-byte big-endian 1). Used as the default
+/// genesis treasury/validator on LOCAL networks only — real networks must
+/// configure GENESIS_TREASURY_ADDRESS / GENESIS_VALIDATOR_PUBLIC_KEY.
+pub fn dev_genesis_private_key() -> String {
+    let mut bytes = [0u8; 32];
+    bytes[31] = 1;
+    hex::encode(bytes)
+}
+
+fn default_genesis_validator_public_key() -> Option<String> {
+    pos::derive_public_key(&dev_genesis_private_key()).ok()
+}
+
+fn default_genesis_treasury() -> String {
+    default_genesis_validator_public_key()
+        .and_then(|key| pos::derive_address(&key).ok())
+        .unwrap_or_default()
+}
+
+fn default_genesis_supply() -> u64 {
+    DEFAULT_GENESIS_SUPPLY
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Blockchain {
@@ -16,11 +40,23 @@ pub struct Blockchain {
     pub difficulty: usize,
     #[serde(default)]
     pub finalized_height: u64,
+    /// Genesis network parameters — part of chain identity. Two nodes with
+    /// different parameters produce different genesis hashes and never sync.
+    #[serde(default = "default_genesis_treasury")]
+    pub genesis_treasury: String,
+    #[serde(default = "default_genesis_validator_public_key")]
+    pub genesis_validator_public_key: Option<String>,
+    #[serde(default = "default_genesis_supply")]
+    pub genesis_supply: u64,
+    /// Current chain state: derived from the blocks, never persisted.
+    /// Rebuilt via `rebuild_state` after deserialization.
+    #[serde(skip)]
+    pub state: ChainState,
 }
 
 /// A validation failure. `slashable` distinguishes provable validator
-/// misbehavior (wrong slot, bad signature, bad PoW, tampered payload) from
-/// structural problems (missing fields, stale tip).
+/// misbehavior (wrong slot, bad signature, bad PoW, tampered payload or
+/// state) from structural problems (missing fields, stale tip).
 #[derive(Debug, Clone)]
 pub struct BlockError {
     pub reason: String,
@@ -44,14 +80,46 @@ impl BlockError {
 }
 
 impl Blockchain {
+    /// New chain with default (development) genesis parameters.
     pub fn new(difficulty: usize) -> Self {
+        Self::new_with_genesis(
+            difficulty,
+            default_genesis_treasury(),
+            default_genesis_validator_public_key(),
+            default_genesis_supply(),
+        )
+    }
+
+    pub fn new_with_genesis(
+        difficulty: usize,
+        genesis_treasury: String,
+        genesis_validator_public_key: Option<String>,
+        genesis_supply: u64,
+    ) -> Self {
         let difficulty = pow::clamp_difficulty(difficulty);
-        let genesis_block = Block::genesis(difficulty);
+        let state = ChainState::genesis(
+            &genesis_treasury,
+            genesis_validator_public_key.as_deref(),
+            genesis_supply,
+        );
+        let genesis_block = Block::genesis(difficulty, state.state_root());
         Blockchain {
             blocks: vec![genesis_block],
             difficulty,
             finalized_height: 0,
+            genesis_treasury,
+            genesis_validator_public_key,
+            genesis_supply,
+            state,
         }
+    }
+
+    fn genesis_state(&self) -> ChainState {
+        ChainState::genesis(
+            &self.genesis_treasury,
+            self.genesis_validator_public_key.as_deref(),
+            self.genesis_supply,
+        )
     }
 
     pub fn latest_hash(&self) -> String {
@@ -66,8 +134,7 @@ impl Blockchain {
         transactions: Vec<String>,
         validator: Option<String>,
         validator_public_key: Option<String>,
-        staker_set_hash: Option<String>,
-        staker_snapshot: Option<Vec<Staker>>,
+        state_root: String,
     ) -> Block {
         let index = self.blocks.len() as u64;
         let previous_hash = self.latest_hash();
@@ -79,13 +146,14 @@ impl Blockchain {
             validator,
             validator_public_key,
             None,
-            staker_set_hash,
-            staker_snapshot,
+            state_root,
         )
     }
 
-    pub fn add_mined_block(&mut self, block: Block) {
+    /// Append a fully validated block and adopt its post-state.
+    pub fn commit_block(&mut self, block: Block, post_state: ChainState) {
         self.blocks.push(block);
+        self.state = post_state;
     }
 
     pub fn apply_finality(&mut self, finality_depth: u64) {
@@ -114,13 +182,14 @@ impl Blockchain {
     }
 
     /// Full consensus validation of a single non-genesis block against its
-    /// expected position: linkage, PoS selection, validator signature,
-    /// merkle integrity, and PoW.
+    /// expected position and the state at its parent. On success returns the
+    /// post-execution state.
     fn validate_block_at(
         block: &Block,
         expected_index: u64,
         expected_previous_hash: &str,
-    ) -> Result<(), BlockError> {
+        parent_state: &ChainState,
+    ) -> Result<ChainState, BlockError> {
         if block.index != expected_index {
             return Err(BlockError::structural(
                 "Block index does not match chain tip",
@@ -140,36 +209,35 @@ impl Blockchain {
         if block.validator.is_none()
             || block.validator_public_key.is_none()
             || block.validator_signature.is_none()
-            || block.staker_snapshot.is_none()
-            || block.staker_set_hash.is_none()
         {
             return Err(BlockError::structural(
-                "Block missing required validator or staker data",
+                "Block missing required validator data",
             ));
         }
 
-        let staker_snapshot = block.staker_snapshot.as_ref().unwrap();
-        let staker_hash = pos::staker_set_hash(staker_snapshot);
-        if Some(staker_hash) != block.staker_set_hash {
-            return Err(BlockError::slashable("Block staker set hash mismatch"));
-        }
-
+        // PoS: the validator set is the ON-CHAIN set at the parent state.
+        let validator_set = parent_state.validator_set();
         let seed = pos::selection_seed(&block.previous_hash, block.index);
-        let expected_validator = pos::select_staker_with_seed(&seed, staker_snapshot);
+        let expected_validator = pos::select_staker_with_seed(&seed, &validator_set);
+        if expected_validator.is_none() {
+            return Err(BlockError::structural(
+                "No validators registered at parent state",
+            ));
+        }
         if expected_validator != block.validator {
             return Err(BlockError::slashable(
                 "Block validator does not match PoS selection",
             ));
         }
 
-        // The block validator's registered key must be the one that signed.
+        // The block must be signed with the validator's on-chain key.
         let validator = block.validator.as_ref().unwrap();
         let public_key = block.validator_public_key.as_ref().unwrap();
-        let registered_key = staker_snapshot
-            .iter()
-            .find(|staker| &staker.address == validator)
-            .and_then(|staker| staker.public_key.as_ref());
-        if registered_key != Some(public_key) {
+        let registered_key = parent_state
+            .stakers
+            .get(validator)
+            .map(|info| info.public_key.as_str());
+        if registered_key != Some(public_key.as_str()) {
             return Err(BlockError::slashable(
                 "Block signer key does not match validator's registered key",
             ));
@@ -188,32 +256,43 @@ impl Blockchain {
             return Err(BlockError::slashable("Block PoW validation failed"));
         }
 
-        // Transaction-level consensus rules: every payload must be a
-        // well-formed transaction, transfers must carry valid sender
-        // signatures, and the block may pay at most one correct reward.
+        // Execute the block: every transaction must be statelessly valid,
+        // apply cleanly to the parent state, and the block must pay exactly
+        // one correct reward.
+        let mut post_state = parent_state.clone();
         let mut reward_count = 0usize;
         for tx_str in &block.transactions {
             let tx: Transaction = serde_json::from_str(tx_str)
                 .map_err(|_| BlockError::slashable("Block contains malformed transaction"))?;
             tx.verify_for_block(validator)
                 .map_err(BlockError::slashable)?;
+            post_state
+                .apply_transaction(&tx)
+                .map_err(BlockError::slashable)?;
             if tx.transaction_type == TransactionType::Reward {
                 reward_count += 1;
-                if reward_count > 1 {
-                    return Err(BlockError::slashable(
-                        "Block contains multiple reward transactions",
-                    ));
-                }
             }
         }
+        if reward_count != 1 {
+            return Err(BlockError::slashable(
+                "Block must contain exactly one reward transaction",
+            ));
+        }
 
-        Ok(())
+        // The block's committed state root must match actual execution.
+        if post_state.state_root() != block.state_root {
+            return Err(BlockError::slashable(
+                "Block state root does not match executed state",
+            ));
+        }
+
+        Ok(post_state)
     }
 
     /// Validate a candidate block for appending to the current tip. Adds
     /// tip-difficulty and timestamp-freshness rules on top of the consensus
-    /// checks.
-    pub fn validate_block_candidate(&self, block: &Block) -> Result<(), String> {
+    /// checks. On success returns the post-execution state to commit.
+    pub fn validate_block_candidate(&self, block: &Block) -> Result<ChainState, String> {
         if block.difficulty != self.difficulty {
             return Err("Block difficulty does not match chain difficulty".to_string());
         }
@@ -223,8 +302,66 @@ impl Blockchain {
             return Err("Block timestamp is too far in the future".to_string());
         }
 
-        Self::validate_block_at(block, self.blocks.len() as u64, &self.latest_hash())
-            .map_err(|err| err.reason)
+        Self::validate_block_at(
+            block,
+            self.blocks.len() as u64,
+            &self.latest_hash(),
+            &self.state,
+        )
+        .map_err(|err| err.reason)
+    }
+
+    /// Validate the entire chain from genesis by replaying the state
+    /// machine. Returns the final state, or the first failure.
+    pub fn validate_full(&self) -> Result<ChainState, (usize, BlockError)> {
+        let genesis = self
+            .blocks
+            .first()
+            .ok_or((0, BlockError::structural("Chain is empty")))?;
+        if !genesis.has_valid_pow() || !genesis.has_valid_merkle_root() {
+            return Err((0, BlockError::structural("Genesis block failed validation")));
+        }
+
+        let mut state = self.genesis_state();
+        if state.state_root() != genesis.state_root {
+            return Err((
+                0,
+                BlockError::structural("Genesis state root does not match network parameters"),
+            ));
+        }
+
+        for i in 1..self.blocks.len() {
+            let current = &self.blocks[i];
+            let previous = &self.blocks[i - 1];
+            state = Self::validate_block_at(current, i as u64, &previous.hash, &state)
+                .map_err(|error| (i, error))?;
+        }
+        Ok(state)
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.validate_full().is_ok()
+    }
+
+    /// Recompute `state` from the block history (after deserialization or
+    /// adoption). Fails if the stored chain does not validate.
+    pub fn rebuild_state(&mut self) -> Result<(), String> {
+        match self.validate_full() {
+            Ok(state) => {
+                self.state = state;
+                Ok(())
+            }
+            Err((index, error)) => Err(format!("Block {}: {}", index, error.reason)),
+        }
+    }
+
+    /// Report chain validity with details (no side effects — slashing is an
+    /// on-chain transaction, not a local mutation).
+    pub fn validate_report(&self) -> (bool, Option<String>) {
+        match self.validate_full() {
+            Ok(_) => (true, None),
+            Err((index, error)) => (false, Some(format!("Block {}: {}", index, error.reason))),
+        }
     }
 
     pub fn evaluate_slash_evidence(&self, block_index: u64) -> Result<SlashEvidence, String> {
@@ -236,79 +373,25 @@ impl Blockchain {
             return Err("Block index out of range".to_string());
         }
 
-        let block = &self.blocks[index];
-        let previous = &self.blocks[index - 1];
-
-        match Self::validate_block_at(block, block.index, &previous.hash) {
-            Ok(()) => Err("Block does not contain slashable behavior".to_string()),
-            Err(error) => Ok(SlashEvidence {
-                validator: block
-                    .validator
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                reason: error.reason,
-                timestamp: Utc::now().to_rfc3339(),
-            }),
-        }
-    }
-
-    pub fn is_valid(&self) -> bool {
-        self.validate_full().is_ok()
-    }
-
-    /// Validate the entire chain from genesis. Returns the first failure.
-    pub fn validate_full(&self) -> Result<(), (usize, BlockError)> {
-        match self.blocks.first() {
-            Some(genesis) => {
-                if !genesis.has_valid_pow() || !genesis.has_valid_merkle_root() {
-                    return Err((0, BlockError::structural("Genesis block failed validation")));
-                }
-            }
-            None => return Err((0, BlockError::structural("Chain is empty"))),
-        }
-
-        for i in 1..self.blocks.len() {
-            let current = &self.blocks[i];
-            let previous = &self.blocks[i - 1];
-            Self::validate_block_at(current, i as u64, &previous.hash)
-                .map_err(|error| (i, error))?;
-        }
-        Ok(())
-    }
-
-    pub fn validate_and_slash(
-        &self,
-        stakers: &mut Vec<Staker>,
-    ) -> (bool, Vec<(String, u64)>, Option<String>) {
-        let mut slashed = Vec::new();
-
         match self.validate_full() {
-            Ok(()) => (true, slashed, None),
-            Err((index, error)) => {
-                if error.slashable {
-                    if let Some(validator) = self
-                        .blocks
-                        .get(index)
-                        .and_then(|block| block.validator.clone())
-                    {
-                        let amount = pos::slash_staker(stakers, &validator);
-                        if amount > 0 {
-                            slashed.push((validator, amount));
-                        }
-                    }
-                }
-                (
-                    false,
-                    slashed,
-                    Some(format!("Block {}: {}", index, error.reason)),
-                )
+            Ok(_) => Err("Block does not contain slashable behavior".to_string()),
+            Err((failed_index, error)) if failed_index == index && error.slashable => {
+                Ok(SlashEvidence {
+                    validator: self.blocks[index]
+                        .validator
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    reason: error.reason,
+                    timestamp: Utc::now().to_rfc3339(),
+                })
             }
+            Err(_) => Err("Block does not contain slashable behavior".to_string()),
         }
     }
 
-    /// Fork choice: adopt `candidate` if it shares our genesis, is fully
-    /// valid, preserves every finalized block, and carries strictly more
-    /// cumulative work. Returns Ok(true) when the chain was replaced.
+    /// Fork choice: adopt `candidate` if it shares our genesis, replays
+    /// cleanly under OUR network parameters, preserves every finalized
+    /// block, and carries strictly more cumulative work.
     pub fn try_adopt_chain(&mut self, candidate: &Blockchain) -> Result<bool, String> {
         let our_genesis = self
             .blocks
@@ -340,11 +423,23 @@ impl Blockchain {
             return Ok(false);
         }
 
-        candidate
-            .validate_full()
-            .map_err(|(index, error)| format!("Candidate block {}: {}", index, error.reason))?;
+        // Never trust the candidate's own genesis parameters: replay its
+        // blocks under our network configuration.
+        let mut replay = Blockchain {
+            blocks: candidate.blocks.clone(),
+            difficulty: self.difficulty,
+            finalized_height: 0,
+            genesis_treasury: self.genesis_treasury.clone(),
+            genesis_validator_public_key: self.genesis_validator_public_key.clone(),
+            genesis_supply: self.genesis_supply,
+            state: ChainState::default(),
+        };
+        replay
+            .rebuild_state()
+            .map_err(|err| format!("Candidate chain failed replay: {}", err))?;
 
-        self.blocks = candidate.blocks.clone();
+        self.blocks = replay.blocks;
+        self.state = replay.state;
         Ok(true)
     }
 }
@@ -364,138 +459,201 @@ pub struct SlashEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blockchain::state::STAKING_POOL_ACCOUNT;
+    use crate::blockchain::transaction::SlashProof;
 
-    fn test_keys() -> (String, String) {
-        let private_key = hex::encode([1u8; 32]);
+    /// The dev genesis validator (treasury) — key 0x…01.
+    fn treasury() -> (String, String, String) {
+        let private_key = dev_genesis_private_key();
         let public_key = pos::derive_public_key(&private_key).unwrap();
-        (public_key, private_key)
+        let address = pos::derive_address(&public_key).unwrap();
+        (address, public_key, private_key)
     }
 
-    fn test_stakers(public_key: &str) -> Vec<Staker> {
-        vec![Staker {
-            address: "validator-1".to_string(),
-            stake: 10,
-            public_key: Some(public_key.to_string()),
-        }]
+    fn wallet(seed: u8) -> (String, String, String) {
+        let private_key = hex::encode([seed; 32]);
+        let public_key = pos::derive_public_key(&private_key).unwrap();
+        let address = pos::derive_address(&public_key).unwrap();
+        (address, public_key, private_key)
     }
 
-    fn reward_txs(validator: &str) -> Vec<String> {
-        vec![serde_json::to_string(&Transaction::new_reward(validator)).unwrap()]
+    /// Sign a block for whichever validator PoS selected, using the provided
+    /// keyring of (address, private_key) pairs.
+    fn keyring() -> Vec<(String, String)> {
+        let (t_addr, _, t_key) = treasury();
+        let mut ring = vec![(t_addr, t_key)];
+        for seed in 2..=9u8 {
+            let (addr, _, key) = wallet(seed);
+            ring.push((addr, key));
+        }
+        ring
     }
 
-    /// Produce and append a fully valid signed block carrying its reward tx.
-    fn mine_valid_block(chain: &mut Blockchain) {
-        let (public_key, private_key) = test_keys();
-        let stakers = test_stakers(&public_key);
-        let staker_hash = pos::staker_set_hash(&stakers);
+    /// Build, sign, validate, and commit the next block carrying `extra`
+    /// transactions (plus the mandatory reward).
+    fn mine_block_with(chain: &mut Blockchain, extra: Vec<Transaction>) -> Result<(), String> {
+        let validator_set = chain.state.validator_set();
+        let seed = pos::selection_seed(&chain.latest_hash(), chain.blocks.len() as u64);
+        let validator = pos::select_staker_with_seed(&seed, &validator_set)
+            .ok_or("no validators".to_string())?;
+        let public_key = chain.state.stakers.get(&validator).unwrap().public_key.clone();
+
+        let mut post = chain.state.clone();
+        let mut txs = Vec::new();
+        for tx in &extra {
+            tx.verify_for_block(&validator)?;
+            post.apply_transaction(tx)?;
+            txs.push(serde_json::to_string(tx).unwrap());
+        }
+        let reward = Transaction::new_reward(&validator);
+        post.apply_transaction(&reward)?;
+        txs.push(serde_json::to_string(&reward).unwrap());
+
         let mut block = chain.create_block(
-            reward_txs("validator-1"),
-            Some("validator-1".to_string()),
+            txs,
+            Some(validator.clone()),
             Some(public_key),
-            Some(staker_hash),
-            Some(stakers),
+            post.state_root(),
         );
-        let signature = pos::sign_block_hash(&block.hash, &private_key).unwrap();
-        block.validator_signature = Some(signature);
-        chain
-            .validate_block_candidate(&block)
-            .expect("test block should be valid");
-        chain.add_mined_block(block);
+        let private_key = keyring()
+            .into_iter()
+            .find(|(addr, _)| *addr == validator)
+            .map(|(_, key)| key)
+            .ok_or("no key for selected validator".to_string())?;
+        block.validator_signature = Some(pos::sign_block_hash(&block.hash, &private_key).unwrap());
+
+        let post_state = chain.validate_block_candidate(&block)?;
+        chain.commit_block(block, post_state);
+        Ok(())
+    }
+
+    fn mine_valid_block(chain: &mut Blockchain) {
+        mine_block_with(chain, Vec::new()).expect("block should be valid");
+    }
+
+    fn signed_transfer(
+        from: (&str, &str, &str), // address, public_key, private_key
+        to: &str,
+        amount: u64,
+        nonce: u64,
+    ) -> Transaction {
+        let mut tx = Transaction::new(
+            Some(from.0.to_string()),
+            to.to_string(),
+            amount,
+            TransactionType::Transfer,
+        );
+        tx.nonce = nonce;
+        tx.public_key = Some(from.1.to_string());
+        let message = Transaction::transfer_signing_message(from.0, to, amount, nonce);
+        tx.signature = Some(pos::sign_message(&message, from.2).unwrap());
+        tx
     }
 
     #[test]
-    fn test_blockchain_addition() {
+    fn chain_grows_and_replays_deterministically() {
         let mut chain = Blockchain::default();
         assert_eq!(chain.blocks.len(), 1);
         mine_valid_block(&mut chain);
-        assert_eq!(chain.blocks.len(), 2);
+        mine_valid_block(&mut chain);
+        assert_eq!(chain.blocks.len(), 3);
+        assert!(chain.is_valid());
+
+        // Rebuilding state from scratch converges to the same root.
+        let runtime_root = chain.state.state_root();
+        chain.rebuild_state().unwrap();
+        assert_eq!(chain.state.state_root(), runtime_root);
     }
 
     #[test]
-    fn test_chain_validation() {
+    fn transfers_execute_on_chain() {
         let mut chain = Blockchain::default();
-        mine_valid_block(&mut chain);
-        mine_valid_block(&mut chain);
+        let (t_addr, t_pub, t_key) = treasury();
+        let (dest, ..) = wallet(2);
+
+        let tx = signed_transfer((&t_addr, &t_pub, &t_key), &dest, 500, 1);
+        mine_block_with(&mut chain, vec![tx]).unwrap();
+
+        assert_eq!(chain.state.balance_of(&dest), 500);
+        assert_eq!(chain.state.nonce_of(&t_addr), 1);
         assert!(chain.is_valid());
     }
 
     #[test]
-    fn rejects_unsigned_candidate() {
+    fn on_chain_staking_admits_new_validator() {
+        let mut chain = Blockchain::default();
+        let (t_addr, t_pub, t_key) = treasury();
+        let (v_addr, v_pub, v_key) = wallet(2);
+
+        // Fund the new validator, then stake on-chain.
+        let fund = signed_transfer((&t_addr, &t_pub, &t_key), &v_addr, 500, 1);
+        mine_block_with(&mut chain, vec![fund]).unwrap();
+
+        let mut stake = Transaction::new(
+            Some(v_addr.clone()),
+            STAKING_POOL_ACCOUNT.to_string(),
+            300,
+            TransactionType::Stake,
+        );
+        stake.nonce = 1;
+        stake.public_key = Some(v_pub.clone());
+        let message = Transaction::stake_signing_message(&v_addr, 300, 1);
+        stake.signature = Some(pos::sign_message(&message, &v_key).unwrap());
+        mine_block_with(&mut chain, vec![stake]).unwrap();
+
+        assert_eq!(chain.state.validator_set().len(), 2);
+        assert!(chain.is_valid());
+
+        // The new validator can now be selected and produce blocks.
+        for _ in 0..4 {
+            mine_valid_block(&mut chain);
+        }
+        assert!(chain.is_valid());
+    }
+
+    #[test]
+    fn rejects_forged_state_root() {
         let chain = Blockchain::default();
-        let (public_key, _) = test_keys();
-        let stakers = test_stakers(&public_key);
-        let staker_hash = pos::staker_set_hash(&stakers);
-        let block = chain.create_block(
-            reward_txs("validator-1"),
-            Some("validator-1".to_string()),
-            Some(public_key),
-            Some(staker_hash),
-            Some(stakers),
+        let (t_addr, t_pub, t_key) = treasury();
+
+        let reward = Transaction::new_reward(&t_addr);
+        let mut post = chain.state.clone();
+        post.apply_transaction(&reward).unwrap();
+        // Forge extra balance into the state the block claims.
+        post.balances.insert("hkmthief".to_string(), 1_000_000);
+
+        let mut block = chain.create_block(
+            vec![serde_json::to_string(&reward).unwrap()],
+            Some(t_addr),
+            Some(t_pub),
+            post.state_root(),
+        );
+        block.validator_signature = Some(pos::sign_block_hash(&block.hash, &t_key).unwrap());
+
+        let error = chain.validate_block_candidate(&block).unwrap_err();
+        assert!(error.contains("state root"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn rejects_unsigned_candidate_and_wrong_key() {
+        let chain = Blockchain::default();
+        let (t_addr, t_pub, _) = treasury();
+        let reward = Transaction::new_reward(&t_addr);
+        let mut post = chain.state.clone();
+        post.apply_transaction(&reward).unwrap();
+
+        let mut block = chain.create_block(
+            vec![serde_json::to_string(&reward).unwrap()],
+            Some(t_addr.clone()),
+            Some(t_pub),
+            post.state_root(),
         );
         assert!(chain.validate_block_candidate(&block).is_err());
-    }
 
-    #[test]
-    fn rejects_wrong_validator_slot() {
-        let chain = Blockchain::default();
-        let (public_key, private_key) = test_keys();
-        // Two stakers; claim the block for whichever one PoS did NOT select.
-        let stakers = vec![
-            Staker {
-                address: "validator-1".to_string(),
-                stake: 10,
-                public_key: Some(public_key.clone()),
-            },
-            Staker {
-                address: "validator-2".to_string(),
-                stake: 10,
-                public_key: Some(public_key.clone()),
-            },
-        ];
-        let seed = pos::selection_seed(&chain.latest_hash(), 1);
-        let selected = pos::select_staker_with_seed(&seed, &stakers).unwrap();
-        let imposter = if selected == "validator-1" {
-            "validator-2"
-        } else {
-            "validator-1"
-        };
-
-        let staker_hash = pos::staker_set_hash(&stakers);
-        let mut block = chain.create_block(
-            vec!["Tx1".to_string()],
-            Some(imposter.to_string()),
-            Some(public_key),
-            Some(staker_hash),
-            Some(stakers),
-        );
-        block.validator_signature =
-            Some(pos::sign_block_hash(&block.hash, &private_key).unwrap());
-
-        let error = chain.validate_block_candidate(&block).unwrap_err();
-        assert!(error.contains("PoS selection"), "unexpected error: {error}");
-    }
-
-    #[test]
-    fn rejects_signer_key_not_registered_for_validator() {
-        let chain = Blockchain::default();
-        let (registered_key, _) = test_keys();
-        let attacker_private = hex::encode([9u8; 32]);
-        let attacker_public = pos::derive_public_key(&attacker_private).unwrap();
-
-        let stakers = test_stakers(&registered_key);
-        let staker_hash = pos::staker_set_hash(&stakers);
-        let mut block = chain.create_block(
-            reward_txs("validator-1"),
-            Some("validator-1".to_string()),
-            Some(attacker_public),
-            Some(staker_hash),
-            Some(stakers),
-        );
-        block.validator_signature =
-            Some(pos::sign_block_hash(&block.hash, &attacker_private).unwrap());
-
-        let error = chain.validate_block_candidate(&block).unwrap_err();
-        assert!(error.contains("registered key"), "unexpected error: {error}");
+        // Signature from a non-registered key fails.
+        let (_, _, intruder) = wallet(9);
+        block.validator_signature = Some(pos::sign_block_hash(&block.hash, &intruder).unwrap());
+        assert!(chain.validate_block_candidate(&block).is_err());
     }
 
     #[test]
@@ -509,18 +667,23 @@ mod tests {
     }
 
     #[test]
-    fn fork_choice_adopts_heavier_chain() {
+    fn fork_choice_adopts_heavier_chain_and_rebuilds_state() {
         let mut local = Blockchain::default();
         mine_valid_block(&mut local);
 
         let mut remote = Blockchain::default();
-        mine_valid_block(&mut remote);
+        let (t_addr, t_pub, t_key) = treasury();
+        let (dest, ..) = wallet(3);
+        let tx = signed_transfer((&t_addr, &t_pub, &t_key), &dest, 250, 1);
+        mine_block_with(&mut remote, vec![tx]).unwrap();
         mine_valid_block(&mut remote);
         mine_valid_block(&mut remote);
 
         let adopted = local.try_adopt_chain(&remote).unwrap();
         assert!(adopted);
         assert_eq!(local.blocks.len(), 4);
+        // State was rebuilt from the adopted history.
+        assert_eq!(local.state.balance_of(&dest), 250);
         assert!(local.is_valid());
     }
 
@@ -543,7 +706,6 @@ mod tests {
         let mut local = Blockchain::default();
         mine_valid_block(&mut local);
         mine_valid_block(&mut local);
-        // Finalize everything mined so far.
         local.apply_finality(0);
 
         let mut remote = Blockchain::default();
@@ -558,38 +720,70 @@ mod tests {
     #[test]
     fn rejects_future_timestamps() {
         let chain = Blockchain::default();
-        let (public_key, private_key) = test_keys();
-        let stakers = test_stakers(&public_key);
-        let staker_hash = pos::staker_set_hash(&stakers);
+        let (t_addr, t_pub, t_key) = treasury();
+        let reward = Transaction::new_reward(&t_addr);
+        let mut post = chain.state.clone();
+        post.apply_transaction(&reward).unwrap();
+
         let mut block = chain.create_block(
-            reward_txs("validator-1"),
-            Some("validator-1".to_string()),
-            Some(public_key),
-            Some(staker_hash),
-            Some(stakers),
+            vec![serde_json::to_string(&reward).unwrap()],
+            Some(t_addr),
+            Some(t_pub),
+            post.state_root(),
         );
         block.timestamp = Utc::now() + Duration::seconds(MAX_TIMESTAMP_SKEW_SECONDS + 60);
-        block.validator_signature =
-            Some(pos::sign_block_hash(&block.hash, &private_key).unwrap());
+        block.validator_signature = Some(pos::sign_block_hash(&block.hash, &t_key).unwrap());
 
         let error = chain.validate_block_candidate(&block).unwrap_err();
         assert!(error.contains("future"), "unexpected error: {error}");
     }
 
     #[test]
-    fn validate_and_slash_penalizes_bad_signature() {
+    fn equivocation_proof_slashes_validator_on_chain() {
         let mut chain = Blockchain::default();
-        mine_valid_block(&mut chain);
-        // Corrupt the signature after acceptance.
-        chain.blocks[1].validator_signature = Some(hex::encode([0u8; 64]));
+        let (t_addr, t_pub, t_key) = treasury();
 
-        let (public_key, _) = test_keys();
-        let mut stakers = test_stakers(&public_key);
-        let (valid, slashed, details) = chain.validate_and_slash(&mut stakers);
-        assert!(!valid);
-        assert_eq!(slashed.len(), 1);
-        assert_eq!(slashed[0].0, "validator-1");
-        assert!(details.is_some());
-        assert_eq!(stakers[0].stake, 9);
+        // The treasury validator signs two DIFFERENT blocks at height 1.
+        let reward = Transaction::new_reward(&t_addr);
+        let mut post = chain.state.clone();
+        post.apply_transaction(&reward).unwrap();
+        let root = post.state_root();
+
+        let make_signed = |memo: &str| {
+            let mut block = chain.create_block(
+                vec![
+                    serde_json::to_string(&reward).unwrap(),
+                    // Vary content so hashes differ (invalid tx — irrelevant,
+                    // the proof only needs hash + signature).
+                    memo.to_string(),
+                ],
+                Some(t_addr.clone()),
+                Some(t_pub.clone()),
+                root.clone(),
+            );
+            block.validator_signature =
+                Some(pos::sign_block_hash(&block.hash, &t_key).unwrap());
+            block
+        };
+        let block_a = make_signed("fork-a");
+        let block_b = make_signed("fork-b");
+        assert_ne!(block_a.hash, block_b.hash);
+
+        // Build the slash transaction and mine it into the chain.
+        let mut slash = Transaction::new(None, t_addr.clone(), 0, TransactionType::Slash);
+        slash.slash_proof = Some(SlashProof { block_a, block_b });
+        slash.verify_for_block("anyone").unwrap();
+
+        let stake_before = chain.state.stakers.get(&t_addr).unwrap().stake;
+        mine_block_with(&mut chain, vec![slash.clone()]).unwrap();
+        let stake_after = chain.state.stakers.get(&t_addr).unwrap().stake;
+        assert_eq!(stake_after, stake_before - stake_before / 10);
+        assert!(chain.state.burned > 0);
+        assert!(chain.is_valid());
+
+        // The same offense cannot be slashed twice.
+        let mut replay = slash.clone();
+        replay.id = "new-id".to_string();
+        assert!(mine_block_with(&mut chain, vec![replay]).is_err());
     }
 }

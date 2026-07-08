@@ -8,8 +8,7 @@ use axum::{
 };
 
 use super::{
-    signature::recover_address_from_signature, AuthResponse, NonceRequest, NonceResponse,
-    VerifyRequest, VerifyResponse,
+    signature, AuthResponse, NonceRequest, NonceResponse, VerifyRequest, VerifyResponse,
 };
 
 pub fn auth_routes() -> Router<crate::api::routes::AppState> {
@@ -40,23 +39,21 @@ async fn verify_signature(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Verify the signature
-    match recover_address_from_signature(&payload.message, &payload.signature) {
-        Ok(recovered_address) => {
-            // Check if recovered address matches the claimed address
-            if recovered_address.to_lowercase() == payload.address.to_lowercase() {
-                // Create session token
-                let token = auth_manager.create_session(&payload.address);
-
-                Ok(Json(VerifyResponse {
-                    token,
-                    address: payload.address,
-                }))
-            } else {
-                Err(StatusCode::UNAUTHORIZED)
-            }
-        }
-        Err(_) => Err(StatusCode::BAD_REQUEST),
+    // Verify the native signature: the supplied key must derive to the
+    // claimed address and the signature must verify over the message.
+    if signature::verify_signature(
+        &payload.address,
+        &payload.message,
+        &payload.public_key,
+        &payload.signature,
+    ) {
+        let token = auth_manager.create_session(&payload.address);
+        Ok(Json(VerifyResponse {
+            token,
+            address: payload.address,
+        }))
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
     }
 }
 

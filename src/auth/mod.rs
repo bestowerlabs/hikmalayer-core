@@ -62,6 +62,7 @@ pub struct NonceResponse {
 pub struct VerifyRequest {
     pub address: String,
     pub message: String,
+    pub public_key: String,
     pub signature: String,
     pub nonce: String,
 }

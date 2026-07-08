@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 
-use crate::blockchain::block::Block;
+use crate::blockchain::{block::Block, transaction::Transaction};
 
 /// Bounded set of recently seen message IDs used to reject replayed P2P
 /// envelopes. Oldest entries are evicted first.
@@ -57,6 +57,7 @@ pub enum P2PPayload {
     PeerAnnounce { address: String },
     Block(Block),
     BlockBatch(Vec<Block>),
+    Transaction(Transaction),
 }
 
 impl P2PEnvelope {

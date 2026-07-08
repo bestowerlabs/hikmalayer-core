@@ -6,4 +6,3 @@ pub mod contract;
 pub mod governance;
 pub mod p2p;
 pub mod persistence;
-pub mod token;

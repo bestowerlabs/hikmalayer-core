@@ -96,7 +96,7 @@ fn run() -> Result<(), String> {
                 .parse()
                 .map_err(|_| "nonce must be a number".to_string())?;
             let private_key = args.get(4).ok_or(usage)?;
-            let message = format!("hikmalayer-stake:{}:{}:{}", address, amount, nonce);
+            let message = Transaction::stake_signing_message(address, amount, nonce);
             sign_and_print(&message, private_key)
         }
         Some("sign-withdraw") => {
@@ -112,7 +112,7 @@ fn run() -> Result<(), String> {
                 .parse()
                 .map_err(|_| "nonce must be a number".to_string())?;
             let private_key = args.get(4).ok_or(usage)?;
-            let message = format!("hikmalayer-withdraw:{}:{}:{}", address, amount, nonce);
+            let message = Transaction::withdraw_signing_message(address, amount, nonce);
             sign_and_print(&message, private_key)
         }
         _ => Err(usage.to_string()),

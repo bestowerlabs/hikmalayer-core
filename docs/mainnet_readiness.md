@@ -9,68 +9,75 @@ is a launch blocker until closed.
 
 | Area | Status |
 |---|---|
-| Hybrid consensus | PoS stake-weighted selection (height-salted seed) + PoW finalization, enforced on every block |
-| Block integrity | Deterministic genesis, Merkle root committed into the mined hash, full-chain validation |
-| Validator authentication | Block signature must match the validator's **registered** staker key; no server-side keys |
-| Transaction security | All transfers signed (raw secp256k1 or Ethereum personal_sign), verified at ingress **and** at consensus level |
-| Replay protection | Per-account strictly increasing nonces (API); bounded message-ID cache (P2P) |
-| Fork choice | Cumulative-work comparison, full candidate-chain validation, finalized-history protection |
-| Sync | Peers serve `/p2p/chain`; nodes auto-sync on tip mismatch |
-| Authorization | Deny-by-default admin and P2P tokens; admin-gated faucet, certificates, difficulty, governance, slashing |
-| Resource bounds | Difficulty clamped 1–5 (prevents PoW-disable and mining stalls); input length limits |
-| Rewards | Fixed block reward, consensus-verified (recipient + amount + at most one per block) |
-| Slashing | Provably invalid blocks generate slashing evidence; slashable vs structural errors distinguished |
+| Replicated state machine | Balances, validator set, nonces, and slashing are a deterministic function of the blocks; every block commits a **state root** re-verified by every node |
+| On-chain validator set | Stake / withdraw are signed on-chain transactions; the validator set is derived from state, not node-local bookkeeping |
+| Native identity | `hkm…` addresses (SHA-256 over secp256k1 pubkey) and a native signing domain — no external-chain conventions |
+| Hybrid consensus | PoS stake-weighted selection (height-salted seed) from the on-chain set + PoW finalization |
+| Block integrity | Deterministic genesis, Merkle root and state root both committed into the mined hash, full-chain replay |
+| Validator authentication | Block signature must match the validator's on-chain registered key |
+| Transaction security | All transfers / stakes / withdrawals carry native signatures, verified at ingress and re-verified + re-executed at consensus |
+| Replay protection | Per-account on-chain nonces; bounded message-ID cache (P2P) |
+| Fork choice | Cumulative-work comparison, full re-execution under local params, finalized-history protection |
+| Sync | Peers serve `/p2p/chain`; nodes auto-sync on tip mismatch and rebuild state from genesis |
+| Slashing | Permissionless equivocation proofs burn the offender's stake on-chain; double-slash prevented |
+| Authorization | Deny-by-default admin and P2P tokens |
+| Resource bounds | Difficulty clamped 1–5; input length limits |
+| Rewards | Fixed block reward, consensus-verified (recipient + amount + exactly one per block) |
 | Tooling | `hikma-wallet` offline keygen/signing; propose/sign/submit flow for external validators |
-| Tests | 44 automated tests covering consensus, security, replay, fork choice, and API flows |
+| Tests | 53 automated tests across consensus, state machine, security, replay, fork choice, slashing, and API flows |
 
-## 🚧 Launch blockers (Phase 6)
+## 🚧 Launch blockers (Phase 7)
 
-1. **On-chain validator-set state machine.** Stake registration is currently
-   node-local app state (blocks carry staker snapshots for validation).
-   Mainnet requires stake deposits/withdrawals to be on-chain transactions so
-   every node derives the identical validator set from the chain itself.
-
-2. **Global transaction execution from blocks.** Balances are updated at the
-   ingress node and anchored on-chain; peers verify transaction signatures in
-   blocks but do not re-execute them. Mainnet requires deterministic state
-   transition from blocks (execute-on-accept with state root commitments),
-   including balance re-checks and state rebuild on reorg.
-
-3. **VRF-based leader election.** The selection seed (`parent_hash:height`)
+1. **VRF-based leader election.** The selection seed (`parent_hash:height`)
    is deterministic and public, so the current producer can attempt to grind
    block contents to influence the next slot. A verifiable random function
    (or RANDAO-style beacon) is required for unbiasable selection.
 
-4. **Signed peer handshakes / validator networking.** P2P is currently
+2. **Signed peer handshakes / validator networking.** P2P is currently
    authenticated by a shared bearer token, suitable for a permissioned
    testnet. Mainnet requires per-node keypairs, signed handshakes, and
    peer scoring/banning.
 
-5. **Mempool and block-size limits.** Pending-pool size, per-block
+3. **Mempool and block-size limits.** Pending-pool size, per-block
    transaction count, and per-request body limits need explicit caps and
-   fee-based prioritization (fee market not yet designed).
+   fee-based prioritization (fee market not yet designed). Currently one
+   pending transaction per account per block (nonce must be the next value).
 
-6. **Difficulty adjustment.** Difficulty is an operator-set constant. A
-   retargeting algorithm tied to observed block times is needed.
+4. **Difficulty adjustment.** Difficulty is an operator-set constant. A
+   retargeting algorithm tied to observed block times is needed. PoW is also
+   a synchronous single-thread loop — production needs an async miner.
 
-7. **Economic design.** Fixed 5-token block reward, no fees, no halving
-   schedule, no treasury policy. Token economics must be specified before
-   value is attached.
+5. **Economic design.** Fixed 5-token block reward, no transaction fees, no
+   halving schedule, no treasury policy. Token economics must be specified
+   before value is attached.
+
+6. **Unbonding period for withdrawals.** Stake can currently be withdrawn in
+   the next block. Mainnet needs an unbonding delay so a validator cannot
+   equivocate and immediately exit before a slash lands.
+
+7. **Historical slashing window.** Equivocation proofs are accepted at any
+   time; they should be bounded to an unbonding window and the offending
+   blocks should be checkable against a retained header history.
 
 8. **Key management hardening.** `VALIDATOR_PRIVATE_KEY` via environment
    variable is fine for testnets; production validators should use an HSM,
    OS keyring, or remote signer (see `docs/key_management.md`).
 
-9. **External security audit + adversarial testnet.** Independent audit of
-   consensus and cryptography, plus a public incentivized testnet with
-   adversarial validators, before any mainnet genesis.
+9. **State growth & snapshots.** State is held in memory and replayed from
+   full block history on startup. Mainnet needs state snapshots / checkpoint
+   sync and pruning so startup and memory do not grow unbounded.
 
-10. **Observability & operations.** Structured logging, alerting on reorgs
+10. **External security audit + adversarial testnet.** Independent audit of
+    consensus and cryptography, plus a public incentivized testnet with
+    adversarial validators, before any mainnet genesis.
+
+11. **Observability & operations.** Structured logging, alerting on reorgs
     and validation failures, snapshot/restore tooling, and documented
     incident-response runbooks.
 
 ## Suggested order of work
 
-`(1) on-chain validator set` → `(2) execute-on-accept state machine` →
-`(6) difficulty retargeting` → `(3) VRF` → `(4) P2P identity` →
-`(5) mempool limits + fees` → `(7) economics` → `(9) audit + adversarial testnet`.
+`(1) VRF election` → `(6) unbonding + (7) slashing window` →
+`(4) difficulty retarget + async miner` → `(3) mempool/fees` →
+`(2) P2P identity` → `(9) snapshots/pruning` → `(5) economics` →
+`(10) audit + adversarial testnet`.

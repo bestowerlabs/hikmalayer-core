@@ -416,8 +416,10 @@ hikmalayer-core/
 │   │   ├── mod.rs
 │   │   ├── protocol.rs
 │   │   └── service.rs
-│   ├── token/
+│   ├── bin/
+│   │   └── hikma-wallet.rs
 │   ├── governance.rs
+│   ├── lib.rs
 │   ├── main.rs
 │   └── persistence.rs
 ├── BENCHMARKING.md
@@ -428,3 +430,19 @@ hikmalayer-core/
 ├── README.md
 └── docker-compose.yml
 ```
+## Security Status (Sprint 1 Remediation)
+
+The following pre-identified security findings have been remediated:
+
+- **HM-03 (High)** — JWT authentication middleware previously accepted any non-empty token as valid, without actually verifying it. Replaced with real signature verification using the `jsonwebtoken` crate; requests with missing, malformed, or invalid tokens are now rejected with `401 Unauthorized`.
+- **HM-06 (Medium)** — Replaced the single static shared secret with support for rotating token pairs (`*_TOKEN_CURRENT` / `*_TOKEN_PREVIOUS`), allowing secrets to be rotated without invalidating all active sessions at once.
+
+### Environment Variables
+
+| Variable | Purpose |
+|---|---|
+| `P2P_TOKEN_CURRENT` | Active P2P authentication token |
+| `P2P_TOKEN_PREVIOUS` | Previous P2P token, valid during rotation window |
+| `ADMIN_TOKEN_CURRENT` | Active admin authentication token |
+| `ADMIN_TOKEN_PREVIOUS` | Previous admin token, valid during rotation window |
+| `P2P_TOKEN` / `ADMIN_TOKEN` | Legacy single-token variables (still supported) |

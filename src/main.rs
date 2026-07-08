@@ -104,14 +104,29 @@ async fn main() {
     let metrics = Arc::new(Mutex::new(Metrics::default()));
     let seen_messages = Arc::new(Mutex::new(SeenMessageCache::new(8192)));
 
-    let p2p_token = std::env::var("P2P_TOKEN").ok().filter(|t| !t.is_empty());
-    let admin_token = std::env::var("ADMIN_TOKEN").ok().filter(|t| !t.is_empty());
-
-    if p2p_token.is_none() {
-        eprintln!("⚠️  P2P_TOKEN is not set: all P2P endpoints will reject requests.");
+    // Token rotation (HM-06): a node accepts the CURRENT token and, during a
+    // rotation window, the PREVIOUS one. The legacy single-token variables
+    // remain supported.
+    fn load_token_list(legacy_var: &str, current_var: &str, previous_var: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        for var in [current_var, legacy_var, previous_var] {
+            if let Ok(value) = std::env::var(var) {
+                if !value.is_empty() && !tokens.contains(&value) {
+                    tokens.push(value);
+                }
+            }
+        }
+        tokens
     }
-    if admin_token.is_none() {
-        eprintln!("⚠️  ADMIN_TOKEN is not set: all admin endpoints will reject requests.");
+
+    let p2p_tokens = load_token_list("P2P_TOKEN", "P2P_TOKEN_CURRENT", "P2P_TOKEN_PREVIOUS");
+    let admin_tokens = load_token_list("ADMIN_TOKEN", "ADMIN_TOKEN_CURRENT", "ADMIN_TOKEN_PREVIOUS");
+
+    if p2p_tokens.is_empty() {
+        eprintln!("⚠️  No P2P token set (P2P_TOKEN / P2P_TOKEN_CURRENT): all P2P endpoints will reject requests.");
+    }
+    if admin_tokens.is_empty() {
+        eprintln!("⚠️  No admin token set (ADMIN_TOKEN / ADMIN_TOKEN_CURRENT): all admin endpoints will reject requests.");
     }
 
     // This node's validator identity. The private key never leaves the node.
@@ -158,7 +173,7 @@ async fn main() {
     let p2p_service = Arc::new(
         P2PService::new(
             std::env::var("NODE_ID").unwrap_or_else(|_| "node-local".to_string()),
-            p2p_token.clone(),
+            p2p_tokens.first().cloned(),
         )
         .unwrap_or_else(|err| panic!("{}", err)),
     );
@@ -182,8 +197,8 @@ async fn main() {
         slash_evidence,
         metrics,
         seen_messages,
-        p2p_token,
-        admin_token,
+        p2p_tokens,
+        admin_tokens,
         p2p_service,
         validator_key,
         treasury_key,

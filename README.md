@@ -1,14 +1,43 @@
 # Hikmalayer Core
 
 ## What is Hikmalayer core?
-Hikmalayer Core is a hybrid Layer‑1 blockchain prototype that combines Proof‑of‑Stake (validator
-selection) with Proof‑of‑Work (block finalization). It provides:
+Hikmalayer Core is a sovereign hybrid Layer‑1 blockchain that combines Proof‑of‑Stake
+(validator selection) with Proof‑of‑Work (block finalization). It has its own native
+cryptographic identity — no dependency on Ethereum or any other chain's address or
+signing conventions. It provides:
 
-- PoS validator selection, staking, and validator signature verification.
-- PoW mining and PoW validation for every block.
-- Governance and slashing configuration for validator accountability.
-- Persistence of chain state to disk for safe restarts.
-- P2P gossip and peer discovery for block propagation.
+- **A replicated on-chain state machine.** Balances, the validator set, per-account
+  nonces, and slashing are a deterministic function of the block history. Every block
+  commits to the resulting state via a **state root**, so every node independently
+  verifies that every other node executed the chain correctly.
+- **Native identity.** Addresses are `hkm…` (SHA-256 over the secp256k1 public key) and
+  messages are signed under a native Hikmalayer signing domain. Keys are a cryptographic
+  primitive (secp256k1), not an external-chain dependency.
+- **On-chain validator set.** Staking and withdrawals are signed on-chain transactions;
+  the validator set is derived from state, not node-local bookkeeping.
+- **VRF randomness beacon (unbiasable leader election).** Every block carries an
+  sr25519 VRF proof; outputs fold into an on-chain beacon that seeds stake-weighted
+  leader selection. A VRF output is unique per (key, slot) — there is nothing for a
+  validator to grind.
+- **⭐ Proof-of-Credential — on-chain verifiable credentials.** Issue, verify, and
+  revoke credentials as first-class consensus objects. Only a hash of the credential
+  document goes on-chain (privacy by design); any third party verifies a credential
+  against the block-committed state root without trusting a node. Built for the
+  chain's mission: digital identity anchoring and credential verification.
+- PoS validator selection (stake-weighted, seeded by the VRF beacon) verified
+  against the on-chain validator set at each block's parent state.
+- PoW mining and PoW validation for every block, with bounded difficulty.
+- Deterministic genesis, Merkle-root transaction commitment, and full-chain replay.
+- Signed transactions with per-account nonces (replay protection).
+- Fork choice by cumulative work with finalized-history protection; adopted chains are
+  re-executed under local network parameters and their state rebuilt from genesis.
+- P2P block and transaction gossip, peer chain sync, and P2P message replay protection.
+- **Permissionless slashing:** anyone holding a proof that a validator signed two blocks
+  at the same height can submit it; the offender's stake is burned on-chain.
+- Block rewards minted to the producing validator on block acceptance.
+- An offline wallet/validator signing CLI (`hikma-wallet`) — private keys never touch
+  the node or the network.
+- Persistence to disk (chain only; balances/stakes/nonces are replayed on startup).
 - A React dashboard for local interaction and testing workflows.
 
 Hikmalayer is developed by Muhammad Ayan Rao, Founder and Director of Bestower Labs Limited.
@@ -85,6 +114,156 @@ Hikmalayer Core is developed in phases:
 - **Phase 5 (in progress)**: Public testnet with full P2P validator consensus and finalized-state tracking.
 
 
+## 🔄 How it works — consensus workflow
+
+The full life of a transaction and block, from wallet to finality:
+
+```mermaid
+flowchart TD
+    A["👤 User / Validator<br/>hikma-wallet (native hkm… keys)"] -->|"sign offline:<br/>transfer / stake / withdraw<br/>+ per-account nonce"| B["Node API"]
+    B -->|"verify native signature,<br/>check applies to state"| C["⏳ Pending transaction pool"]
+    C -->|"gossip tx to peers"| C
+
+    C --> D{"Next block slot"}
+    D -->|"PoS: stake-weighted selection from<br/>on-chain validator set at parent<br/>seed = VRF randomness beacon : height"| E["🎯 Selected validator"]
+
+    E -->|"node holds its own key<br/>(VALIDATOR_PRIVATE_KEY)"| F["POST /mine"]
+    E -->|"external validator"| G["POST /mine/propose<br/>→ sign block hash offline →<br/>POST /mine/submit"]
+
+    F --> EX["🧮 Execute txs against parent state<br/>→ new balances, stakes, nonces,<br/>credentials → compute STATE ROOT"]
+    G --> EX
+    EX --> H["⛏️ PoW: SHA-256 mining<br/>(commits state root + merkle root)"]
+    H --> I["✍️ Validator signs the block hash<br/>+ attaches VRF output & proof<br/>(keys never leave the validator)"]
+
+    I --> J{"🔍 Full consensus validation<br/>(every node, independently)"}
+    J -->|"checks"| J1["• index + previous-hash linkage<br/>• PoS slot matches on-chain validator<br/>• signer key = validator's on-chain key<br/>• VRF proof valid for this exact slot<br/>• Merkle root commits to txs<br/>• PoW hash + difficulty bounds<br/>• re-execute every tx on parent state<br/>• STATE ROOT matches execution<br/>• exactly one correct reward tx<br/>• timestamp within skew"]
+
+    J -->|valid| K["✅ Append block<br/>+ adopt executed state<br/>(reward already in state)"]
+    J -->|invalid| L["❌ Reject<br/>(equivocation → on-chain slash)"]
+
+    K --> M["📡 Gossip block to peers<br/>(authenticated, replay-protected)"]
+    M --> N{"Peer validation"}
+    N -->|extends tip| O["Peer re-executes & appends<br/>→ identical state root"]
+    N -->|tip mismatch| P["🔀 Fork choice:<br/>fetch peer chains, replay under<br/>local params, adopt heaviest valid,<br/>never rewrite finalized history"]
+
+    O --> Q["🔒 Finality:<br/>blocks deeper than finality_depth<br/>are irreversible"]
+    P --> Q
+    K --> Q
+```
+
+Key consensus rules:
+
+| Rule | Mechanism |
+|---|---|
+| Native identity | `hkm` + SHA-256(secp256k1 pubkey)[..20]; messages signed under the Hikmalayer signing domain — no external-chain conventions |
+| Who may produce the next block | Stake-weighted PoS from the **on-chain** validator set, seeded by the **VRF randomness beacon** at the parent (`beacon:height`) |
+| Why leader election is unbiasable | Each block's sr25519 VRF output is unique per (validator key, slot) and folds into the beacon — a producer cannot grind future assignments (residual bias: withhold-and-forfeit only) |
+| Proof the right validator produced it | secp256k1 signature over the block hash, checked against the validator's **on-chain** registered key |
+| State agreement | Every block commits a **state root**; nodes re-execute all transactions and reject any block whose root ≠ executed state |
+| Tamper evidence | Merkle root over transactions, both roots committed into the PoW-mined hash |
+| Work requirement | SHA-256 PoW at chain difficulty (bounded 1–5) |
+| Transaction authenticity | Every transfer/stake/withdraw carries a native signature, re-verified at consensus level |
+| Replay protection | Per-account on-chain nonces + P2P message-ID cache |
+| Conflicting chains | Heaviest-cumulative-work valid chain wins; adopted chains re-execute from genesis; finalized blocks can never be rewritten |
+| Misbehavior | Permissionless equivocation proofs slash the offender's stake on-chain (burned) |
+
+## 🔐 Security model
+
+- **Sovereign native identity.** `hkm…` addresses and a native signing domain — no reliance
+  on Ethereum or any other chain's address/signature format. secp256k1 is used purely as a
+  cryptographic primitive.
+- **No private keys on the node.** Validators keep keys offline (`hikma-wallet`) or in the
+  node's local environment (`VALIDATOR_PRIVATE_KEY` — the node's *own* identity only).
+  The API never accepts a private key.
+- **Replicated state, verified everywhere.** No node can forge a balance or a credential:
+  state is a pure function of the blocks and every node checks the committed state root
+  by re-execution.
+- **Unbiasable randomness.** Leader election is seeded by a VRF beacon (audited
+  sr25519/schnorrkel, as used by Polkadot) — validator-unique, publicly verifiable,
+  nothing to grind.
+- **Rotating, constant-time authorization tokens.** Admin/P2P tokens support
+  `*_TOKEN_CURRENT`/`*_TOKEN_PREVIOUS` rotation and are compared in constant time.
+- **Signed everything.** Transfers, stakes, and withdrawals require native signatures;
+  staking addresses are cryptographically bound to their keys
+  (`address = hkm + SHA-256(pubkey)[..20]`).
+- **Deny-by-default authorization.** P2P endpoints require `x-p2p-token`; admin endpoints
+  (faucet, certificates, difficulty, governance) require `x-admin-token`. Unset = disabled.
+- **Bounded resources.** Difficulty is clamped (1–5) so a bad difficulty can neither
+  disable PoW nor stall the node; explorer inputs are length-limited.
+
+## ⭐ Flagship: Proof-of-Credential
+
+Hikmalayer's differentiator is a **credential layer built into consensus** — not a
+smart contract bolted on top. Universities, licensing bodies, and employers issue
+credentials as signed on-chain transactions; anyone verifies them against the
+chain's state root in one call.
+
+```bash
+# 1. Issuer signs the credential action offline (only the DOCUMENT HASH goes on-chain)
+hikma-wallet sign-credential degree-2026-001 hkm<student> $(sha256sum diploma.pdf | cut -d' ' -f1) false <nonce> <issuer_key>
+
+# 2. Submit — it becomes a consensus object when mined
+curl -X POST localhost:3000/credentials/issue -d '{
+  "id": "degree-2026-001", "subject": "hkm<student>",
+  "data_hash": "<sha256 of the document>", "issuer": "hkm<issuer>",
+  "nonce": 1, "public_key": "<issuer pub>", "signature": "<sig>"
+}'
+
+# 3. Anyone, anywhere verifies — and gets a portable, state-root-bound proof
+curl localhost:3000/credentials/degree-2026-001/proof
+#   → { credential, height, state_root, block_hash }
+
+# 4. Revocation is a first-class on-chain operation (issuer-only, instant)
+curl -X POST localhost:3000/credentials/revoke -d '{ "id": "degree-2026-001", … }'
+```
+
+Why it stands out:
+
+| | Typical chains | Hikmalayer |
+|---|---|---|
+| Credential logic | Smart-contract per issuer | Native consensus objects |
+| Verification | Requires contract ABI + indexer | One HTTP call, checked against the state root |
+| Privacy | Data often on-chain | Only the document hash on-chain |
+| Revocation | Contract-specific | Protocol-level, issuer-signed, instant |
+| Trust needed | The RPC node | None — the proof binds to the replicated state root |
+
+## Running a node
+
+```bash
+# generate a native identity (offline; keys never leave your machine)
+cargo run --bin hikma-wallet keygen
+#   → private_key / public_key / address (hkm…)
+
+# run a validator node (genesis params identical across a network)
+ADMIN_TOKEN=... P2P_TOKEN=... VALIDATOR_PRIVATE_KEY=<hex> PORT=3000 cargo run
+
+# fund an account from the treasury faucet (dev; node needs TREASURY_PRIVATE_KEY)
+curl -X POST localhost:3000/tokens/faucet -H "x-admin-token: ..." \
+     -d '{"to":"<hkm-address>","amount":500}'
+curl -X POST localhost:3000/mine    # execute the faucet transfer on-chain
+
+# stake to become a validator (signed offline, executes on-chain)
+nonce=$(curl -s localhost:3000/tokens/nonce/<hkm-address> | jq .next_nonce)
+sig=$(hikma-wallet sign-stake <hkm-address> 100 $nonce <private_key> | awk '/signature/{print $2}')
+curl -X POST localhost:3000/staking/deposit \
+     -d '{"address":"<hkm-address>","amount":100,"public_key":"<pub>","nonce":'$nonce',"signature":"'$sig'"}'
+curl -X POST localhost:3000/mine
+
+# inspect the replicated state
+curl localhost:3000/blockchain/state    # height, state_root, supply, validators
+```
+
+Genesis parameters (`GENESIS_TREASURY_ADDRESS`, `GENESIS_VALIDATOR_PUBLIC_KEY`,
+`GENESIS_SUPPLY`) are part of chain identity — every node on a network must share them
+or their genesis hashes differ and they will not sync. Unset = the well-known **dev**
+genesis (fine for local use only).
+
+A full multi-node local testnet (bootnode + 4 validators + RPC + monitoring):
+
+```bash
+./ops/start_testnet.sh
+```
+
 ## Testing
 Run the Rust test suite:
 
@@ -93,8 +272,11 @@ cargo test
 ```
 
 ## Automated testing
-Automated tests are currently run via `cargo test` and include unit coverage for chain validation,
-transactions, and PoS selection.
+Automated tests run via `cargo test` (also in CI, `.github/workflows/rust.yml`) and cover:
+chain replay & state-root verification, on-chain staking/withdrawal, equivocation
+slashing, fork choice and finality protection, PoS selection, block/transaction
+signature verification, Merkle integrity, replay protection (nonces and
+P2P envelopes), authorization gating, and the full mine/propose/submit flows.
 
 ## Manual Quality Assurance testing
 Manual QA can be performed using the API and dashboard:
@@ -183,21 +365,27 @@ Phase-5 introduces peer-to-peer validator networking and public testnet deployme
 
 Current implementation provides:
 
-- Hybrid PoS validator selection + PoW block finalization (logic implemented)  
-- REST execution layer (benchmarked)  
-- Governance + slashing primitives  
-- Persistent chain state  
-- Token subsystem  
-- Smart contract execution framework  
-- Dockerized orchestration  
-- Monitoring + metrics  
+- Replicated on-chain state machine with per-block **state-root** commitment  
+- Native `hkm…` identity and signing domain (no external-chain dependency)  
+- On-chain validator set: staking & withdrawal are signed on-chain transactions  
+- VRF randomness beacon (sr25519) seeding unbiasable leader election  
+- Proof-of-Credential: native on-chain verifiable credentials with state-root proofs  
+- Hybrid PoS validator selection + PoW block finalization (enforced end-to-end)  
+- Deterministic genesis + Merkle-committed transactions  
+- Signed transactions with on-chain nonce replay protection  
+- Fork choice by cumulative work, with re-execution and finality protection  
+- Block & transaction gossip, peer chain sync, and P2P replay protection  
+- Offline validator signing flow (`/mine/propose` → `hikma-wallet sign-block` → `/mine/submit`)  
+- Permissionless equivocation slashing (stake burned on-chain)  
+- Block rewards, governance configuration  
+- Persistent chain (state replayed on startup), smart contract / certificate subsystem  
+- Dockerized orchestration, monitoring + metrics  
 
-### Upcoming (Phase-5)
+### Remaining before public mainnet
 
-- Validator networking  
-- Block gossip  
-- Finality tracking  
-- Public testnet  
+See [`docs/mainnet_readiness.md`](docs/mainnet_readiness.md) for the full checklist
+(VRF-based leader election, signed peer handshakes, fee market, difficulty retargeting,
+and an external security audit).
 
 ---
 
@@ -229,7 +417,10 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 | Phase 2 | ✅ Complete |
 | Phase 3 | ✅ Complete |
 | Phase 4 | ✅ Complete (Execution + Ops) |
-| Phase 5 | 🚧 In Progress (Public Testnet) |
+| Phase 5 | ✅ Consensus layer complete (gossip, fork choice, finality, signed txs) |
+| Phase 6 | ✅ Replicated on-chain state machine, native identity, on-chain validator set & slashing |
+| Phase 7 | ✅ VRF randomness beacon (unbiasable leader election) + Proof-of-Credential registry |
+| Phase 8 | 🚧 Mainnet hardening (unbonding, fee market, P2P identity, audit — see `docs/mainnet_readiness.md`) |
 
 
 
@@ -280,8 +471,10 @@ hikmalayer-core/
 │   │   ├── mod.rs
 │   │   ├── protocol.rs
 │   │   └── service.rs
-│   ├── token/
+│   ├── bin/
+│   │   └── hikma-wallet.rs
 │   ├── governance.rs
+│   ├── lib.rs
 │   ├── main.rs
 │   └── persistence.rs
 ├── BENCHMARKING.md
@@ -307,3 +500,4 @@ The following pre-identified security findings have been remediated:
 | `P2P_TOKEN_PREVIOUS` | Previous P2P token, valid during rotation window |
 | `ADMIN_TOKEN_CURRENT` | Active admin authentication token |
 | `ADMIN_TOKEN_PREVIOUS` | Previous admin token, valid during rotation window |
+| `P2P_TOKEN` / `ADMIN_TOKEN` | Legacy single-token variables (still supported) |

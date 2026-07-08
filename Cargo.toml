@@ -25,3 +25,4 @@ jsonwebtoken = "9.2"  # Optional: for JWT tokens instead of UUIDs
 # Optional: For more secure session management
 argon2 = "0.5"        # For password hashing if you add password auth
 base64 = "0.21"       # For encoding/decoding
+schnorrkel = "0.11"

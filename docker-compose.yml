@@ -1,13 +1,25 @@
 version: "3.9"
 
+# Local testnet topology. The VALIDATOR_PRIVATE_KEY values below are the
+# well-known dev keys (1..5) — NEVER use them outside a local test network.
+
+x-common-env: &common-env
+  P2P_TOKEN: local-testnet
+  ADMIN_TOKEN: local-admin
+  RUST_LOG: info
+
 services:
   bootnode:
     build: .
     container_name: hikmalayer-bootnode
     environment:
-      - P2P_TOKEN=local-testnet
-      - ADMIN_TOKEN=local-admin
-      - RUST_LOG=info
+      <<: *common-env
+      NODE_ID: bootnode
+      # Dev genesis: key 0x…01 is the genesis validator (treasury). The
+      # bootnode holds it so it can bootstrap block production and run the
+      # faucet. NEVER use these keys outside a local test network.
+      VALIDATOR_PRIVATE_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
+      TREASURY_PRIVATE_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
     ports:
       - "3000:3000"
 
@@ -15,9 +27,10 @@ services:
     build: .
     container_name: hikmalayer-validator1
     environment:
-      - P2P_TOKEN=local-testnet
-      - ADMIN_TOKEN=local-admin
-      - RUST_LOG=info
+      <<: *common-env
+      NODE_ID: validator1
+      VALIDATOR_PRIVATE_KEY: "0000000000000000000000000000000000000000000000000000000000000002"
+      BOOTNODES: http://bootnode:3000
     ports:
       - "3001:3000"
 
@@ -25,9 +38,10 @@ services:
     build: .
     container_name: hikmalayer-validator2
     environment:
-      - P2P_TOKEN=local-testnet
-      - ADMIN_TOKEN=local-admin
-      - RUST_LOG=info
+      <<: *common-env
+      NODE_ID: validator2
+      VALIDATOR_PRIVATE_KEY: "0000000000000000000000000000000000000000000000000000000000000003"
+      BOOTNODES: http://bootnode:3000
     ports:
       - "3002:3000"
 
@@ -35,9 +49,10 @@ services:
     build: .
     container_name: hikmalayer-validator3
     environment:
-      - P2P_TOKEN=local-testnet
-      - ADMIN_TOKEN=local-admin
-      - RUST_LOG=info
+      <<: *common-env
+      NODE_ID: validator3
+      VALIDATOR_PRIVATE_KEY: "0000000000000000000000000000000000000000000000000000000000000004"
+      BOOTNODES: http://bootnode:3000
     ports:
       - "3003:3000"
 
@@ -45,9 +60,10 @@ services:
     build: .
     container_name: hikmalayer-validator4
     environment:
-      - P2P_TOKEN=local-testnet
-      - ADMIN_TOKEN=local-admin
-      - RUST_LOG=info
+      <<: *common-env
+      NODE_ID: validator4
+      VALIDATOR_PRIVATE_KEY: "0000000000000000000000000000000000000000000000000000000000000005"
+      BOOTNODES: http://bootnode:3000
     ports:
       - "3004:3000"
 
@@ -55,9 +71,9 @@ services:
     build: .
     container_name: hikmalayer-rpc
     environment:
-      - P2P_TOKEN=local-testnet
-      - ADMIN_TOKEN=local-admin
-      - RUST_LOG=info
+      <<: *common-env
+      NODE_ID: rpc
+      BOOTNODES: http://bootnode:3000
     ports:
       - "3010:3000"
 

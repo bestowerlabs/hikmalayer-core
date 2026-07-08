@@ -4,21 +4,23 @@ use std::path::Path;
 
 use crate::{
     blockchain::{chain::Blockchain, transaction::Transaction},
-    consensus::pos::Staker,
     contract::contract::ContractExecutor,
     governance::GovernanceConfig,
-    token::fungible::Token,
 };
 
-const STATE_PATH: &str = "data/state.json";
+const DEFAULT_STATE_PATH: &str = "data/state.json";
 
+fn state_path() -> String {
+    std::env::var("HIKMALAYER_STATE_PATH").unwrap_or_else(|_| DEFAULT_STATE_PATH.to_string())
+}
+
+/// Persisted node state. Balances, stakes, and nonces are NOT stored — they
+/// are chain state, deterministically rebuilt from the blocks at startup.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppSnapshot {
     pub chain: Blockchain,
-    pub token: Token,
     pub contracts: ContractExecutor,
     pub pending_transactions: Vec<Transaction>,
-    pub stakers: Vec<Staker>,
     #[serde(default)]
     pub peers: Vec<String>,
     #[serde(default)]
@@ -37,15 +39,16 @@ pub struct SlashEvidence {
 }
 
 pub fn load_state() -> Option<AppSnapshot> {
-    let contents = fs::read_to_string(STATE_PATH).ok()?;
+    let contents = fs::read_to_string(state_path()).ok()?;
     serde_json::from_str(&contents).ok()
 }
 
 pub fn save_state(snapshot: &AppSnapshot) -> std::io::Result<()> {
-    if let Some(parent) = Path::new(STATE_PATH).parent() {
+    let path = state_path();
+    if let Some(parent) = Path::new(&path).parent() {
         fs::create_dir_all(parent)?;
     }
     let data = serde_json::to_string_pretty(snapshot)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-    fs::write(STATE_PATH, data)
+    fs::write(path, data)
 }

@@ -1,7 +1,43 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, VecDeque};
 
-use crate::blockchain::block::Block;
+use crate::blockchain::{block::Block, transaction::Transaction};
+
+/// Bounded set of recently seen message IDs used to reject replayed P2P
+/// envelopes. Oldest entries are evicted first.
+#[derive(Debug, Default)]
+pub struct SeenMessageCache {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl SeenMessageCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Record a message ID. Returns false when the ID was already seen
+    /// (i.e. the message is a replay).
+    pub fn insert(&mut self, message_id: &str) -> bool {
+        if self.seen.contains(message_id) {
+            return false;
+        }
+        if self.order.len() >= self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.seen.insert(message_id.to_string());
+        self.order.push_back(message_id.to_string());
+        true
+    }
+}
 
 pub const P2P_PROTOCOL_VERSION: &str = "hikmalayer-p2p/1";
 
@@ -21,6 +57,7 @@ pub enum P2PPayload {
     PeerAnnounce { address: String },
     Block(Block),
     BlockBatch(Vec<Block>),
+    Transaction(Transaction),
 }
 
 impl P2PEnvelope {
@@ -63,6 +100,17 @@ impl P2PEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seen_cache_rejects_replays_and_evicts() {
+        let mut cache = SeenMessageCache::new(2);
+        assert!(cache.insert("a"));
+        assert!(!cache.insert("a"));
+        assert!(cache.insert("b"));
+        assert!(cache.insert("c")); // evicts "a"
+        assert!(cache.insert("a"));
+        assert!(!cache.insert("c"));
+    }
 
     #[test]
     fn validates_fresh_envelope() {

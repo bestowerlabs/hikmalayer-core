@@ -8,7 +8,10 @@ const TokenManager = ({ refreshTrigger, onTokenTransfer }) => {
     from: "",
     to: "",
     amount: 0,
+    public_key: "",
+    signature: "",
   });
+  const [nextNonce, setNextNonce] = useState(null);
   const [balanceAddress, setBalanceAddress] = useState("");
   const [balance, setBalance] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -56,13 +59,29 @@ const TokenManager = ({ refreshTrigger, onTokenTransfer }) => {
     }));
   };
 
+  // The exact hikma-wallet command that produces the required signature.
+  const signingCommand = () =>
+    `hikma-wallet sign-transfer ${transferData.from || "<from>"} ${
+      transferData.to || "<to>"
+    } ${transferData.amount || 0} ${nextNonce ?? "<nonce>"} <private_key>`;
+
+  const fetchNextNonce = async () => {
+    if (!transferData.from) return null;
+    const nonceResponse = await fetch(
+      `${API_BASE}/tokens/nonce/${transferData.from}`
+    );
+    const { next_nonce } = await nonceResponse.json();
+    setNextNonce(next_nonce);
+    return next_nonce;
+  };
+
+  useEffect(() => {
+    fetchNextNonce().catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transferData.from, refreshTrigger]);
+
   const handleTransferTokens = async (e) => {
     e.preventDefault();
-
-    if (!isConnected) {
-      setMessage("Please connect your wallet first");
-      return;
-    }
 
     if (!transferData.from || !transferData.to || transferData.amount <= 0) {
       setMessage("Please fill in all fields with valid values");
@@ -74,13 +93,29 @@ const TokenManager = ({ refreshTrigger, onTokenTransfer }) => {
       return;
     }
 
+    if (!transferData.public_key || !transferData.signature) {
+      setMessage(
+        `Transfers are signed offline with the Hikmalayer wallet. Run: ${signingCommand()}`
+      );
+      return;
+    }
+
     setLoading(true);
-    setMessage("Transferring tokens...");
+    setMessage("Submitting signed transfer...");
 
     try {
+      const nonce = nextNonce ?? (await fetchNextNonce());
+
       const response = await authenticatedFetch("/tokens/transfer", {
         method: "POST",
-        body: JSON.stringify(transferData),
+        body: JSON.stringify({
+          from: transferData.from,
+          to: transferData.to,
+          amount: transferData.amount,
+          nonce,
+          public_key: transferData.public_key,
+          signature: transferData.signature,
+        }),
       });
 
       const result = await response.json();
@@ -95,6 +130,8 @@ const TokenManager = ({ refreshTrigger, onTokenTransfer }) => {
           from: account || "",
           to: "",
           amount: 0,
+          public_key: "",
+          signature: "",
         }));
 
         // Refresh user balance
@@ -300,16 +337,52 @@ const TokenManager = ({ refreshTrigger, onTokenTransfer }) => {
                   </p>
                 )}
               </div>
+
+              {/* Native offline signing: keys never leave the wallet */}
+              <div className="p-3 rounded-lg bg-black/30 border border-white/10">
+                <p className="text-xs text-gray-300 mb-2">
+                  🔏 Sign this transfer offline with the Hikmalayer wallet
+                  (next nonce: <strong>{nextNonce ?? "…"}</strong>):
+                </p>
+                <code className="block text-[11px] text-cyan-300 break-all mb-3">
+                  {signingCommand()}
+                </code>
+                <label className="block text-xs font-medium text-gray-200 mb-1">
+                  Public Key (hex)
+                </label>
+                <input
+                  type="text"
+                  name="public_key"
+                  value={transferData.public_key}
+                  onChange={handleTransferInputChange}
+                  placeholder="Uncompressed secp256k1 public key"
+                  className="w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white placeholder-gray-400 text-xs mb-2"
+                  disabled={loading}
+                />
+                <label className="block text-xs font-medium text-gray-200 mb-1">
+                  Signature (hex)
+                </label>
+                <input
+                  type="text"
+                  name="signature"
+                  value={transferData.signature}
+                  onChange={handleTransferInputChange}
+                  placeholder="hikma-wallet signature output"
+                  className="w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white placeholder-gray-400 text-xs"
+                  disabled={loading}
+                />
+              </div>
             </div>
 
             <button
               type="submit"
               disabled={
                 loading ||
-                !isConnected ||
                 !transferData.from ||
                 !transferData.to ||
-                transferData.amount <= 0
+                transferData.amount <= 0 ||
+                !transferData.public_key ||
+                !transferData.signature
               }
               className="relative overflow-hidden mt-6 w-full bg-gradient-to-r from-indigo-500 to-purple-600 text-white px-6 py-3 rounded-xl font-medium transition-all duration-300 hover:scale-105 hover:shadow-lg hover:shadow-indigo-500/25 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 group"
             >
@@ -318,11 +391,7 @@ const TokenManager = ({ refreshTrigger, onTokenTransfer }) => {
                 {loading ? "⏳" : "💸"}
               </span>
               <span className="relative z-10">
-                {loading
-                  ? "Transferring..."
-                  : !isConnected
-                  ? "Connect Wallet to Transfer"
-                  : "Transfer Tokens"}
+                {loading ? "Transferring..." : "Submit Signed Transfer"}
               </span>
             </button>
           </form>

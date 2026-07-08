@@ -17,7 +17,7 @@ struct Claims {
 
 pub async fn auth_middleware(
     headers: HeaderMap,
-    State(state): State<crate::api::routes::AppState>,
+    State(_state): State<crate::api::routes::AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {

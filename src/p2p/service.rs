@@ -11,27 +11,58 @@ use crate::{
 pub struct P2PService {
     pub node_id: String,
     pub p2p_token: Option<String>,
+    /// This node's identity key. When present, every outgoing envelope is
+    /// signed and `node_id` is the address derived from it.
+    node_private_key: Option<String>,
     client: Client,
     max_retries: usize,
 }
 
 impl P2PService {
     pub fn new(node_id: String, p2p_token: Option<String>) -> Result<Self, String> {
+        Self::with_identity(node_id, p2p_token, None)
+    }
+
+    pub fn with_identity(
+        node_id: String,
+        p2p_token: Option<String>,
+        node_private_key: Option<String>,
+    ) -> Result<Self, String> {
         let client = Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
             .map_err(|e| format!("Failed to build P2P client: {}", e))?;
 
+        // Derive the node_id from the identity key when one is configured.
+        let node_id = match &node_private_key {
+            Some(key) => {
+                let public = crate::consensus::pos::derive_public_key(key)?;
+                crate::consensus::pos::derive_address(&public)?
+            }
+            None => node_id,
+        };
+
         Ok(Self {
             node_id,
             p2p_token,
+            node_private_key,
             client,
             max_retries: 2,
         })
     }
 
+    /// Sign an envelope with the node identity key when one is configured.
+    fn finalize(&self, envelope: P2PEnvelope) -> P2PEnvelope {
+        match &self.node_private_key {
+            Some(key) => envelope.signed(key).unwrap_or_else(|_| {
+                P2PEnvelope::new(self.node_id.clone(), P2PPayload::Ping)
+            }),
+            None => envelope,
+        }
+    }
+
     pub fn block_envelope(&self, block: Block) -> P2PEnvelope {
-        P2PEnvelope::new(self.node_id.clone(), P2PPayload::Block(block))
+        self.finalize(P2PEnvelope::new(self.node_id.clone(), P2PPayload::Block(block)))
     }
 
     pub async fn broadcast_block(&self, peers: Vec<String>, block: Block) -> (u64, u64) {
@@ -45,10 +76,10 @@ impl P2PService {
         peers: Vec<String>,
         transaction: crate::blockchain::transaction::Transaction,
     ) -> (u64, u64) {
-        let envelope = P2PEnvelope::new(
+        let envelope = self.finalize(P2PEnvelope::new(
             self.node_id.clone(),
             P2PPayload::Transaction(transaction),
-        );
+        ));
         self.broadcast_envelope(peers, envelope).await
     }
 

@@ -73,6 +73,9 @@ pub struct AppState {
     pub p2p_tokens: Vec<String>,
     pub admin_tokens: Vec<String>,
     pub p2p_service: Arc<P2PService>,
+    /// When true, inbound P2P envelopes must carry a valid node-identity
+    /// signature (per-node keypair handshake), not just the bearer token.
+    pub p2p_require_identity: bool,
     pub validator_key: Option<LocalValidatorKey>,
     /// Treasury key for dev/test faucet operation (never required in
     /// production; the faucet is disabled without it).
@@ -1912,7 +1915,7 @@ async fn receive_protocol_message(
         });
     }
 
-    if let Err(message) = envelope.validate(300) {
+    if let Err(message) = envelope.validate_with_identity(300, state.p2p_require_identity) {
         let mut metrics = state.metrics.lock().await;
         metrics.protocol_messages_rejected += 1;
         return Json(ApiResponse {
@@ -2368,6 +2371,7 @@ mod tests {
             p2p_tokens: vec![P2P_TOKEN.to_string()],
             admin_tokens: vec![ADMIN_TOKEN.to_string()],
             p2p_service: Arc::new(P2PService::new("node-test".to_string(), None).unwrap()),
+            p2p_require_identity: false,
             validator_key: with_local_validator.then(|| treasury.clone()),
             treasury_key: Some(treasury),
         }

@@ -180,13 +180,28 @@ async fn main() {
         _ => None,
     };
 
+    // Node identity for signed P2P handshakes: dedicated NODE_PRIVATE_KEY,
+    // else reuse the validator key, else anonymous (token-only).
+    let node_private_key = std::env::var("NODE_PRIVATE_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| std::env::var("VALIDATOR_PRIVATE_KEY").ok().filter(|k| !k.is_empty()));
+    let p2p_require_identity = std::env::var("P2P_REQUIRE_IDENTITY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     let p2p_service = Arc::new(
-        P2PService::new(
+        P2PService::with_identity(
             std::env::var("NODE_ID").unwrap_or_else(|_| "node-local".to_string()),
             p2p_tokens.first().cloned(),
+            node_private_key,
         )
         .unwrap_or_else(|err| panic!("{}", err)),
     );
+    if p2p_require_identity {
+        println!("🛡️  P2P identity enforcement ON: inbound envelopes must be node-signed.");
+    }
+    println!("🕸️  P2P node identity: {}", p2p_service.node_id);
 
     let finality_depth = {
         let governance = governance.lock().await;
@@ -210,6 +225,7 @@ async fn main() {
         p2p_tokens,
         admin_tokens,
         p2p_service,
+        p2p_require_identity,
         validator_key,
         treasury_key,
     };

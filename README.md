@@ -32,6 +32,9 @@ signing conventions. It provides:
 - Fork choice by cumulative work with finalized-history protection; adopted chains are
   re-executed under local network parameters and their state rebuilt from genesis.
 - P2P block and transaction gossip, peer chain sync, and P2P message replay protection.
+- **Cryptographic node identity.** Every gossip envelope is signed by the sender's node
+  key and bound to its derived `node_id`; set `P2P_REQUIRE_IDENTITY=true` to reject any
+  unsigned envelope — a per-node keypair handshake layered on the bearer token.
 - **Permissionless slashing with an unbonding guarantee:** anyone holding a proof that a
   validator signed two blocks at the same height can submit it; the offender's stake is
   burned on-chain. Withdrawn stake unbonds over 20 blocks and stays slashable for the
@@ -433,7 +436,7 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 | Phase 6 | ✅ Replicated on-chain state machine, native identity, on-chain validator set & slashing |
 | Phase 7 | ✅ VRF randomness beacon (unbiasable leader election) + Proof-of-Credential registry |
 | Phase 8 | ✅ Unbonding + slashing window, tx fees, difficulty retargeting, mempool/DoS bounds, async mining |
-| Phase 9 | 🚧 Mainnet hardening (P2P identity, snapshots, fee market, audit — see `docs/mainnet_readiness.md`) |
+| Phase 9 | ✅ Signed P2P node identity/handshakes. 🚧 Peer scoring, snapshots, fee market, external audit |
 
 
 

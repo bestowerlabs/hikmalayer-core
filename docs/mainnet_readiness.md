@@ -31,15 +31,16 @@ is a launch blocker until closed.
 | Difficulty retargeting | Deterministic per-chain schedule (every 10 blocks toward 15s target); block difficulty is consensus-validated, not operator-set |
 | Node responsiveness | PoW mining runs on the blocking thread pool with a tip-moved recheck; hot reads use an O(1) integrity probe |
 | DoS bounds | Mempool cap (1,000 txs), per-block tx cap (100), 1 MiB request-body limit |
+| P2P node identity | Every gossip envelope is signed by the sender's node key; `node_id` = derived address; `P2P_REQUIRE_IDENTITY=true` rejects unsigned envelopes (per-node keypair handshake atop the bearer token) |
 | Tooling | `hikma-wallet` offline keygen/signing; propose/sign/submit flow for external validators |
-| Tests | 63 automated tests across consensus, state machine, security, replay, fork choice, slashing, and API flows |
+| Tests | 65 automated tests across consensus, state machine, security, replay, fork choice, slashing, and API flows |
 
 ## 🚧 Launch blockers (Phase 9)
 
-1. **Signed peer handshakes / validator networking.** P2P is currently
-   authenticated by a shared bearer token, suitable for a permissioned
-   testnet. Mainnet requires per-node keypairs, signed handshakes, and
-   peer scoring/banning.
+1. **Peer scoring / banning.** Envelopes are now signed by per-node keys
+   (`P2P_REQUIRE_IDENTITY`), so peers are cryptographically identified.
+   Reputation scoring, misbehavior banning, and an allow-list of permitted
+   validator node keys still need to be layered on top.
 
 2. **Fee-market refinement.** A flat per-tx fee exists; a dynamic fee market
    (priority pricing, congestion response) and long-term emission policy

@@ -32,39 +32,41 @@ is a launch blocker until closed.
 | Node responsiveness | PoW mining runs on the blocking thread pool with a tip-moved recheck; hot reads use an O(1) integrity probe |
 | DoS bounds | Mempool cap (1,000 txs), per-block tx cap (100), 1 MiB request-body limit |
 | P2P node identity | Every gossip envelope is signed by the sender's node key; `node_id` = derived address; `P2P_REQUIRE_IDENTITY=true` rejects unsigned envelopes (per-node keypair handshake atop the bearer token) |
+| Peer reputation | Per-node scoring: useful blocks/txs raise reputation, invalid/malformed messages lower it, and repeat offenders are auto-banned; optional `P2P_ALLOWLIST` restricts participation to named validator node ids; `GET /p2p/peers/scores` |
+| Snapshots & checkpoints | `GET /snapshot` exports the tip state + authenticating commitments (backup/inspection); `GET /checkpoint` returns a pinnable finalized (height, block_hash, state_root) triple for weak-subjectivity anchoring; trust-minimizing genesis replay remains the default |
+| Observability | Metrics include blocks mined/received/rejected, reorgs, gossip, txs, slashes, peers banned, invalid-from-peers; structured startup logging of identity/enforcement |
 | Tooling | `hikma-wallet` offline keygen/signing; propose/sign/submit flow for external validators |
-| Tests | 65 automated tests across consensus, state machine, security, replay, fork choice, slashing, and API flows |
+| Tests | 70 automated tests across consensus, state machine, security, replay, fork choice, slashing, and API flows |
 
-## 🚧 Launch blockers (Phase 9)
+## 🚧 Remaining before mainnet
 
-1. **Peer scoring / banning.** Envelopes are now signed by per-node keys
-   (`P2P_REQUIRE_IDENTITY`), so peers are cryptographically identified.
-   Reputation scoring, misbehavior banning, and an allow-list of permitted
-   validator node keys still need to be layered on top.
+The engineering surface is now built and tested. What remains is **design and
+external process**, not missing protocol code:
 
-2. **Fee-market refinement.** A flat per-tx fee exists; a dynamic fee market
-   (priority pricing, congestion response) and long-term emission policy
-   (halving/treasury) still need economic design before value is attached.
+1. **External security audit + adversarial testnet (the hard gate).**
+   Independent audit of consensus and cryptography, plus a public incentivized
+   testnet with adversarial validators, before any mainnet genesis. This
+   *cannot* be self-performed — see the step-by-step
+   [`docs/external_audit_guide.md`](external_audit_guide.md).
 
-3. **Key management hardening.** `VALIDATOR_PRIVATE_KEY` via environment
+2. **Economic design (fee market + emission).** A flat per-tx fee and fixed
+   block reward exist and are consensus-verified. A dynamic fee market
+   (priority pricing, congestion response) and a long-term emission/treasury
+   policy require token-economic modeling, not just code, before value is
+   attached.
+
+3. **Production key management.** `VALIDATOR_PRIVATE_KEY` via environment
    variable is fine for testnets; production validators should use an HSM,
-   OS keyring, or remote signer (see `docs/key_management.md`).
+   OS keyring, or remote signer (see `docs/key_management.md`). This is an
+   operator deployment choice; the node already never handles foreign keys.
 
-4. **State growth & snapshots.** State is held in memory and replayed from
-   full block history on startup. Mainnet needs state snapshots / checkpoint
-   sync and pruning so startup and memory do not grow unbounded.
-
-5. **External security audit + adversarial testnet.** Independent audit of
-    consensus and cryptography, plus a public incentivized testnet with
-    adversarial validators, before any mainnet genesis. **A full
-    step-by-step guide for the external auditor is in
-    [`docs/external_audit_guide.md`](external_audit_guide.md).**
-
-6. **Observability & operations.** Structured logging, alerting on reorgs
-    and validation failures, snapshot/restore tooling, and documented
-    incident-response runbooks.
+4. **State pruning for very long chains.** Snapshots and pinnable checkpoints
+   now exist; full trust-minimizing replay remains the default. History
+   pruning / checkpoint-based fast sync (skipping pre-checkpoint replay under
+   an explicit weak-subjectivity assumption) is an optional scaling step for
+   long-lived deployments.
 
 ## Suggested order of work
 
-`P2P identity` → `snapshots/pruning` → `fee market + emission policy` →
-`audit + adversarial testnet`.
+`economic modeling` → `deploy adversarial testnet` → `external audit + fixes`
+→ `mainnet genesis`. Optional scaling: `checkpoint fast-sync / pruning`.

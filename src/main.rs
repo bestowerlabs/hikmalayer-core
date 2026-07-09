@@ -4,7 +4,7 @@ use hikmalayer::auth::{routes::auth_routes, AuthManager};
 use hikmalayer::blockchain::chain::{Blockchain, DEFAULT_GENESIS_SUPPLY};
 use hikmalayer::consensus::pos;
 use hikmalayer::contract::contract::ContractExecutor;
-use hikmalayer::p2p::{protocol::SeenMessageCache, service::P2PService};
+use hikmalayer::p2p::{peerbook::PeerBook, protocol::SeenMessageCache, service::P2PService};
 use hikmalayer::persistence::load_state;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -114,6 +114,20 @@ async fn main() {
     let metrics = Arc::new(Mutex::new(Metrics::default()));
     let seen_messages = Arc::new(Mutex::new(SeenMessageCache::new(8192)));
 
+    // Optional allow-list: restrict P2P participation to explicit node ids.
+    let peer_book = Arc::new(Mutex::new(match std::env::var("P2P_ALLOWLIST") {
+        Ok(list) if !list.is_empty() => {
+            let allow: std::collections::HashSet<String> = list
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            println!("🔐 P2P allow-list active: {} permitted node(s).", allow.len());
+            PeerBook::with_allow_list(allow)
+        }
+        _ => PeerBook::new(),
+    }));
+
     // Token rotation (HM-06): a node accepts the CURRENT token and, during a
     // rotation window, the PREVIOUS one. The legacy single-token variables
     // remain supported.
@@ -222,6 +236,7 @@ async fn main() {
         slash_evidence,
         metrics,
         seen_messages,
+        peer_book,
         p2p_tokens,
         admin_tokens,
         p2p_service,

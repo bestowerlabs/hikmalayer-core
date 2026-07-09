@@ -35,6 +35,12 @@ signing conventions. It provides:
 - **Cryptographic node identity.** Every gossip envelope is signed by the sender's node
   key and bound to its derived `node_id`; set `P2P_REQUIRE_IDENTITY=true` to reject any
   unsigned envelope — a per-node keypair handshake layered on the bearer token.
+- **Peer reputation & banning.** Useful blocks/transactions raise a peer's score, invalid
+  or malformed messages lower it, and repeat offenders are auto-banned; an optional
+  `P2P_ALLOWLIST` restricts participation to named validator node ids.
+- **Snapshots & checkpoints.** `GET /snapshot` exports the tip state with its
+  authenticating commitments; `GET /checkpoint` returns a pinnable finalized
+  (height, block_hash, state_root) triple for weak-subjectivity anchoring.
 - **Permissionless slashing with an unbonding guarantee:** anyone holding a proof that a
   validator signed two blocks at the same height can submit it; the offender's stake is
   burned on-chain. Withdrawn stake unbonds over 20 blocks and stays slashable for the
@@ -121,7 +127,12 @@ Hikmalayer Core is developed in phases:
 - **Phase 2**: PoS validator selection, staking, and validator identities.
 - **Phase 3**: Persistence, P2P gossip, governance, slashing, and async‑safe services.
 - **Phase 4**: Operational hardening, Dockerized multi-node deployment, monitoring, and benchmark validation. (Completed for API execution layer.)
-- **Phase 5 (in progress)**: Public testnet with full P2P validator consensus and finalized-state tracking.
+- **Phase 5**: P2P validator consensus, gossip, fork choice, finality.
+- **Phase 6**: Replicated on-chain state machine, native identity, on-chain validator set.
+- **Phase 7**: VRF unbiasable leader election + Proof-of-Credential registry.
+- **Phase 8**: Unbonding + slashing window, tx fees, difficulty retargeting, DoS bounds.
+- **Phase 9**: Signed P2P identity, peer scoring/banning, snapshots/checkpoints, observability.
+- **Mainnet (pending)**: External audit + adversarial testnet, economic modeling, ops hardening.
 
 
 ## 🔄 How it works — consensus workflow
@@ -436,7 +447,8 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 | Phase 6 | ✅ Replicated on-chain state machine, native identity, on-chain validator set & slashing |
 | Phase 7 | ✅ VRF randomness beacon (unbiasable leader election) + Proof-of-Credential registry |
 | Phase 8 | ✅ Unbonding + slashing window, tx fees, difficulty retargeting, mempool/DoS bounds, async mining |
-| Phase 9 | ✅ Signed P2P node identity/handshakes. 🚧 Peer scoring, snapshots, fee market, external audit |
+| Phase 9 | ✅ Signed P2P identity, peer scoring/banning, allow-list, snapshots/checkpoints, observability |
+| Mainnet | 🚧 External audit + adversarial testnet, economic modeling, ops hardening (see `docs/mainnet_readiness.md`) |
 
 
 

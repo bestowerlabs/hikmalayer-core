@@ -22,6 +22,7 @@ use crate::{
     contract::contract::ContractExecutor,
     governance::GovernanceConfig,
     p2p::{
+        peerbook::PeerBook,
         protocol::{P2PEnvelope, P2PPayload, SeenMessageCache},
         service::P2PService,
     },
@@ -69,6 +70,7 @@ pub struct AppState {
     pub slash_evidence: Arc<Mutex<Vec<crate::persistence::SlashEvidence>>>,
     pub metrics: Arc<Mutex<Metrics>>,
     pub seen_messages: Arc<Mutex<SeenMessageCache>>,
+    pub peer_book: Arc<Mutex<PeerBook>>,
     /// Accepted bearer tokens (first = current; extras support rotation).
     pub p2p_tokens: Vec<String>,
     pub admin_tokens: Vec<String>,
@@ -327,6 +329,8 @@ pub struct Metrics {
     pub gossip_failed: u64,
     pub protocol_messages_received: u64,
     pub protocol_messages_rejected: u64,
+    pub peers_banned: u64,
+    pub invalid_from_peers: u64,
 }
 
 async fn persist_state(state: &AppState) -> Result<(), String> {
@@ -412,6 +416,31 @@ fn authorize_p2p(headers: &HeaderMap, state: &AppState) -> bool {
         return false;
     };
     state.p2p_tokens.iter().any(|t| constant_time_eq(t, supplied))
+}
+
+/// Lower a peer's reputation for misbehavior; count a ban when it triggers.
+async fn penalize_peer(state: &AppState, node_id: &str) {
+    if node_id.trim().is_empty() {
+        return;
+    }
+    let banned = {
+        let mut book = state.peer_book.lock().await;
+        book.record_bad(node_id)
+    };
+    let mut metrics = state.metrics.lock().await;
+    metrics.invalid_from_peers += 1;
+    if banned {
+        metrics.peers_banned += 1;
+    }
+}
+
+/// Raise a peer's reputation for a useful contribution.
+async fn reward_peer(state: &AppState, node_id: &str) {
+    if node_id.trim().is_empty() {
+        return;
+    }
+    let mut book = state.peer_book.lock().await;
+    book.record_good(node_id);
 }
 
 fn authorize_admin(headers: &HeaderMap, state: &AppState) -> bool {
@@ -529,6 +558,9 @@ pub fn api_routes() -> Router<AppState> {
         .route("/p2p/block", post(receive_block))
         .route("/p2p/blocks", post(receive_blocks))
         .route("/p2p/chain", get(get_p2p_chain))
+        .route("/p2p/peers/scores", get(get_peer_scores))
+        .route("/snapshot", get(get_snapshot))
+        .route("/checkpoint", get(get_checkpoint))
         .route("/p2p/protocol", post(receive_protocol_message))
         // Governance & slashing routes
         .route("/governance/config", get(get_governance))
@@ -1901,6 +1933,70 @@ async fn receive_blocks(
     })
 }
 
+#[derive(Serialize)]
+pub struct SnapshotResponse {
+    pub height: u64,
+    pub block_hash: String,
+    pub state_root: String,
+    pub randomness: String,
+    pub current_difficulty: usize,
+    pub total_supply: u64,
+    pub finalized_height: u64,
+    /// The full replicated state at the tip (for backup / fast inspection).
+    pub state: crate::blockchain::state::ChainState,
+}
+
+/// Export a snapshot of the current tip: the committed state plus the
+/// commitments that authenticate it (block hash, state root, beacon). An
+/// operator can back this up, and a light client can pin it as a
+/// weak-subjectivity checkpoint. Trust-minimizing full sync remains
+/// available via GET /p2p/chain (replay from genesis).
+async fn get_snapshot(State(state): State<AppState>) -> Json<SnapshotResponse> {
+    let chain = state.chain.lock().await;
+    Json(SnapshotResponse {
+        height: chain.blocks.len() as u64 - 1,
+        block_hash: chain.latest_hash(),
+        state_root: chain.state.state_root(),
+        randomness: chain.randomness.clone(),
+        current_difficulty: chain.current_difficulty,
+        total_supply: chain.state.total_supply,
+        finalized_height: chain.finalized_height,
+        state: chain.state.clone(),
+    })
+}
+
+#[derive(Serialize)]
+pub struct CheckpointResponse {
+    pub finalized_height: u64,
+    pub block_hash: String,
+    pub state_root: String,
+}
+
+/// The current finalized checkpoint: a compact, pinnable
+/// (height, block_hash, state_root) triple. Publishing this out-of-band lets
+/// new nodes and light clients anchor to a trusted point.
+async fn get_checkpoint(State(state): State<AppState>) -> Json<CheckpointResponse> {
+    let chain = state.chain.lock().await;
+    let height = chain.finalized_height as usize;
+    let block = chain.blocks.get(height).cloned().unwrap_or_else(|| chain.blocks[0].clone());
+    Json(CheckpointResponse {
+        finalized_height: chain.finalized_height,
+        block_hash: block.hash.clone(),
+        state_root: block.state_root.clone(),
+    })
+}
+
+async fn get_peer_scores(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<Vec<crate::p2p::peerbook::PeerRecord>> {
+    if !authorize_p2p(&headers, &state) {
+        return Json(Vec::new());
+    }
+    let book = state.peer_book.lock().await;
+    Json(book.snapshot())
+}
+
 async fn receive_protocol_message(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1916,12 +2012,30 @@ async fn receive_protocol_message(
     }
 
     if let Err(message) = envelope.validate_with_identity(300, state.p2p_require_identity) {
+        // A malformed/mis-signed envelope is misbehavior (when we can
+        // attribute it to an identity).
+        penalize_peer(&state, &envelope.node_id).await;
         let mut metrics = state.metrics.lock().await;
         metrics.protocol_messages_rejected += 1;
         return Json(ApiResponse {
             status: "error".to_string(),
             message,
         });
+    }
+
+    // Reputation gate: refuse banned or allow-list-excluded peers.
+    let node_id = envelope.node_id.clone();
+    {
+        let book = state.peer_book.lock().await;
+        if !book.is_accepted(&node_id) {
+            drop(book);
+            let mut metrics = state.metrics.lock().await;
+            metrics.protocol_messages_rejected += 1;
+            return Json(ApiResponse {
+                status: "error".to_string(),
+                message: "Peer is banned or not permitted".to_string(),
+            });
+        }
     }
 
     // Replay protection: each envelope may only be processed once.
@@ -1989,6 +2103,7 @@ async fn receive_protocol_message(
             let valid = transaction.verify_for_block("__queue__").is_ok()
                 && transaction.transaction_type != TransactionType::Reward;
             if !valid {
+                penalize_peer(&state, &node_id).await;
                 let mut metrics = state.metrics.lock().await;
                 metrics.protocol_messages_rejected += 1;
                 return Json(ApiResponse {
@@ -2005,6 +2120,7 @@ async fn receive_protocol_message(
                 if projected.apply_transaction(&transaction, next_height).is_err() {
                     drop(pending);
                     drop(chain);
+                    penalize_peer(&state, &node_id).await;
                     let mut metrics = state.metrics.lock().await;
                     metrics.protocol_messages_rejected += 1;
                     return Json(ApiResponse {
@@ -2015,6 +2131,7 @@ async fn receive_protocol_message(
                 pending.push(transaction);
             }
 
+            reward_peer(&state, &node_id).await;
             let mut metrics = state.metrics.lock().await;
             metrics.transactions_received += 1;
             drop(metrics);
@@ -2032,6 +2149,7 @@ async fn receive_protocol_message(
             };
             match accept_peer_block(&state, block, finality_depth).await {
                 Ok(_) => {
+                    reward_peer(&state, &node_id).await;
                     let mut metrics = state.metrics.lock().await;
                     metrics.blocks_received += 1;
                     drop(metrics);
@@ -2042,6 +2160,11 @@ async fn receive_protocol_message(
                     })
                 }
                 Err(message) => {
+                    // A tip mismatch triggers sync and is not misbehavior;
+                    // only genuinely invalid blocks are penalized.
+                    if !message.contains("chain tip") {
+                        penalize_peer(&state, &node_id).await;
+                    }
                     let mut metrics = state.metrics.lock().await;
                     metrics.blocks_rejected += 1;
                     metrics.protocol_messages_rejected += 1;
@@ -2368,6 +2491,7 @@ mod tests {
             slash_evidence: Arc::new(Mutex::new(Vec::new())),
             metrics: Arc::new(Mutex::new(Metrics::default())),
             seen_messages: Arc::new(Mutex::new(SeenMessageCache::new(1024))),
+            peer_book: Arc::new(Mutex::new(PeerBook::new())),
             p2p_tokens: vec![P2P_TOKEN.to_string()],
             admin_tokens: vec![ADMIN_TOKEN.to_string()],
             p2p_service: Arc::new(P2PService::new("node-test".to_string(), None).unwrap()),
@@ -2871,6 +2995,67 @@ mod tests {
         let response =
             receive_protocol_message(State(state.clone()), p2p_headers(), Json(envelope)).await;
         assert_eq!(response.0.status, "error");
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_checkpoint_expose_consistent_commitments() {
+        let state = test_state(true);
+        mine_next(&state, &base_keyring()).await;
+
+        let snap = get_snapshot(State(state.clone())).await.0;
+        let chain = state.chain.lock().await;
+        assert_eq!(snap.height, 1);
+        assert_eq!(snap.block_hash, chain.latest_hash());
+        assert_eq!(snap.state_root, chain.state.state_root());
+        drop(chain);
+
+        let cp = get_checkpoint(State(state.clone())).await.0;
+        // Genesis is the finalized checkpoint under the default depth.
+        assert_eq!(cp.finalized_height, 0);
+        assert!(!cp.block_hash.is_empty());
+        assert!(!cp.state_root.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_invalid_gossip_bans_the_peer() {
+        let state = test_state(false);
+        let attacker = hex::encode([200u8; 32]);
+
+        // Three malformed (unsigned-body / not-applicable) gossiped txs from
+        // the same signed node identity trip the ban threshold.
+        for i in 0..3 {
+            let mut forged = Transaction::new(
+                Some("hkmnobody".to_string()),
+                "hkmsink".to_string(),
+                9_999_999,
+                TransactionType::Transfer,
+            );
+            forged.id = format!("forged-{}", i);
+            forged.nonce = 1;
+            // no signature → verify_for_block fails → penalized
+            let envelope = P2PEnvelope::new("x".to_string(), P2PPayload::Transaction(forged))
+                .signed(&attacker)
+                .unwrap();
+            let node_id = envelope.node_id.clone();
+            let response =
+                receive_protocol_message(State(state.clone()), p2p_headers(), Json(envelope))
+                    .await;
+            assert_eq!(response.0.status, "error");
+            let _ = node_id;
+        }
+
+        // The attacker's node is now banned: a fresh (even well-formed) Ping
+        // is refused.
+        let ping = P2PEnvelope::new("x".to_string(), P2PPayload::Ping)
+            .signed(&attacker)
+            .unwrap();
+        let response =
+            receive_protocol_message(State(state.clone()), p2p_headers(), Json(ping)).await;
+        assert_eq!(response.0.status, "error");
+        assert!(response.0.message.contains("banned"), "{}", response.0.message);
+
+        let metrics = state.metrics.lock().await;
+        assert!(metrics.peers_banned >= 1);
     }
 
     #[tokio::test]

@@ -56,7 +56,9 @@ is a launch blocker until closed.
 
 5. **External security audit + adversarial testnet.** Independent audit of
     consensus and cryptography, plus a public incentivized testnet with
-    adversarial validators, before any mainnet genesis.
+    adversarial validators, before any mainnet genesis. **A full
+    step-by-step guide for the external auditor is in
+    [`docs/external_audit_guide.md`](external_audit_guide.md).**
 
 6. **Observability & operations.** Structured logging, alerting on reorgs
     and validation failures, snapshot/restore tooling, and documented

@@ -231,11 +231,13 @@ async fn main() {
         .allow_headers(Any)
         .allow_credentials(false);
 
-    // Combine API routes with auth routes
+    // Combine API routes with auth routes. Request bodies are capped to
+    // bound memory per request.
     let app = api_routes()
         .merge(auth_routes())
         .with_state(app_state)
-        .layer(cors);
+        .layer(cors)
+        .layer(axum::extract::DefaultBodyLimit::max(1_048_576));
 
     let port = std::env::var("PORT")
         .ok()

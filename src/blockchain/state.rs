@@ -21,6 +21,26 @@ pub const SLASH_PERCENT: u64 = 10;
 /// Stake registered at genesis for the genesis validator (the treasury).
 pub const GENESIS_VALIDATOR_STAKE: u64 = 1_000;
 
+/// Flat protocol fee charged on value-bearing transactions (Transfer,
+/// Stake, Withdraw). Credited to the block validator. Credential actions
+/// stay free (anti-spam via nonces and mempool caps).
+pub const TX_FEE: u64 = 1;
+
+/// Blocks a withdrawn stake stays locked (and slashable) before release.
+pub const UNBONDING_BLOCKS: u64 = 20;
+
+/// How far back (in blocks) an equivocation proof is accepted. Equal to the
+/// unbonding period so misbehaving stake can never exit before a slash.
+pub const SLASHING_WINDOW_BLOCKS: u64 = 20;
+
+/// Stake in the process of unbonding: still in the pool, still slashable,
+/// released to the owner's balance at `release_height`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct UnbondingEntry {
+    pub amount: u64,
+    pub release_height: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct StakeInfo {
     pub stake: u64,
@@ -57,6 +77,13 @@ pub struct ChainState {
     /// "{validator}:{height}" offenses already punished (prevents double
     /// slashing from the same equivocation proof).
     pub slashed_offenses: BTreeMap<String, u64>,
+    /// Stake awaiting release after withdrawal (still slashable).
+    #[serde(default)]
+    pub unbonding: BTreeMap<String, Vec<UnbondingEntry>>,
+    /// Fees collected within the current block; paid to the validator and
+    /// zeroed by `end_block`, so it is always 0 at block boundaries.
+    #[serde(default)]
+    pub fee_pot: u64,
     pub total_supply: u64,
     pub burned: u64,
 }
@@ -115,6 +142,14 @@ impl ChainState {
         self.nonces.get(account).copied().unwrap_or(0)
     }
 
+    /// Total stake currently unbonding for an account.
+    pub fn unbonding_total(&self, account: &str) -> u64 {
+        self.unbonding
+            .get(account)
+            .map(|entries| entries.iter().map(|e| e.amount).sum())
+            .unwrap_or(0)
+    }
+
     /// The current validator set, deterministically ordered by address.
     pub fn validator_set(&self) -> Vec<Staker> {
         self.stakers
@@ -156,11 +191,11 @@ impl ChainState {
         *self.balances.entry(account.to_string()).or_insert(0) += amount;
     }
 
-    /// Apply one transaction. Stateless validity (signature schemes, reward
-    /// shape) is checked by `Transaction::verify_for_block`; this method
-    /// enforces the stateful rules: nonces, balances, stake accounting,
-    /// registered-key checks, and slashing.
-    pub fn apply_transaction(&mut self, tx: &Transaction) -> Result<(), String> {
+    /// Apply one transaction at `height`. Stateless validity (signature
+    /// schemes, reward shape) is checked by `Transaction::verify_for_block`;
+    /// this method enforces the stateful rules: nonces, balances + fees,
+    /// stake accounting with unbonding, registered-key checks, and slashing.
+    pub fn apply_transaction(&mut self, tx: &Transaction, height: u64) -> Result<(), String> {
         match tx.transaction_type {
             TransactionType::Transfer => {
                 let from = tx
@@ -168,8 +203,9 @@ impl ChainState {
                     .as_ref()
                     .ok_or_else(|| "Transfer missing sender".to_string())?;
                 self.consume_nonce(from, tx.nonce)?;
-                self.debit(from, tx.amount)?;
+                self.debit(from, tx.amount + TX_FEE)?;
                 self.credit(&tx.to, tx.amount);
+                self.fee_pot += TX_FEE;
                 Ok(())
             }
             TransactionType::Stake => {
@@ -186,8 +222,9 @@ impl ChainState {
                     .as_ref()
                     .ok_or_else(|| "Stake missing VRF public key".to_string())?;
                 self.consume_nonce(from, tx.nonce)?;
-                self.debit(from, tx.amount)?;
+                self.debit(from, tx.amount + TX_FEE)?;
                 self.credit(STAKING_POOL_ACCOUNT, tx.amount);
+                self.fee_pot += TX_FEE;
                 let entry = self.stakers.entry(from.clone()).or_default();
                 entry.stake += tx.amount;
                 entry.public_key = public_key.clone();
@@ -223,14 +260,19 @@ impl ChainState {
                 }
 
                 self.consume_nonce(from, tx.nonce)?;
-                self.debit(STAKING_POOL_ACCOUNT, tx.amount)?;
-                self.credit(from, tx.amount);
-                let remaining = info.stake - tx.amount;
-                if remaining == 0 {
-                    self.stakers.remove(from);
-                } else {
-                    self.stakers.get_mut(from).unwrap().stake = remaining;
-                }
+                // The withdrawal fee comes from liquid balance; the stake
+                // itself enters unbonding — it stays in the pool, remains
+                // slashable, and is released after UNBONDING_BLOCKS.
+                self.debit(from, TX_FEE)?;
+                self.fee_pot += TX_FEE;
+                self.stakers.get_mut(from).unwrap().stake = info.stake - tx.amount;
+                self.unbonding
+                    .entry(from.clone())
+                    .or_default()
+                    .push(UnbondingEntry {
+                        amount: tx.amount,
+                        release_height: height + UNBONDING_BLOCKS,
+                    });
                 Ok(())
             }
             TransactionType::Reward => {
@@ -283,6 +325,12 @@ impl ChainState {
                     .ok_or_else(|| "Slash missing proof".to_string())?;
                 let validator = &tx.to;
 
+                // Slashing window: proofs must land while the offending
+                // stake is still bonded or unbonding.
+                if proof.block_a.index + SLASHING_WINDOW_BLOCKS < height {
+                    return Err("Equivocation proof outside the slashing window".to_string());
+                }
+
                 // The offending key must be the validator's registered key.
                 let info = self
                     .stakers
@@ -303,22 +351,85 @@ impl ChainState {
                     return Err("Offense already slashed".to_string());
                 }
 
-                let slashed = info.stake.saturating_mul(SLASH_PERCENT) / 100;
+                // Unbonding stake is still slashable: base = bonded + unbonding.
+                let base = info.stake + self.unbonding_total(validator);
+                let slashed = base.saturating_mul(SLASH_PERCENT) / 100;
                 if slashed == 0 {
                     return Err("Nothing to slash".to_string());
                 }
                 self.debit(STAKING_POOL_ACCOUNT, slashed)?;
                 self.burned += slashed;
                 self.total_supply = self.total_supply.saturating_sub(slashed);
-                let remaining = info.stake - slashed;
-                if remaining == 0 {
-                    self.stakers.remove(validator);
-                } else {
-                    self.stakers.get_mut(validator).unwrap().stake = remaining;
+
+                // Deduct from bonded stake first, then oldest unbonding.
+                let mut remaining = slashed;
+                let take_bonded = remaining.min(info.stake);
+                self.stakers.get_mut(validator).unwrap().stake = info.stake - take_bonded;
+                remaining -= take_bonded;
+                if remaining > 0 {
+                    if let Some(entries) = self.unbonding.get_mut(validator) {
+                        for entry in entries.iter_mut() {
+                            let take = remaining.min(entry.amount);
+                            entry.amount -= take;
+                            remaining -= take;
+                            if remaining == 0 {
+                                break;
+                            }
+                        }
+                        entries.retain(|e| e.amount > 0);
+                        if entries.is_empty() {
+                            self.unbonding.remove(validator);
+                        }
+                    }
                 }
+
                 self.slashed_offenses.insert(offense_key, slashed);
                 Ok(())
             }
+        }
+    }
+}
+
+impl ChainState {
+    /// Block-boundary housekeeping, applied identically by every node after
+    /// the block's transactions: release matured unbonding stake and pay the
+    /// block's collected fees to its validator.
+    pub fn end_block(&mut self, height: u64, validator: &str) {
+        // Release matured unbonding entries (pool → owner balance).
+        let accounts: Vec<String> = self.unbonding.keys().cloned().collect();
+        for account in accounts {
+            let mut released = 0u64;
+            if let Some(entries) = self.unbonding.get_mut(&account) {
+                entries.retain(|entry| {
+                    if entry.release_height <= height {
+                        released += entry.amount;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if entries.is_empty() {
+                    self.unbonding.remove(&account);
+                }
+            }
+            if released > 0 {
+                let _ = self.debit(STAKING_POOL_ACCOUNT, released);
+                self.credit(&account, released);
+            }
+            // Fully exited validators leave the staker set once nothing
+            // remains bonded or unbonding.
+            if self.stakers.get(&account).is_some_and(|i| i.stake == 0)
+                && !self.unbonding.contains_key(&account)
+            {
+                self.stakers.remove(&account);
+            }
+        }
+
+        // Pay this block's fees to its validator.
+        if self.fee_pot > 0 {
+            let fees = self.fee_pot;
+            self.fee_pot = 0;
+            self.credit(validator, fees);
         }
     }
 }
@@ -376,12 +487,12 @@ mod tests {
             TransactionType::Transfer,
         );
         tx.nonce = 1;
-        state.apply_transaction(&tx).unwrap();
+        state.apply_transaction(&tx, 1).unwrap();
         assert_eq!(state.balance_of("hkmrecipient"), 100);
         assert_eq!(state.nonce_of(&treasury), 1);
 
         // Same nonce cannot apply twice.
-        assert!(state.apply_transaction(&tx).is_err());
+        assert!(state.apply_transaction(&tx, 1).is_err());
     }
 
     #[test]
@@ -395,15 +506,15 @@ mod tests {
             TransactionType::Transfer,
         );
         tx.nonce = 1;
-        assert!(state.apply_transaction(&tx).is_err());
+        assert!(state.apply_transaction(&tx, 1).is_err());
     }
 
     #[test]
-    fn stake_and_withdraw_roundtrip() {
-        let (mut state, treasury, _, treasury_key) = genesis_state();
+    fn stake_withdraw_unbonding_lifecycle() {
+        let (mut state, treasury, _, _) = genesis_state();
         let (address, public_key, private_key) = wallet(2);
 
-        // Fund the new validator from treasury.
+        // Fund the new validator from treasury (sender pays the fee).
         let mut fund = Transaction::new(
             Some(treasury.clone()),
             address.clone(),
@@ -411,10 +522,9 @@ mod tests {
             TransactionType::Transfer,
         );
         fund.nonce = 1;
-        state.apply_transaction(&fund).unwrap();
-        let _ = treasury_key;
+        state.apply_transaction(&fund, 1).unwrap();
 
-        // Stake.
+        // Stake 300 (+1 fee).
         let mut stake = Transaction::new(
             Some(address.clone()),
             STAKING_POOL_ACCOUNT.to_string(),
@@ -425,11 +535,12 @@ mod tests {
         stake.public_key = Some(public_key.clone());
         stake.vrf_public_key =
             Some(crate::consensus::vrf::derive_vrf_public_key(&private_key).unwrap());
-        state.apply_transaction(&stake).unwrap();
+        state.apply_transaction(&stake, 1).unwrap();
         assert_eq!(state.validator_set().len(), 2);
-        assert_eq!(state.balance_of(&address), 200);
+        assert_eq!(state.balance_of(&address), 500 - 300 - TX_FEE);
 
-        // Withdraw with a valid signature over the withdraw message.
+        // Withdraw 300 (+1 fee) at height 2: funds enter UNBONDING, they
+        // are NOT immediately spendable.
         let mut withdraw = Transaction::new(
             Some(address.clone()),
             address.clone(),
@@ -439,9 +550,99 @@ mod tests {
         withdraw.nonce = 2;
         let message = Transaction::withdraw_signing_message(&address, 300, 2);
         withdraw.signature = Some(pos::sign_message(&message, &private_key).unwrap());
-        state.apply_transaction(&withdraw).unwrap();
-        assert_eq!(state.balance_of(&address), 500);
+        state.apply_transaction(&withdraw, 2).unwrap();
+
+        assert_eq!(state.balance_of(&address), 500 - 300 - 2 * TX_FEE);
+        assert_eq!(state.unbonding_total(&address), 300);
+        // Exited from the active set, but keys retained while unbonding.
         assert_eq!(state.validator_set().len(), 1);
+        assert!(state.stakers.contains_key(&address));
+
+        // Not released before maturity.
+        state.end_block(2 + UNBONDING_BLOCKS - 1, &treasury);
+        assert_eq!(state.unbonding_total(&address), 300);
+
+        // Released at maturity; the fully exited validator entry is gone.
+        state.end_block(2 + UNBONDING_BLOCKS, &treasury);
+        assert_eq!(state.unbonding_total(&address), 0);
+        assert_eq!(state.balance_of(&address), 500 - 2 * TX_FEE);
+        assert!(!state.stakers.contains_key(&address));
+    }
+
+    #[test]
+    fn slash_reaches_unbonding_stake_and_respects_window() {
+        let (mut state, treasury, treasury_pub, treasury_key) = genesis_state();
+        let _ = treasury_pub;
+
+        // Treasury withdraws 400 of its 1000 genesis stake at height 5.
+        let mut withdraw = Transaction::new(
+            Some(treasury.clone()),
+            treasury.clone(),
+            400,
+            TransactionType::Withdraw,
+        );
+        withdraw.nonce = 1;
+        let message = Transaction::withdraw_signing_message(&treasury, 400, 1);
+        withdraw.signature = Some(pos::sign_message(&message, &treasury_key).unwrap());
+        state.apply_transaction(&withdraw, 5).unwrap();
+        assert_eq!(state.unbonding_total(&treasury), 400);
+
+        // Build a slash tx (proof internals are validated statelessly by
+        // verify_for_block; apply checks the stateful parts we exercise by
+        // constructing the proof through the chain tests — here we check the
+        // window + base math using a minimal proof object).
+        use crate::blockchain::block::Block;
+        use crate::blockchain::transaction::SlashProof;
+        let make_block = |memo: &str| {
+            Block::new(
+                7,
+                vec![memo.to_string()],
+                "prev".to_string(),
+                2,
+                Some(treasury.clone()),
+                Some(state.stakers[&treasury].public_key.clone()),
+                None,
+                "root".to_string(),
+            )
+        };
+        let mut slash = Transaction::new(None, treasury.clone(), 0, TransactionType::Slash);
+        slash.slash_proof = Some(SlashProof {
+            block_a: make_block("a"),
+            block_b: make_block("b"),
+        });
+
+        // Outside the window: rejected.
+        let err = state
+            .apply_transaction(&slash, 7 + SLASHING_WINDOW_BLOCKS + 1)
+            .unwrap_err();
+        assert!(err.contains("window"), "{err}");
+
+        // Inside the window: slashes 10% of bonded (600) + unbonding (400).
+        let pool_before = state.balance_of(STAKING_POOL_ACCOUNT);
+        state.apply_transaction(&slash, 8).unwrap();
+        assert_eq!(state.burned, 100);
+        assert_eq!(state.balance_of(STAKING_POOL_ACCOUNT), pool_before - 100);
+        // Bonded stake absorbs the deduction first.
+        assert_eq!(state.stakers[&treasury].stake, 500);
+        assert_eq!(state.unbonding_total(&treasury), 400);
+    }
+
+    #[test]
+    fn fees_flow_to_the_block_validator() {
+        let (mut state, treasury, _, _) = genesis_state();
+        let mut tx = Transaction::new(
+            Some(treasury.clone()),
+            "hkmrecipient".to_string(),
+            100,
+            TransactionType::Transfer,
+        );
+        tx.nonce = 1;
+        state.apply_transaction(&tx, 1).unwrap();
+        assert_eq!(state.fee_pot, TX_FEE);
+
+        state.end_block(1, "hkmvalidator");
+        assert_eq!(state.fee_pot, 0);
+        assert_eq!(state.balance_of("hkmvalidator"), TX_FEE);
     }
 
     #[test]
@@ -457,7 +658,7 @@ mod tests {
         withdraw.nonce = 1;
         let message = Transaction::withdraw_signing_message(&treasury, 10, 1);
         withdraw.signature = Some(pos::sign_message(&message, &intruder_key).unwrap());
-        assert!(state.apply_transaction(&withdraw).is_err());
+        assert!(state.apply_transaction(&withdraw, 1).is_err());
     }
 
     #[test]
@@ -465,7 +666,7 @@ mod tests {
         let (mut state, treasury, _, _) = genesis_state();
         let reward = Transaction::new_reward(&treasury);
         let supply_before = state.total_supply;
-        state.apply_transaction(&reward).unwrap();
+        state.apply_transaction(&reward, 1).unwrap();
         assert_eq!(state.total_supply, supply_before + BLOCK_REWARD);
     }
 }

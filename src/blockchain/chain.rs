@@ -11,6 +11,29 @@ pub const MAX_TIMESTAMP_SKEW_SECONDS: i64 = 120;
 /// Default initial supply for networks that do not configure one.
 pub const DEFAULT_GENESIS_SUPPLY: u64 = 1_000_000;
 
+/// Target seconds between blocks for difficulty retargeting.
+pub const TARGET_BLOCK_SECONDS: i64 = 15;
+
+/// Blocks between deterministic difficulty adjustments.
+pub const RETARGET_INTERVAL: u64 = 10;
+
+/// Deterministic difficulty adjustment: compare the average interval of the
+/// last window against the target and step by at most 1, inside PoW bounds.
+fn adjusted_difficulty(current: usize, window: &[Block]) -> usize {
+    if window.len() < 2 {
+        return current;
+    }
+    let span = (window[window.len() - 1].timestamp - window[0].timestamp).num_seconds();
+    let average = span / (window.len() as i64 - 1);
+    if average < TARGET_BLOCK_SECONDS / 2 {
+        (current + 1).min(pow::MAX_DIFFICULTY)
+    } else if average > TARGET_BLOCK_SECONDS * 2 {
+        current.saturating_sub(1).max(pow::MIN_DIFFICULTY)
+    } else {
+        current
+    }
+}
+
 /// Well-known development key (32-byte big-endian 1). Used as the default
 /// genesis treasury/validator on LOCAL networks only — real networks must
 /// configure GENESIS_TREASURY_ADDRESS / GENESIS_VALIDATOR_PUBLIC_KEY.
@@ -62,6 +85,11 @@ pub struct Blockchain {
     /// output, seeding unbiasable leader election. Derived, never persisted.
     #[serde(skip)]
     pub randomness: String,
+    /// Difficulty for the NEXT block: retargeted deterministically from
+    /// block timestamps every RETARGET_INTERVAL blocks. Derived, never
+    /// persisted (`difficulty` is the genesis/base parameter).
+    #[serde(skip)]
+    pub current_difficulty: usize,
 }
 
 /// A validation failure. `slashable` distinguishes provable validator
@@ -128,6 +156,7 @@ impl Blockchain {
             genesis_supply,
             state,
             randomness,
+            current_difficulty: difficulty,
         }
     }
 
@@ -160,7 +189,7 @@ impl Blockchain {
             index,
             transactions,
             previous_hash,
-            self.difficulty,
+            self.current_difficulty,
             validator,
             validator_public_key,
             None,
@@ -177,6 +206,14 @@ impl Blockchain {
         );
         self.blocks.push(block);
         self.state = post_state;
+        // Deterministic retarget at interval boundaries. The genesis block
+        // (fixed network timestamp) is excluded from timing windows.
+        let len = self.blocks.len() as u64;
+        if len % RETARGET_INTERVAL == 0 {
+            let start = (len - RETARGET_INTERVAL).max(1) as usize;
+            let window = &self.blocks[start..];
+            self.current_difficulty = adjusted_difficulty(self.current_difficulty, window);
+        }
     }
 
     pub fn apply_finality(&mut self, finality_depth: u64) {
@@ -213,10 +250,18 @@ impl Blockchain {
         expected_previous_hash: &str,
         parent_state: &ChainState,
         parent_randomness: &str,
+        expected_difficulty: usize,
     ) -> Result<ChainState, BlockError> {
         if block.index != expected_index {
             return Err(BlockError::structural(
                 "Block index does not match chain tip",
+            ));
+        }
+
+        // Difficulty is consensus-derived (retargeting), not producer-chosen.
+        if block.difficulty != expected_difficulty {
+            return Err(BlockError::slashable(
+                "Block difficulty does not match retarget schedule",
             ));
         }
 
@@ -314,7 +359,7 @@ impl Blockchain {
             tx.verify_for_block(validator)
                 .map_err(BlockError::slashable)?;
             post_state
-                .apply_transaction(&tx)
+                .apply_transaction(&tx, block.index)
                 .map_err(BlockError::slashable)?;
             if tx.transaction_type == TransactionType::Reward {
                 reward_count += 1;
@@ -325,6 +370,9 @@ impl Blockchain {
                 "Block must contain exactly one reward transaction",
             ));
         }
+
+        // Block-boundary housekeeping: unbonding releases + fee payout.
+        post_state.end_block(block.index, validator);
 
         // The block's committed state root must match actual execution.
         if post_state.state_root() != block.state_root {
@@ -340,10 +388,6 @@ impl Blockchain {
     /// tip-difficulty and timestamp-freshness rules on top of the consensus
     /// checks. On success returns the post-execution state to commit.
     pub fn validate_block_candidate(&self, block: &Block) -> Result<ChainState, String> {
-        if block.difficulty != self.difficulty {
-            return Err("Block difficulty does not match chain difficulty".to_string());
-        }
-
         let now = Utc::now();
         if block.timestamp > now + Duration::seconds(MAX_TIMESTAMP_SKEW_SECONDS) {
             return Err("Block timestamp is too far in the future".to_string());
@@ -355,6 +399,7 @@ impl Blockchain {
             &self.latest_hash(),
             &self.state,
             &self.randomness,
+            self.current_difficulty,
         )
         .map_err(|err| err.reason)
     }
@@ -381,9 +426,11 @@ impl Blockchain {
     }
 
     /// Validate the entire chain from genesis by replaying the state
-    /// machine and the randomness beacon. Returns the final (state,
-    /// randomness), or the first failure.
-    pub fn validate_full(&self) -> Result<(ChainState, String), (usize, BlockError)> {
+    /// machine, the randomness beacon, and the difficulty schedule. Returns
+    /// the final (state, randomness, next difficulty), or the first failure.
+    pub fn validate_full(
+        &self,
+    ) -> Result<(ChainState, String, usize), (usize, BlockError)> {
         let genesis = self
             .blocks
             .first()
@@ -401,18 +448,31 @@ impl Blockchain {
         }
 
         let mut randomness = genesis.hash.clone();
+        let mut difficulty = self.difficulty;
         for i in 1..self.blocks.len() {
             let current = &self.blocks[i];
             let previous = &self.blocks[i - 1];
-            state =
-                Self::validate_block_at(current, i as u64, &previous.hash, &state, &randomness)
-                    .map_err(|error| (i, error))?;
+            state = Self::validate_block_at(
+                current,
+                i as u64,
+                &previous.hash,
+                &state,
+                &randomness,
+                difficulty,
+            )
+            .map_err(|error| (i, error))?;
             randomness = vrf::next_randomness(
                 &randomness,
                 current.vrf_output.as_deref().unwrap_or_default(),
             );
+            let produced = (i + 1) as u64;
+            if produced % RETARGET_INTERVAL == 0 {
+                let start = (produced - RETARGET_INTERVAL).max(1) as usize;
+                let window = &self.blocks[start..=i];
+                difficulty = adjusted_difficulty(difficulty, window);
+            }
         }
-        Ok((state, randomness))
+        Ok((state, randomness, difficulty))
     }
 
     pub fn is_valid(&self) -> bool {
@@ -423,9 +483,10 @@ impl Blockchain {
     /// adoption). Fails if the stored chain does not validate.
     pub fn rebuild_state(&mut self) -> Result<(), String> {
         match self.validate_full() {
-            Ok((state, randomness)) => {
+            Ok((state, randomness, difficulty)) => {
                 self.state = state;
                 self.randomness = randomness;
+                self.current_difficulty = difficulty;
                 Ok(())
             }
             Err((index, error)) => Err(format!("Block {}: {}", index, error.reason)),
@@ -512,6 +573,7 @@ impl Blockchain {
             genesis_supply: self.genesis_supply,
             state: ChainState::default(),
             randomness: String::new(),
+            current_difficulty: self.difficulty,
         };
         replay
             .rebuild_state()
@@ -520,6 +582,7 @@ impl Blockchain {
         self.blocks = replay.blocks;
         self.state = replay.state;
         self.randomness = replay.randomness;
+        self.current_difficulty = replay.current_difficulty;
         Ok(true)
     }
 }
@@ -578,16 +641,18 @@ mod tests {
             .ok_or("no validators".to_string())?;
         let public_key = chain.state.stakers.get(&validator).unwrap().public_key.clone();
 
+        let next_height = chain.blocks.len() as u64;
         let mut post = chain.state.clone();
         let mut txs = Vec::new();
         for tx in &extra {
             tx.verify_for_block(&validator)?;
-            post.apply_transaction(tx)?;
+            post.apply_transaction(tx, next_height)?;
             txs.push(serde_json::to_string(tx).unwrap());
         }
         let reward = Transaction::new_reward(&validator);
-        post.apply_transaction(&reward)?;
+        post.apply_transaction(&reward, next_height)?;
         txs.push(serde_json::to_string(&reward).unwrap());
+        post.end_block(next_height, &validator);
 
         let mut block = chain.create_block(
             txs,
@@ -703,7 +768,8 @@ mod tests {
 
         let reward = Transaction::new_reward(&t_addr);
         let mut post = chain.state.clone();
-        post.apply_transaction(&reward).unwrap();
+        post.apply_transaction(&reward, 1).unwrap();
+        post.end_block(1, &t_addr);
         // Forge extra balance into the state the block claims.
         post.balances.insert("hkmthief".to_string(), 1_000_000);
 
@@ -729,7 +795,8 @@ mod tests {
         let (t_addr, t_pub, _) = treasury();
         let reward = Transaction::new_reward(&t_addr);
         let mut post = chain.state.clone();
-        post.apply_transaction(&reward).unwrap();
+        post.apply_transaction(&reward, 1).unwrap();
+        post.end_block(1, &t_addr);
 
         let mut block = chain.create_block(
             vec![serde_json::to_string(&reward).unwrap()],
@@ -812,7 +879,8 @@ mod tests {
         let (t_addr, t_pub, t_key) = treasury();
         let reward = Transaction::new_reward(&t_addr);
         let mut post = chain.state.clone();
-        post.apply_transaction(&reward).unwrap();
+        post.apply_transaction(&reward, 1).unwrap();
+        post.end_block(1, &t_addr);
 
         let mut block = chain.create_block(
             vec![serde_json::to_string(&reward).unwrap()],
@@ -833,7 +901,8 @@ mod tests {
         let (t_addr, t_pub, t_key) = treasury();
         let reward = Transaction::new_reward(&t_addr);
         let mut post = chain.state.clone();
-        post.apply_transaction(&reward).unwrap();
+        post.apply_transaction(&reward, 1).unwrap();
+        post.end_block(1, &t_addr);
 
         let mut block = chain.create_block(
             vec![serde_json::to_string(&reward).unwrap()],
@@ -887,6 +956,51 @@ mod tests {
     }
 
     #[test]
+    fn difficulty_retargets_deterministically() {
+        let mut chain = Blockchain::default();
+        assert_eq!(chain.current_difficulty, 2);
+
+        // Mine RETARGET_INTERVAL blocks back-to-back (far faster than the
+        // 15s target) — difficulty must step up by exactly one.
+        for _ in 0..RETARGET_INTERVAL {
+            mine_valid_block(&mut chain);
+        }
+        assert_eq!(chain.current_difficulty, 3);
+        assert!(chain.is_valid());
+
+        // A candidate carrying the stale difficulty is rejected.
+        let (t_addr, t_pub, t_key) = treasury();
+        let reward = Transaction::new_reward(&t_addr);
+        let next_height = chain.blocks.len() as u64;
+        let mut post = chain.state.clone();
+        post.apply_transaction(&reward, next_height).unwrap();
+        post.end_block(next_height, &t_addr);
+        let mut block = Block::new(
+            next_height,
+            vec![serde_json::to_string(&reward).unwrap()],
+            chain.latest_hash(),
+            2, // stale difficulty
+            Some(t_addr.clone()),
+            Some(t_pub),
+            None,
+            post.state_root(),
+        );
+        let (vrf_output, vrf_proof) =
+            vrf::prove(&chain.next_slot_input(), &t_key).unwrap();
+        block.vrf_output = Some(vrf_output);
+        block.vrf_proof = Some(vrf_proof);
+        block.validator_signature =
+            Some(pos::sign_block_hash(&block.hash, &t_key).unwrap());
+        let error = chain.validate_block_candidate(&block).unwrap_err();
+        assert!(error.contains("retarget"), "unexpected error: {error}");
+
+        // Replay from scratch converges to the same difficulty.
+        let runtime = chain.current_difficulty;
+        chain.rebuild_state().unwrap();
+        assert_eq!(chain.current_difficulty, runtime);
+    }
+
+    #[test]
     fn equivocation_proof_slashes_validator_on_chain() {
         let mut chain = Blockchain::default();
         let (t_addr, t_pub, t_key) = treasury();
@@ -894,7 +1008,8 @@ mod tests {
         // The treasury validator signs two DIFFERENT blocks at height 1.
         let reward = Transaction::new_reward(&t_addr);
         let mut post = chain.state.clone();
-        post.apply_transaction(&reward).unwrap();
+        post.apply_transaction(&reward, 1).unwrap();
+        post.end_block(1, &t_addr);
         let root = post.state_root();
 
         let make_signed = |memo: &str| {

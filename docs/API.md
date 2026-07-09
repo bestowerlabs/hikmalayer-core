@@ -5,7 +5,7 @@
 Hikmalayer is a hybrid PoS/PoW blockchain platform with REST execution APIs, staking, governance/slashing controls, and a dedicated P2P protocol endpoint for inter-node communication. This documentation provides API integration guidelines for operators and developers.
 
 **Base URL:** `http://127.0.0.1:3000`  
-**Version:** 3.0 (native identity + replicated on-chain state machine)  
+**Version:** 3.1 (state machine + VRF election + fees/unbonding)  
 **Protocol:** HTTP/HTTPS  
 **Content-Type:** `application/json`
 
@@ -70,6 +70,14 @@ block mints a fixed reward to its validator.
 `{ "block_a": <Block>, "block_b": <Block> }` proof that a validator signed two
 different blocks at the same height. It becomes an on-chain Slash transaction and
 burns the offender's stake when mined.
+
+**Economics (v3.1).** Every Transfer/Stake/Withdraw pays a flat 1-token fee to
+the block validator (senders need `amount + 1`). Withdrawals unbond for 20
+blocks — still slashable — before releasing; inspect with
+`GET /staking/unbonding/{address}`. Equivocation proofs are accepted only
+within the 20-block slashing window. Difficulty retargets deterministically
+every 10 blocks toward a 15s block time; `POST /mining/difficulty` no longer
+sets it. Mempool caps: 1,000 pending txs, 100 txs/block, 1 MiB request bodies.
 
 **New/changed endpoints:** `GET /blockchain/state`, `POST /slashing/equivocation`,
 `POST /tokens/faucet` (admin), `GET /tokens/nonce/{account}`, `POST /mine/propose`,

@@ -18,15 +18,22 @@ use crate::{
         state::ChainState,
         transaction::{CredentialAction, SlashProof, Transaction, TransactionType},
     },
-    consensus::{pos, pow, vrf},
+    consensus::{pos, vrf},
     contract::contract::ContractExecutor,
     governance::GovernanceConfig,
     p2p::{
+        peerbook::PeerBook,
         protocol::{P2PEnvelope, P2PPayload, SeenMessageCache},
         service::P2PService,
     },
     persistence::{save_state, AppSnapshot},
 };
+
+/// Maximum transactions the node will hold in its pending pool.
+const MAX_PENDING_TXS: usize = 1_000;
+
+/// Maximum transactions included per block (plus the reward).
+const MAX_BLOCK_TXS: usize = 100;
 
 /// This node's own validator identity, loaded from the local environment.
 /// The key never leaves the node and is never accepted over the network.
@@ -63,10 +70,14 @@ pub struct AppState {
     pub slash_evidence: Arc<Mutex<Vec<crate::persistence::SlashEvidence>>>,
     pub metrics: Arc<Mutex<Metrics>>,
     pub seen_messages: Arc<Mutex<SeenMessageCache>>,
+    pub peer_book: Arc<Mutex<PeerBook>>,
     /// Accepted bearer tokens (first = current; extras support rotation).
     pub p2p_tokens: Vec<String>,
     pub admin_tokens: Vec<String>,
     pub p2p_service: Arc<P2PService>,
+    /// When true, inbound P2P envelopes must carry a valid node-identity
+    /// signature (per-node keypair handshake), not just the bearer token.
+    pub p2p_require_identity: bool,
     pub validator_key: Option<LocalValidatorKey>,
     /// Treasury key for dev/test faucet operation (never required in
     /// production; the faucet is disabled without it).
@@ -318,6 +329,8 @@ pub struct Metrics {
     pub gossip_failed: u64,
     pub protocol_messages_received: u64,
     pub protocol_messages_rejected: u64,
+    pub peers_banned: u64,
+    pub invalid_from_peers: u64,
 }
 
 async fn persist_state(state: &AppState) -> Result<(), String> {
@@ -405,6 +418,31 @@ fn authorize_p2p(headers: &HeaderMap, state: &AppState) -> bool {
     state.p2p_tokens.iter().any(|t| constant_time_eq(t, supplied))
 }
 
+/// Lower a peer's reputation for misbehavior; count a ban when it triggers.
+async fn penalize_peer(state: &AppState, node_id: &str) {
+    if node_id.trim().is_empty() {
+        return;
+    }
+    let banned = {
+        let mut book = state.peer_book.lock().await;
+        book.record_bad(node_id)
+    };
+    let mut metrics = state.metrics.lock().await;
+    metrics.invalid_from_peers += 1;
+    if banned {
+        metrics.peers_banned += 1;
+    }
+}
+
+/// Raise a peer's reputation for a useful contribution.
+async fn reward_peer(state: &AppState, node_id: &str) {
+    if node_id.trim().is_empty() {
+        return;
+    }
+    let mut book = state.peer_book.lock().await;
+    book.record_good(node_id);
+}
+
 fn authorize_admin(headers: &HeaderMap, state: &AppState) -> bool {
     if state.admin_tokens.is_empty() {
         return false;
@@ -418,10 +456,14 @@ fn authorize_admin(headers: &HeaderMap, state: &AppState) -> bool {
 /// Chain state with all queued (not yet mined) transactions applied — the
 /// view against which new submissions are validated so queued nonces and
 /// balances chain correctly.
-fn project_pending_state(chain_state: &ChainState, pending: &[Transaction]) -> ChainState {
+fn project_pending_state(
+    chain_state: &ChainState,
+    pending: &[Transaction],
+    next_height: u64,
+) -> ChainState {
     let mut projected = chain_state.clone();
     for tx in pending {
-        let _ = projected.apply_transaction(tx);
+        let _ = projected.apply_transaction(tx, next_height);
     }
     projected
 }
@@ -440,13 +482,17 @@ async fn queue_transaction(state: &AppState, tx: Transaction) -> Result<(), Stri
         let chain = state.chain.lock().await;
         let mut pending = state.pending_transactions.lock().await;
 
+        if pending.len() >= MAX_PENDING_TXS {
+            return Err("Mempool is full; retry after the next block".to_string());
+        }
         if pending.iter().any(|queued| queued.id == tx.id) {
             return Ok(()); // duplicate gossip — already queued
         }
 
-        let mut projected = project_pending_state(&chain.state, &pending);
+        let next_height = chain.blocks.len() as u64;
+        let mut projected = project_pending_state(&chain.state, &pending, next_height);
         projected
-            .apply_transaction(&tx)
+            .apply_transaction(&tx, next_height)
             .map_err(|err| format!("Transaction not applicable: {}", err))?;
 
         pending.push(tx.clone());
@@ -505,12 +551,16 @@ pub fn api_routes() -> Router<AppState> {
         .route("/staking/deposit", post(stake_tokens))
         .route("/staking/withdraw", post(withdraw_stake))
         .route("/staking/validators", get(list_validators))
+        .route("/staking/unbonding/{address}", get(get_unbonding))
         // P2P routes
         .route("/p2p/peers", get(list_peers))
         .route("/p2p/peers/register", post(register_peer))
         .route("/p2p/block", post(receive_block))
         .route("/p2p/blocks", post(receive_blocks))
         .route("/p2p/chain", get(get_p2p_chain))
+        .route("/p2p/peers/scores", get(get_peer_scores))
+        .route("/snapshot", get(get_snapshot))
+        .route("/checkpoint", get(get_checkpoint))
         .route("/p2p/protocol", post(receive_protocol_message))
         // Governance & slashing routes
         .route("/governance/config", get(get_governance))
@@ -839,7 +889,8 @@ async fn faucet_tokens(
     let nonce = {
         let chain = state.chain.lock().await;
         let pending = state.pending_transactions.lock().await;
-        let projected = project_pending_state(&chain.state, &pending);
+        let projected =
+            project_pending_state(&chain.state, &pending, chain.blocks.len() as u64);
         projected.nonce_of(&treasury.address) + 1
     };
 
@@ -895,7 +946,7 @@ async fn get_account_nonce(
 ) -> Json<NonceStateResponse> {
     let chain = state.chain.lock().await;
     let pending = state.pending_transactions.lock().await;
-    let projected = project_pending_state(&chain.state, &pending);
+    let projected = project_pending_state(&chain.state, &pending, chain.blocks.len() as u64);
     Json(NonceStateResponse {
         next_nonce: projected.nonce_of(&account) + 1,
         account,
@@ -1098,6 +1149,7 @@ fn plan_block(chain: &Blockchain, pending: &[Transaction]) -> Result<BlockPlan, 
     }
 
     let validator_set = chain.state.validator_set();
+    let next_index = chain.blocks.len() as u64;
     // Slot seed from the VRF randomness beacon: unbiasable by grinding.
     let slot_input = chain.next_slot_input();
     let validator = pos::select_staker_with_seed(&slot_input, &validator_set)
@@ -1109,15 +1161,19 @@ fn plan_block(chain: &Blockchain, pending: &[Transaction]) -> Result<BlockPlan, 
         .map(|info| info.public_key.clone())
         .ok_or_else(|| "Selected validator not registered".to_string())?;
 
-    // Execute pending transactions in order; skip any that no longer apply.
+    // Execute pending transactions in order; skip any that no longer
+    // apply; cap the block size.
     let mut post_state = chain.state.clone();
-    let mut transactions = Vec::with_capacity(pending.len() + 1);
-    let mut included_ids = Vec::with_capacity(pending.len());
+    let mut transactions = Vec::with_capacity(pending.len().min(MAX_BLOCK_TXS) + 1);
+    let mut included_ids = Vec::with_capacity(pending.len().min(MAX_BLOCK_TXS));
     for tx in pending {
+        if included_ids.len() >= MAX_BLOCK_TXS {
+            break;
+        }
         if tx.verify_for_block(&validator).is_err() {
             continue;
         }
-        if post_state.apply_transaction(tx).is_err() {
+        if post_state.apply_transaction(tx, next_index).is_err() {
             continue;
         }
         transactions.push(
@@ -1129,12 +1185,14 @@ fn plan_block(chain: &Blockchain, pending: &[Transaction]) -> Result<BlockPlan, 
 
     let reward = Transaction::new_reward(&validator);
     post_state
-        .apply_transaction(&reward)
+        .apply_transaction(&reward, next_index)
         .map_err(|err| format!("Failed to apply reward: {}", err))?;
     transactions.push(
         serde_json::to_string(&reward)
             .map_err(|err| format!("Failed to serialize reward transaction: {}", err))?,
     );
+    // Mirror consensus: block-boundary housekeeping before the root.
+    post_state.end_block(next_index, &validator);
 
     Ok(BlockPlan {
         validator,
@@ -1144,6 +1202,33 @@ fn plan_block(chain: &Blockchain, pending: &[Transaction]) -> Result<BlockPlan, 
         state_root: post_state.state_root(),
         included_ids,
     })
+}
+
+/// Construct (and PoW-mine) a block on the blocking thread pool so the
+/// synchronous mining loop never stalls the async executor.
+async fn build_block_off_thread(
+    index: u64,
+    transactions: Vec<String>,
+    previous_hash: String,
+    difficulty: usize,
+    validator: String,
+    public_key: String,
+    state_root: String,
+) -> Result<Block, String> {
+    tokio::task::spawn_blocking(move || {
+        Block::new(
+            index,
+            transactions,
+            previous_hash,
+            difficulty,
+            Some(validator),
+            Some(public_key),
+            None,
+            state_root,
+        )
+    })
+    .await
+    .map_err(|err| format!("Mining task failed: {}", err))
 }
 
 /// Remove pending transactions that were included in accepted blocks or can
@@ -1233,8 +1318,8 @@ async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
         }
     };
 
-    let mut pending = state.pending_transactions.lock().await;
-    let mut chain = state.chain.lock().await;
+    let pending = state.pending_transactions.lock().await;
+    let chain = state.chain.lock().await;
 
     let plan = match plan_block(&chain, &pending) {
         Ok(plan) => plan,
@@ -1284,12 +1369,49 @@ async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
     }
 
     let transactions_count = plan.transactions.len();
-    let mut block = chain.create_block(
-        plan.transactions,
-        Some(plan.validator.clone()),
-        Some(plan.public_key),
-        plan.state_root,
-    );
+    let mine_index = chain.blocks.len() as u64;
+    let mine_prev_hash = chain.latest_hash();
+    let mine_difficulty = chain.current_difficulty;
+    // Release the locks while PoW runs on the blocking pool.
+    drop(chain);
+    drop(pending);
+
+    let built = build_block_off_thread(
+        mine_index,
+        plan.transactions.clone(),
+        mine_prev_hash.clone(),
+        mine_difficulty,
+        plan.validator.clone(),
+        plan.public_key.clone(),
+        plan.state_root.clone(),
+    )
+    .await;
+
+    let mut pending = state.pending_transactions.lock().await;
+    let mut chain = state.chain.lock().await;
+    let mut block = match built {
+        Ok(block) => block,
+        Err(message) => {
+            drop(chain);
+            drop(pending);
+            return Json(MiningResponse {
+                status: "error".to_string(),
+                message,
+                block_index: 0,
+                transactions_count: 0,
+            });
+        }
+    };
+    if chain.latest_hash() != mine_prev_hash {
+        drop(chain);
+        drop(pending);
+        return Json(MiningResponse {
+            status: "info".to_string(),
+            message: "Chain tip moved while mining; retry".to_string(),
+            block_index: 0,
+            transactions_count: 0,
+        });
+    }
 
     // VRF contribution for this slot (unique — nothing to grind).
     match vrf::prove(&plan.slot_input, &validator_key.private_key) {
@@ -1486,7 +1608,7 @@ async fn submit_block(
 async fn get_mining_difficulty(State(state): State<AppState>) -> Json<DifficultyResponse> {
     let chain = state.chain.lock().await;
     Json(DifficultyResponse {
-        current_difficulty: chain.difficulty,
+        current_difficulty: chain.current_difficulty,
     })
 }
 
@@ -1498,32 +1620,18 @@ async fn set_mining_difficulty(
     if !authorize_admin(&headers, &state) {
         return Json(ApiResponse {
             status: "error".to_string(),
-            message: "Unauthorized: changing difficulty requires the admin token".to_string(),
+            message: "Unauthorized: this endpoint requires the admin token".to_string(),
         });
     }
-    if !pow::is_difficulty_in_bounds(payload.difficulty) {
-        return Json(ApiResponse {
-            status: "error".to_string(),
-            message: format!(
-                "Difficulty must be between {} and {}",
-                pow::MIN_DIFFICULTY,
-                pow::MAX_DIFFICULTY
-            ),
-        });
-    }
-
-    let mut chain = state.chain.lock().await;
-    let old_difficulty = chain.difficulty;
-    chain.difficulty = payload.difficulty;
-    drop(chain);
-
-    let _ = persist_state(&state).await;
-
+    let _ = payload;
+    let chain = state.chain.lock().await;
     Json(ApiResponse {
-        status: "success".to_string(),
+        status: "error".to_string(),
         message: format!(
-            "Mining difficulty changed from {} to {}",
-            old_difficulty, payload.difficulty
+            "Difficulty is consensus-derived: it retargets every {} blocks toward              {}s block time and is currently {}. Operators can no longer set it.",
+            crate::blockchain::chain::RETARGET_INTERVAL,
+            crate::blockchain::chain::TARGET_BLOCK_SECONDS,
+            chain.current_difficulty
         ),
     })
 }
@@ -1607,8 +1715,10 @@ async fn withdraw_stake(
             Json(StakeResponse {
                 status: "success".to_string(),
                 message: format!(
-                    "Withdrawal of {} for {} queued; it executes when mined into a block",
-                    payload.amount, payload.address
+                    "Withdrawal of {} for {} queued; once mined it unbonds for {} blocks                      (still slashable) before releasing to the balance",
+                    payload.amount,
+                    payload.address,
+                    crate::blockchain::state::UNBONDING_BLOCKS
                 ),
                 total_stake,
             })
@@ -1619,6 +1729,32 @@ async fn withdraw_stake(
             total_stake: 0,
         }),
     }
+}
+
+#[derive(Serialize)]
+pub struct UnbondingResponse {
+    pub address: String,
+    pub total_unbonding: u64,
+    pub entries: Vec<crate::blockchain::state::UnbondingEntry>,
+    pub current_height: u64,
+}
+
+async fn get_unbonding(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Json<UnbondingResponse> {
+    let chain = state.chain.lock().await;
+    Json(UnbondingResponse {
+        total_unbonding: chain.state.unbonding_total(&address),
+        entries: chain
+            .state
+            .unbonding
+            .get(&address)
+            .cloned()
+            .unwrap_or_default(),
+        current_height: chain.blocks.len() as u64 - 1,
+        address,
+    })
 }
 
 async fn list_validators(State(state): State<AppState>) -> Json<Vec<ValidatorInfo>> {
@@ -1797,6 +1933,70 @@ async fn receive_blocks(
     })
 }
 
+#[derive(Serialize)]
+pub struct SnapshotResponse {
+    pub height: u64,
+    pub block_hash: String,
+    pub state_root: String,
+    pub randomness: String,
+    pub current_difficulty: usize,
+    pub total_supply: u64,
+    pub finalized_height: u64,
+    /// The full replicated state at the tip (for backup / fast inspection).
+    pub state: crate::blockchain::state::ChainState,
+}
+
+/// Export a snapshot of the current tip: the committed state plus the
+/// commitments that authenticate it (block hash, state root, beacon). An
+/// operator can back this up, and a light client can pin it as a
+/// weak-subjectivity checkpoint. Trust-minimizing full sync remains
+/// available via GET /p2p/chain (replay from genesis).
+async fn get_snapshot(State(state): State<AppState>) -> Json<SnapshotResponse> {
+    let chain = state.chain.lock().await;
+    Json(SnapshotResponse {
+        height: chain.blocks.len() as u64 - 1,
+        block_hash: chain.latest_hash(),
+        state_root: chain.state.state_root(),
+        randomness: chain.randomness.clone(),
+        current_difficulty: chain.current_difficulty,
+        total_supply: chain.state.total_supply,
+        finalized_height: chain.finalized_height,
+        state: chain.state.clone(),
+    })
+}
+
+#[derive(Serialize)]
+pub struct CheckpointResponse {
+    pub finalized_height: u64,
+    pub block_hash: String,
+    pub state_root: String,
+}
+
+/// The current finalized checkpoint: a compact, pinnable
+/// (height, block_hash, state_root) triple. Publishing this out-of-band lets
+/// new nodes and light clients anchor to a trusted point.
+async fn get_checkpoint(State(state): State<AppState>) -> Json<CheckpointResponse> {
+    let chain = state.chain.lock().await;
+    let height = chain.finalized_height as usize;
+    let block = chain.blocks.get(height).cloned().unwrap_or_else(|| chain.blocks[0].clone());
+    Json(CheckpointResponse {
+        finalized_height: chain.finalized_height,
+        block_hash: block.hash.clone(),
+        state_root: block.state_root.clone(),
+    })
+}
+
+async fn get_peer_scores(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<Vec<crate::p2p::peerbook::PeerRecord>> {
+    if !authorize_p2p(&headers, &state) {
+        return Json(Vec::new());
+    }
+    let book = state.peer_book.lock().await;
+    Json(book.snapshot())
+}
+
 async fn receive_protocol_message(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1811,13 +2011,31 @@ async fn receive_protocol_message(
         });
     }
 
-    if let Err(message) = envelope.validate(300) {
+    if let Err(message) = envelope.validate_with_identity(300, state.p2p_require_identity) {
+        // A malformed/mis-signed envelope is misbehavior (when we can
+        // attribute it to an identity).
+        penalize_peer(&state, &envelope.node_id).await;
         let mut metrics = state.metrics.lock().await;
         metrics.protocol_messages_rejected += 1;
         return Json(ApiResponse {
             status: "error".to_string(),
             message,
         });
+    }
+
+    // Reputation gate: refuse banned or allow-list-excluded peers.
+    let node_id = envelope.node_id.clone();
+    {
+        let book = state.peer_book.lock().await;
+        if !book.is_accepted(&node_id) {
+            drop(book);
+            let mut metrics = state.metrics.lock().await;
+            metrics.protocol_messages_rejected += 1;
+            return Json(ApiResponse {
+                status: "error".to_string(),
+                message: "Peer is banned or not permitted".to_string(),
+            });
+        }
     }
 
     // Replay protection: each envelope may only be processed once.
@@ -1885,6 +2103,7 @@ async fn receive_protocol_message(
             let valid = transaction.verify_for_block("__queue__").is_ok()
                 && transaction.transaction_type != TransactionType::Reward;
             if !valid {
+                penalize_peer(&state, &node_id).await;
                 let mut metrics = state.metrics.lock().await;
                 metrics.protocol_messages_rejected += 1;
                 return Json(ApiResponse {
@@ -1896,10 +2115,12 @@ async fn receive_protocol_message(
             {
                 let chain = state.chain.lock().await;
                 let mut pending = state.pending_transactions.lock().await;
-                let mut projected = project_pending_state(&chain.state, &pending);
-                if projected.apply_transaction(&transaction).is_err() {
+                let next_height = chain.blocks.len() as u64;
+                let mut projected = project_pending_state(&chain.state, &pending, next_height);
+                if projected.apply_transaction(&transaction, next_height).is_err() {
                     drop(pending);
                     drop(chain);
+                    penalize_peer(&state, &node_id).await;
                     let mut metrics = state.metrics.lock().await;
                     metrics.protocol_messages_rejected += 1;
                     return Json(ApiResponse {
@@ -1910,6 +2131,7 @@ async fn receive_protocol_message(
                 pending.push(transaction);
             }
 
+            reward_peer(&state, &node_id).await;
             let mut metrics = state.metrics.lock().await;
             metrics.transactions_received += 1;
             drop(metrics);
@@ -1927,6 +2149,7 @@ async fn receive_protocol_message(
             };
             match accept_peer_block(&state, block, finality_depth).await {
                 Ok(_) => {
+                    reward_peer(&state, &node_id).await;
                     let mut metrics = state.metrics.lock().await;
                     metrics.blocks_received += 1;
                     drop(metrics);
@@ -1937,6 +2160,11 @@ async fn receive_protocol_message(
                     })
                 }
                 Err(message) => {
+                    // A tip mismatch triggers sync and is not misbehavior;
+                    // only genuinely invalid blocks are penalized.
+                    if !message.contains("chain tip") {
+                        penalize_peer(&state, &node_id).await;
+                    }
                     let mut metrics = state.metrics.lock().await;
                     metrics.blocks_rejected += 1;
                     metrics.protocol_messages_rejected += 1;
@@ -2263,9 +2491,11 @@ mod tests {
             slash_evidence: Arc::new(Mutex::new(Vec::new())),
             metrics: Arc::new(Mutex::new(Metrics::default())),
             seen_messages: Arc::new(Mutex::new(SeenMessageCache::new(1024))),
+            peer_book: Arc::new(Mutex::new(PeerBook::new())),
             p2p_tokens: vec![P2P_TOKEN.to_string()],
             admin_tokens: vec![ADMIN_TOKEN.to_string()],
             p2p_service: Arc::new(P2PService::new("node-test".to_string(), None).unwrap()),
+            p2p_require_identity: false,
             validator_key: with_local_validator.then(|| treasury.clone()),
             treasury_key: Some(treasury),
         }
@@ -2682,9 +2912,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn difficulty_change_requires_admin_and_bounds() {
+    async fn difficulty_is_consensus_derived_not_admin_set() {
         let state = test_state(false);
 
+        // Unauthorized: rejected outright.
         let response = set_mining_difficulty(
             State(state.clone()),
             HeaderMap::new(),
@@ -2693,22 +2924,16 @@ mod tests {
         .await;
         assert_eq!(response.0.status, "error");
 
-        let response = set_mining_difficulty(
-            State(state.clone()),
-            admin_headers(),
-            Json(DifficultyRequest { difficulty: 99 }),
-        )
-        .await;
-        assert_eq!(response.0.status, "error");
-
+        // Even with the admin token, difficulty cannot be set manually.
         let response = set_mining_difficulty(
             State(state.clone()),
             admin_headers(),
             Json(DifficultyRequest { difficulty: 3 }),
         )
         .await;
-        assert_eq!(response.0.status, "success");
-        assert_eq!(state.chain.lock().await.difficulty, 3);
+        assert_eq!(response.0.status, "error");
+        assert!(response.0.message.contains("consensus-derived"));
+        assert_eq!(state.chain.lock().await.current_difficulty, 2);
     }
 
     #[tokio::test]
@@ -2770,6 +2995,103 @@ mod tests {
         let response =
             receive_protocol_message(State(state.clone()), p2p_headers(), Json(envelope)).await;
         assert_eq!(response.0.status, "error");
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_checkpoint_expose_consistent_commitments() {
+        let state = test_state(true);
+        mine_next(&state, &base_keyring()).await;
+
+        let snap = get_snapshot(State(state.clone())).await.0;
+        let chain = state.chain.lock().await;
+        assert_eq!(snap.height, 1);
+        assert_eq!(snap.block_hash, chain.latest_hash());
+        assert_eq!(snap.state_root, chain.state.state_root());
+        drop(chain);
+
+        let cp = get_checkpoint(State(state.clone())).await.0;
+        // Genesis is the finalized checkpoint under the default depth.
+        assert_eq!(cp.finalized_height, 0);
+        assert!(!cp.block_hash.is_empty());
+        assert!(!cp.state_root.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_invalid_gossip_bans_the_peer() {
+        let state = test_state(false);
+        let attacker = hex::encode([200u8; 32]);
+
+        // Three malformed (unsigned-body / not-applicable) gossiped txs from
+        // the same signed node identity trip the ban threshold.
+        for i in 0..3 {
+            let mut forged = Transaction::new(
+                Some("hkmnobody".to_string()),
+                "hkmsink".to_string(),
+                9_999_999,
+                TransactionType::Transfer,
+            );
+            forged.id = format!("forged-{}", i);
+            forged.nonce = 1;
+            // no signature → verify_for_block fails → penalized
+            let envelope = P2PEnvelope::new("x".to_string(), P2PPayload::Transaction(forged))
+                .signed(&attacker)
+                .unwrap();
+            let node_id = envelope.node_id.clone();
+            let response =
+                receive_protocol_message(State(state.clone()), p2p_headers(), Json(envelope))
+                    .await;
+            assert_eq!(response.0.status, "error");
+            let _ = node_id;
+        }
+
+        // The attacker's node is now banned: a fresh (even well-formed) Ping
+        // is refused.
+        let ping = P2PEnvelope::new("x".to_string(), P2PPayload::Ping)
+            .signed(&attacker)
+            .unwrap();
+        let response =
+            receive_protocol_message(State(state.clone()), p2p_headers(), Json(ping)).await;
+        assert_eq!(response.0.status, "error");
+        assert!(response.0.message.contains("banned"), "{}", response.0.message);
+
+        let metrics = state.metrics.lock().await;
+        assert!(metrics.peers_banned >= 1);
+    }
+
+    #[tokio::test]
+    async fn mempool_rejects_when_full() {
+        let state = test_state(false);
+        {
+            let mut pending = state.pending_transactions.lock().await;
+            for i in 0..MAX_PENDING_TXS {
+                let mut filler = Transaction::new(
+                    Some("hkmfiller".to_string()),
+                    "hkmsink".to_string(),
+                    1,
+                    TransactionType::Transfer,
+                );
+                filler.id = format!("filler-{}", i);
+                pending.push(filler);
+            }
+        }
+        let t = treasury_key();
+        let from = (t.address.clone(), t.public_key.clone(), t.private_key.clone());
+        let message = Transaction::transfer_signing_message(&from.0, "hkmx", 1, 1);
+        let signature = pos::sign_message(&message, &from.2).unwrap();
+        let response = transfer_tokens(
+            State(state.clone()),
+            Json(TokenTransferRequest {
+                from: from.0.clone(),
+                to: "hkmx".to_string(),
+                amount: 1,
+                nonce: 1,
+                public_key: Some(from.1.clone()),
+                signature: Some(signature),
+            }),
+        )
+        .await;
+        assert_eq!(response.0.status, "error");
+        assert!(response.0.message.contains("Mempool"), "{}", response.0.message);
     }
 
     #[tokio::test]
@@ -2894,7 +3216,9 @@ mod tests {
             let chain = state.chain.lock().await;
             let reward = Transaction::new_reward(&treasury.address);
             let mut post = chain.state.clone();
-            post.apply_transaction(&reward).unwrap();
+            let next_height = chain.blocks.len() as u64;
+            post.apply_transaction(&reward, next_height).unwrap();
+            post.end_block(next_height, &treasury.address);
             let root = post.state_root();
             let make = |memo: &str| {
                 let mut block = chain.create_block(

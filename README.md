@@ -32,8 +32,24 @@ signing conventions. It provides:
 - Fork choice by cumulative work with finalized-history protection; adopted chains are
   re-executed under local network parameters and their state rebuilt from genesis.
 - P2P block and transaction gossip, peer chain sync, and P2P message replay protection.
-- **Permissionless slashing:** anyone holding a proof that a validator signed two blocks
-  at the same height can submit it; the offender's stake is burned on-chain.
+- **Cryptographic node identity.** Every gossip envelope is signed by the sender's node
+  key and bound to its derived `node_id`; set `P2P_REQUIRE_IDENTITY=true` to reject any
+  unsigned envelope — a per-node keypair handshake layered on the bearer token.
+- **Peer reputation & banning.** Useful blocks/transactions raise a peer's score, invalid
+  or malformed messages lower it, and repeat offenders are auto-banned; an optional
+  `P2P_ALLOWLIST` restricts participation to named validator node ids.
+- **Snapshots & checkpoints.** `GET /snapshot` exports the tip state with its
+  authenticating commitments; `GET /checkpoint` returns a pinnable finalized
+  (height, block_hash, state_root) triple for weak-subjectivity anchoring.
+- **Permissionless slashing with an unbonding guarantee:** anyone holding a proof that a
+  validator signed two blocks at the same height can submit it; the offender's stake is
+  burned on-chain. Withdrawn stake unbonds over 20 blocks and stays slashable for the
+  entire slashing window — misbehaving stake can never exit before punishment.
+- **Fee economics + DoS bounds.** Flat per-transaction fee paid to the block validator;
+  mempool cap, per-block transaction cap, and request-body limits.
+- **Self-adjusting difficulty.** PoW difficulty retargets deterministically every 10
+  blocks toward a 15-second block time — consensus-validated, not operator-set — and
+  mining runs off the async executor so the node stays responsive.
 - Block rewards minted to the producing validator on block acceptance.
 - An offline wallet/validator signing CLI (`hikma-wallet`) — private keys never touch
   the node or the network.
@@ -111,7 +127,12 @@ Hikmalayer Core is developed in phases:
 - **Phase 2**: PoS validator selection, staking, and validator identities.
 - **Phase 3**: Persistence, P2P gossip, governance, slashing, and async‑safe services.
 - **Phase 4**: Operational hardening, Dockerized multi-node deployment, monitoring, and benchmark validation. (Completed for API execution layer.)
-- **Phase 5 (in progress)**: Public testnet with full P2P validator consensus and finalized-state tracking.
+- **Phase 5**: P2P validator consensus, gossip, fork choice, finality.
+- **Phase 6**: Replicated on-chain state machine, native identity, on-chain validator set.
+- **Phase 7**: VRF unbiasable leader election + Proof-of-Credential registry.
+- **Phase 8**: Unbonding + slashing window, tx fees, difficulty retargeting, DoS bounds.
+- **Phase 9**: Signed P2P identity, peer scoring/banning, snapshots/checkpoints, observability.
+- **Mainnet (pending)**: External audit + adversarial testnet, economic modeling, ops hardening.
 
 
 ## 🔄 How it works — consensus workflow
@@ -165,7 +186,10 @@ Key consensus rules:
 | Transaction authenticity | Every transfer/stake/withdraw carries a native signature, re-verified at consensus level |
 | Replay protection | Per-account on-chain nonces + P2P message-ID cache |
 | Conflicting chains | Heaviest-cumulative-work valid chain wins; adopted chains re-execute from genesis; finalized blocks can never be rewritten |
-| Misbehavior | Permissionless equivocation proofs slash the offender's stake on-chain (burned) |
+| Misbehavior | Permissionless equivocation proofs slash the offender's stake on-chain (burned); proofs accepted within the slashing window only |
+| Exit safety | Withdrawals unbond for 20 blocks (still slashable); slashing window = unbonding period, so no exit-before-slash |
+| Fees | Flat per-tx fee, consensus-executed, paid to the block validator via `end_block` |
+| Difficulty | Deterministic retarget every 10 blocks toward 15s block time; producer-chosen difficulty is rejected |
 
 ## 🔐 Security model
 
@@ -376,7 +400,9 @@ Current implementation provides:
 - Fork choice by cumulative work, with re-execution and finality protection  
 - Block & transaction gossip, peer chain sync, and P2P replay protection  
 - Offline validator signing flow (`/mine/propose` → `hikma-wallet sign-block` → `/mine/submit`)  
-- Permissionless equivocation slashing (stake burned on-chain)  
+- Permissionless equivocation slashing (stake burned on-chain), bounded by a slashing window  
+- Unbonding withdrawals (20 blocks, slashable until released)  
+- Per-tx fees to validators; mempool/block/body caps; deterministic difficulty retargeting  
 - Block rewards, governance configuration  
 - Persistent chain (state replayed on startup), smart contract / certificate subsystem  
 - Dockerized orchestration, monitoring + metrics  
@@ -420,7 +446,9 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 | Phase 5 | ✅ Consensus layer complete (gossip, fork choice, finality, signed txs) |
 | Phase 6 | ✅ Replicated on-chain state machine, native identity, on-chain validator set & slashing |
 | Phase 7 | ✅ VRF randomness beacon (unbiasable leader election) + Proof-of-Credential registry |
-| Phase 8 | 🚧 Mainnet hardening (unbonding, fee market, P2P identity, audit — see `docs/mainnet_readiness.md`) |
+| Phase 8 | ✅ Unbonding + slashing window, tx fees, difficulty retargeting, mempool/DoS bounds, async mining |
+| Phase 9 | ✅ Signed P2P identity, peer scoring/banning, allow-list, snapshots/checkpoints, observability |
+| Mainnet | 🚧 External audit + adversarial testnet, economic modeling, ops hardening (see `docs/mainnet_readiness.md`) |
 
 
 

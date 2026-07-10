@@ -25,56 +25,48 @@ is a launch blocker until closed.
 | Slashing | Permissionless equivocation proofs burn the offender's stake on-chain; double-slash prevented |
 | Authorization | Deny-by-default admin and P2P tokens |
 | Resource bounds | Difficulty clamped 1–5; input length limits |
-| Rewards | Fixed block reward, consensus-verified (recipient + amount + exactly one per block) |
+| Rewards & fees | Fixed block reward + flat per-tx fee paid to the block validator, all consensus-verified |
+| Unbonding | Withdrawn stake stays locked and slashable for UNBONDING_BLOCKS before release; exit only completes when nothing remains bonded or unbonding |
+| Slashing window | Equivocation proofs accepted only within SLASHING_WINDOW_BLOCKS (= unbonding period), so misbehaving stake can never exit before punishment |
+| Difficulty retargeting | Deterministic per-chain schedule (every 10 blocks toward 15s target); block difficulty is consensus-validated, not operator-set |
+| Node responsiveness | PoW mining runs on the blocking thread pool with a tip-moved recheck; hot reads use an O(1) integrity probe |
+| DoS bounds | Mempool cap (1,000 txs), per-block tx cap (100), 1 MiB request-body limit |
+| P2P node identity | Every gossip envelope is signed by the sender's node key; `node_id` = derived address; `P2P_REQUIRE_IDENTITY=true` rejects unsigned envelopes (per-node keypair handshake atop the bearer token) |
+| Peer reputation | Per-node scoring: useful blocks/txs raise reputation, invalid/malformed messages lower it, and repeat offenders are auto-banned; optional `P2P_ALLOWLIST` restricts participation to named validator node ids; `GET /p2p/peers/scores` |
+| Snapshots & checkpoints | `GET /snapshot` exports the tip state + authenticating commitments (backup/inspection); `GET /checkpoint` returns a pinnable finalized (height, block_hash, state_root) triple for weak-subjectivity anchoring; trust-minimizing genesis replay remains the default |
+| Observability | Metrics include blocks mined/received/rejected, reorgs, gossip, txs, slashes, peers banned, invalid-from-peers; structured startup logging of identity/enforcement |
 | Tooling | `hikma-wallet` offline keygen/signing; propose/sign/submit flow for external validators |
-| Tests | 59 automated tests across consensus, state machine, security, replay, fork choice, slashing, and API flows |
+| Tests | 70 automated tests across consensus, state machine, security, replay, fork choice, slashing, and API flows |
 
-## 🚧 Launch blockers (Phase 8)
+## 🚧 Remaining before mainnet
 
-1. **Signed peer handshakes / validator networking.** P2P is currently
-   authenticated by a shared bearer token, suitable for a permissioned
-   testnet. Mainnet requires per-node keypairs, signed handshakes, and
-   peer scoring/banning.
+The engineering surface is now built and tested. What remains is **design and
+external process**, not missing protocol code:
 
-2. **Mempool and block-size limits.** Pending-pool size, per-block
-   transaction count, and per-request body limits need explicit caps and
-   fee-based prioritization (fee market not yet designed). Currently one
-   pending transaction per account per block (nonce must be the next value).
+1. **External security audit + adversarial testnet (the hard gate).**
+   Independent audit of consensus and cryptography, plus a public incentivized
+   testnet with adversarial validators, before any mainnet genesis. This
+   *cannot* be self-performed — see the step-by-step
+   [`docs/external_audit_guide.md`](external_audit_guide.md).
 
-3. **Difficulty adjustment.** Difficulty is an operator-set constant. A
-   retargeting algorithm tied to observed block times is needed. PoW is also
-   a synchronous single-thread loop — production needs an async miner.
+2. **Economic design (fee market + emission).** A flat per-tx fee and fixed
+   block reward exist and are consensus-verified. A dynamic fee market
+   (priority pricing, congestion response) and a long-term emission/treasury
+   policy require token-economic modeling, not just code, before value is
+   attached.
 
-4. **Economic design.** Fixed 5-token block reward, no transaction fees, no
-   halving schedule, no treasury policy. Token economics must be specified
-   before value is attached.
-
-5. **Unbonding period for withdrawals.** Stake can currently be withdrawn in
-   the next block. Mainnet needs an unbonding delay so a validator cannot
-   equivocate and immediately exit before a slash lands.
-
-6. **Historical slashing window.** Equivocation proofs are accepted at any
-   time; they should be bounded to an unbonding window and the offending
-   blocks should be checkable against a retained header history.
-
-7. **Key management hardening.** `VALIDATOR_PRIVATE_KEY` via environment
+3. **Production key management.** `VALIDATOR_PRIVATE_KEY` via environment
    variable is fine for testnets; production validators should use an HSM,
-   OS keyring, or remote signer (see `docs/key_management.md`).
+   OS keyring, or remote signer (see `docs/key_management.md`). This is an
+   operator deployment choice; the node already never handles foreign keys.
 
-8. **State growth & snapshots.** State is held in memory and replayed from
-   full block history on startup. Mainnet needs state snapshots / checkpoint
-   sync and pruning so startup and memory do not grow unbounded.
-
-9. **External security audit + adversarial testnet.** Independent audit of
-    consensus and cryptography, plus a public incentivized testnet with
-    adversarial validators, before any mainnet genesis.
-
-10. **Observability & operations.** Structured logging, alerting on reorgs
-    and validation failures, snapshot/restore tooling, and documented
-    incident-response runbooks.
+4. **State pruning for very long chains.** Snapshots and pinnable checkpoints
+   now exist; full trust-minimizing replay remains the default. History
+   pruning / checkpoint-based fast sync (skipping pre-checkpoint replay under
+   an explicit weak-subjectivity assumption) is an optional scaling step for
+   long-lived deployments.
 
 ## Suggested order of work
 
-`unbonding + slashing window` → `difficulty retarget + async miner` →
-`mempool/fees` → `P2P identity` → `snapshots/pruning` → `economics` →
-`audit + adversarial testnet`.
+`economic modeling` → `deploy adversarial testnet` → `external audit + fixes`
+→ `mainnet genesis`. Optional scaling: `checkpoint fast-sync / pruning`.

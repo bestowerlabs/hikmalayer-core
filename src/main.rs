@@ -4,7 +4,7 @@ use hikmalayer::auth::{routes::auth_routes, AuthManager};
 use hikmalayer::blockchain::chain::{Blockchain, DEFAULT_GENESIS_SUPPLY};
 use hikmalayer::consensus::pos;
 use hikmalayer::contract::contract::ContractExecutor;
-use hikmalayer::p2p::{protocol::SeenMessageCache, service::P2PService};
+use hikmalayer::p2p::{peerbook::PeerBook, protocol::SeenMessageCache, service::P2PService};
 use hikmalayer::persistence::load_state;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -114,6 +114,20 @@ async fn main() {
     let metrics = Arc::new(Mutex::new(Metrics::default()));
     let seen_messages = Arc::new(Mutex::new(SeenMessageCache::new(8192)));
 
+    // Optional allow-list: restrict P2P participation to explicit node ids.
+    let peer_book = Arc::new(Mutex::new(match std::env::var("P2P_ALLOWLIST") {
+        Ok(list) if !list.is_empty() => {
+            let allow: std::collections::HashSet<String> = list
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            println!("🔐 P2P allow-list active: {} permitted node(s).", allow.len());
+            PeerBook::with_allow_list(allow)
+        }
+        _ => PeerBook::new(),
+    }));
+
     // Token rotation (HM-06): a node accepts the CURRENT token and, during a
     // rotation window, the PREVIOUS one. The legacy single-token variables
     // remain supported.
@@ -180,13 +194,28 @@ async fn main() {
         _ => None,
     };
 
+    // Node identity for signed P2P handshakes: dedicated NODE_PRIVATE_KEY,
+    // else reuse the validator key, else anonymous (token-only).
+    let node_private_key = std::env::var("NODE_PRIVATE_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| std::env::var("VALIDATOR_PRIVATE_KEY").ok().filter(|k| !k.is_empty()));
+    let p2p_require_identity = std::env::var("P2P_REQUIRE_IDENTITY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     let p2p_service = Arc::new(
-        P2PService::new(
+        P2PService::with_identity(
             std::env::var("NODE_ID").unwrap_or_else(|_| "node-local".to_string()),
             p2p_tokens.first().cloned(),
+            node_private_key,
         )
         .unwrap_or_else(|err| panic!("{}", err)),
     );
+    if p2p_require_identity {
+        println!("🛡️  P2P identity enforcement ON: inbound envelopes must be node-signed.");
+    }
+    println!("🕸️  P2P node identity: {}", p2p_service.node_id);
 
     let finality_depth = {
         let governance = governance.lock().await;
@@ -207,9 +236,11 @@ async fn main() {
         slash_evidence,
         metrics,
         seen_messages,
+        peer_book,
         p2p_tokens,
         admin_tokens,
         p2p_service,
+        p2p_require_identity,
         validator_key,
         treasury_key,
     };
@@ -231,11 +262,13 @@ async fn main() {
         .allow_headers(Any)
         .allow_credentials(false);
 
-    // Combine API routes with auth routes
+    // Combine API routes with auth routes. Request bodies are capped to
+    // bound memory per request.
     let app = api_routes()
         .merge(auth_routes())
         .with_state(app_state)
-        .layer(cors);
+        .layer(cors)
+        .layer(axum::extract::DefaultBodyLimit::max(1_048_576));
 
     let port = std::env::var("PORT")
         .ok()

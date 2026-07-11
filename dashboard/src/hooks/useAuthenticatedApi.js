@@ -13,12 +13,18 @@ export const useAuthenticatedApi = () => {
 
     const authHeaders = getAuthHeaders();
 
+    // Operators can store their node admin token locally to unlock
+    // admin-gated endpoints (certificates, difficulty, faucet).
+    const adminToken = localStorage.getItem("hikmalayer_admin_token");
+    const adminHeaders = adminToken ? { "x-admin-token": adminToken } : {};
+
     try {
       const response = await fetch(`${API_BASE}${endpoint}`, {
         ...options,
         headers: {
           "Content-Type": "application/json",
           ...authHeaders,
+          ...adminHeaders,
           ...options.headers,
         },
       });

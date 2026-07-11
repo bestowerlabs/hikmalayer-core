@@ -1,74 +1,49 @@
 // src/auth/signature.rs
-use secp256k1::ecdsa::{RecoveryId, Signature};
-use secp256k1::{Message, Secp256k1};
-use sha3::{Digest, Keccak256};
+//
+// Native Hikmalayer signature verification for the session-auth flow.
+// No external chain conventions: addresses are hkm… (SHA-256 derived) and
+// messages are signed under the Hikmalayer signing domain (see
+// consensus::pos::MESSAGE_PREFIX).
 
-/// Recover Ethereum address from a personal_sign signature
-pub fn recover_address_from_signature(
+use crate::consensus::pos;
+
+/// Verify that `signature` over `message` was produced by the key behind
+/// `address`. The caller supplies the public key; it must derive to the
+/// claimed address and the compact secp256k1 signature must verify under
+/// the native signing domain.
+pub fn verify_signature(
+    address: &str,
     message: &str,
+    public_key_hex: &str,
     signature_hex: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    // Remove 0x prefix if present
-    let signature_hex = signature_hex.strip_prefix("0x").unwrap_or(signature_hex);
-
-    // Decode hex signature
-    let signature_bytes = hex::decode(signature_hex)?;
-    if signature_bytes.len() != 65 {
-        return Err("Invalid signature length".into());
-    }
-
-    // Split signature into r, s, v
-    let r = &signature_bytes[0..32];
-    let s = &signature_bytes[32..64];
-    let v = signature_bytes[64];
-
-    // Create the message hash that MetaMask signs
-    let prefixed_message = format!("\x19Ethereum Signed Message:\n{}{}", message.len(), message);
-    let message_hash = Keccak256::digest(prefixed_message.as_bytes());
-
-    // Create secp256k1 objects
-    let secp = Secp256k1::new();
-    let message = Message::from_digest_slice(&message_hash)?;
-
-    // Create signature from r and s
-    let mut sig_bytes = [0u8; 64];
-    sig_bytes[..32].copy_from_slice(r);
-    sig_bytes[32..].copy_from_slice(s);
-    let _signature = Signature::from_compact(&sig_bytes)?;
-
-    // Recovery ID (v - 27 for Ethereum)
-    let recovery_id = RecoveryId::from_i32((v as i32) - 27)?;
-
-    // Recover public key - Updated API: recovery_id is now part of RecoverableSignature
-    let recoverable_sig =
-        secp256k1::ecdsa::RecoverableSignature::from_compact(&sig_bytes, recovery_id)?;
-    let public_key = secp.recover_ecdsa(&message, &recoverable_sig)?;
-
-    // Convert public key to Ethereum address
-    let public_key_bytes = public_key.serialize_uncompressed();
-    let public_key_hash = Keccak256::digest(&public_key_bytes[1..]);
-    let address = &public_key_hash[12..];
-
-    Ok(format!("0x{}", hex::encode(address)))
-}
-
-/// Verify that a signature was created by the claimed address
-pub fn verify_signature(address: &str, message: &str, signature: &str) -> bool {
-    match recover_address_from_signature(message, signature) {
-        Ok(recovered_address) => recovered_address.to_lowercase() == address.to_lowercase(),
-        Err(_) => false,
+) -> bool {
+    match pos::derive_address(public_key_hex) {
+        Ok(derived) if derived == address => {
+            pos::verify_message(message, public_key_hex, signature_hex)
+        }
+        _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_signature_format() {
-        // Test that we can at least handle the format correctly
-        let test_sig = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12";
-        assert!(test_sig.len() == 132); // 0x + 130 hex chars = 65 bytes
+    use super::*;
 
-        let without_prefix = test_sig.strip_prefix("0x").unwrap();
-        assert!(without_prefix.len() == 130);
+    #[test]
+    fn verifies_native_signatures_and_rejects_mismatches() {
+        let private_key = hex::encode([8u8; 32]);
+        let public_key = pos::derive_public_key(&private_key).unwrap();
+        let address = pos::derive_address(&public_key).unwrap();
+        let message = "login-nonce-1234";
+        let signature = pos::sign_message(message, &private_key).unwrap();
+
+        assert!(verify_signature(&address, message, &public_key, &signature));
+        assert!(!verify_signature(
+            "hkm0000000000000000000000000000000000000000",
+            message,
+            &public_key,
+            &signature
+        ));
+        assert!(!verify_signature(&address, "other", &public_key, &signature));
     }
 }

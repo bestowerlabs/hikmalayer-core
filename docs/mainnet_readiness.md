@@ -25,7 +25,7 @@ is a launch blocker until closed.
 | Slashing | Permissionless equivocation proofs burn the offender's stake on-chain; double-slash prevented |
 | Authorization | Deny-by-default admin and P2P tokens |
 | Resource bounds | Difficulty clamped 1–5; input length limits |
-| Rewards & fees | Fixed block reward + flat per-tx fee paid to the block validator, all consensus-verified |
+| Rewards & fees | Fixed block reward + **dynamic base fee** (EIP-1559-style, congestion-responsive) paid to the block validator; the base fee lives in the state root and is recomputed identically by every node |
 | Unbonding | Withdrawn stake stays locked and slashable for UNBONDING_BLOCKS before release; exit only completes when nothing remains bonded or unbonding |
 | Slashing window | Equivocation proofs accepted only within SLASHING_WINDOW_BLOCKS (= unbonding period), so misbehaving stake can never exit before punishment |
 | Difficulty retargeting | Deterministic per-chain schedule (every 10 blocks toward 15s target); block difficulty is consensus-validated, not operator-set |
@@ -36,7 +36,7 @@ is a launch blocker until closed.
 | Snapshots & checkpoints | `GET /snapshot` exports the tip state + authenticating commitments (backup/inspection); `GET /checkpoint` returns a pinnable finalized (height, block_hash, state_root) triple for weak-subjectivity anchoring; trust-minimizing genesis replay remains the default |
 | Observability | Metrics include blocks mined/received/rejected, reorgs, gossip, txs, slashes, peers banned, invalid-from-peers; structured startup logging of identity/enforcement |
 | Tooling | `hikma-wallet` offline keygen/signing; propose/sign/submit flow for external validators |
-| Tests | 70 automated tests across consensus, state machine, security, replay, fork choice, slashing, and API flows |
+| Tests | 73 automated tests across consensus, state machine, security, replay, fork choice, slashing, and API flows |
 
 ## 🚧 Remaining before mainnet
 
@@ -49,11 +49,12 @@ external process**, not missing protocol code:
    *cannot* be self-performed — see the step-by-step
    [`docs/external_audit_guide.md`](external_audit_guide.md).
 
-2. **Economic design (fee market + emission).** A flat per-tx fee and fixed
-   block reward exist and are consensus-verified. A dynamic fee market
-   (priority pricing, congestion response) and a long-term emission/treasury
-   policy require token-economic modeling, not just code, before value is
-   attached.
+2. **Emission/treasury policy.** A dynamic, congestion-responsive base fee
+   and a fixed block reward now exist and are consensus-verified. What still
+   needs *economic modeling* (not code) before value is attached: the
+   long-term emission curve (halving/tail), a treasury/burn policy, and
+   parameter calibration (target block fullness, fee bounds) against expected
+   demand.
 
 3. **Production key management.** `VALIDATOR_PRIVATE_KEY` via environment
    variable is fine for testnets; production validators should use an HSM,

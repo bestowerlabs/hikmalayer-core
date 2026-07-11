@@ -206,6 +206,7 @@ pub struct BlockchainStats {
     pub state_root: String,
     pub total_supply: u64,
     pub burned: u64,
+    pub base_fee: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -303,6 +304,7 @@ pub struct SlashEvidenceResponse {
 pub struct NonceStateResponse {
     pub account: String,
     pub next_nonce: u64,
+    pub base_fee: u64,
 }
 
 #[derive(Serialize)]
@@ -523,6 +525,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/tokens/faucet", post(faucet_tokens))
         .route("/tokens/balance/{account}", get(get_token_balance))
         .route("/tokens/nonce/{account}", get(get_account_nonce))
+        .route("/fees", get(get_fees))
         // Blockchain routes
         .route("/blocks", get(get_blocks))
         .route("/blocks/{index}", get(get_block_by_index))
@@ -931,6 +934,24 @@ async fn faucet_tokens(
     }
 }
 
+#[derive(Serialize)]
+pub struct FeesResponse {
+    pub base_fee: u64,
+    pub target_txs: u64,
+    pub max_block_txs: usize,
+}
+
+/// The current dynamic base fee (per value-bearing transaction) and the
+/// congestion parameters that move it.
+async fn get_fees(State(state): State<AppState>) -> Json<FeesResponse> {
+    let chain = state.chain.lock().await;
+    Json(FeesResponse {
+        base_fee: chain.state.base_fee,
+        target_txs: crate::blockchain::state::BASE_FEE_TARGET_TXS,
+        max_block_txs: MAX_BLOCK_TXS,
+    })
+}
+
 async fn get_token_balance(
     State(state): State<AppState>,
     Path(account): Path<String>,
@@ -949,6 +970,7 @@ async fn get_account_nonce(
     let projected = project_pending_state(&chain.state, &pending, chain.blocks.len() as u64);
     Json(NonceStateResponse {
         next_nonce: projected.nonce_of(&account) + 1,
+        base_fee: chain.state.base_fee,
         account,
     })
 }
@@ -990,6 +1012,7 @@ async fn get_blockchain_stats(State(state): State<AppState>) -> Json<BlockchainS
         state_root: chain.state.state_root(),
         total_supply: chain.state.total_supply,
         burned: chain.state.burned,
+        base_fee: chain.state.base_fee,
     })
 }
 
@@ -2995,6 +3018,20 @@ mod tests {
         let response =
             receive_protocol_message(State(state.clone()), p2p_headers(), Json(envelope)).await;
         assert_eq!(response.0.status, "error");
+    }
+
+    #[tokio::test]
+    async fn fees_endpoint_and_nonce_expose_base_fee() {
+        let state = test_state(false);
+        let fees = get_fees(State(state.clone())).await.0;
+        assert_eq!(fees.base_fee, crate::blockchain::state::TX_FEE);
+        assert_eq!(fees.target_txs, crate::blockchain::state::BASE_FEE_TARGET_TXS);
+
+        let nonce = get_account_nonce(State(state.clone()), Path("hkmx".to_string()))
+            .await
+            .0;
+        assert_eq!(nonce.base_fee, crate::blockchain::state::TX_FEE);
+        assert_eq!(nonce.next_nonce, 1);
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@
 Hikmalayer is a hybrid PoS/PoW blockchain platform with REST execution APIs, staking, governance/slashing controls, and a dedicated P2P protocol endpoint for inter-node communication. This documentation provides API integration guidelines for operators and developers.
 
 **Base URL:** `http://127.0.0.1:3000`  
-**Version:** 3.1 (state machine + VRF election + fees/unbonding)  
+**Version:** 3.2 (state machine + VRF election + dynamic fee market)  
 **Protocol:** HTTP/HTTPS  
 **Content-Type:** `application/json`
 
@@ -71,8 +71,12 @@ block mints a fixed reward to its validator.
 different blocks at the same height. It becomes an on-chain Slash transaction and
 burns the offender's stake when mined.
 
-**Economics (v3.1).** Every Transfer/Stake/Withdraw pays a flat 1-token fee to
-the block validator (senders need `amount + 1`). Withdrawals unbond for 20
+**Economics (v3.2).** Every Transfer/Stake/Withdraw pays the current **dynamic
+base fee** to the block validator (senders need `amount + base_fee`). The base
+fee is congestion-responsive (EIP-1559-style, ±12.5%/block toward a 50-tx
+target) and lives in the state root, so it is identical on every node. Read it
+from `GET /fees`, `GET /tokens/nonce/{account}` (`base_fee` field), or
+`GET /blockchain/stats`. Withdrawals unbond for 20
 blocks — still slashable — before releasing; inspect with
 `GET /staking/unbonding/{address}`. Equivocation proofs are accepted only
 within the 20-block slashing window. Difficulty retargets deterministically

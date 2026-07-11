@@ -45,8 +45,12 @@ signing conventions. It provides:
   validator signed two blocks at the same height can submit it; the offender's stake is
   burned on-chain. Withdrawn stake unbonds over 20 blocks and stays slashable for the
   entire slashing window — misbehaving stake can never exit before punishment.
-- **Fee economics + DoS bounds.** Flat per-transaction fee paid to the block validator;
-  mempool cap, per-block transaction cap, and request-body limits.
+- **Dynamic fee market + DoS bounds.** A congestion-responsive **base fee**
+  (EIP-1559-style, ±12.5%/block toward a target block fullness) is charged per
+  value-bearing transaction and paid to the block validator. The base fee lives
+  in the state root, so every node recomputes the identical fee — a consensus-
+  enforced fee market on a hybrid PoW+PoS+VRF chain. Plus mempool, per-block,
+  and request-body caps. Query the live fee at `GET /fees`.
 - **Self-adjusting difficulty.** PoW difficulty retargets deterministically every 10
   blocks toward a 15-second block time — consensus-validated, not operator-set — and
   mining runs off the async executor so the node stays responsive.

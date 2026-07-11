@@ -11,6 +11,47 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
+/// Fast-sync a fresh node from a checkpoint bundle. When `HIKMALAYER_CHECKPOINT`
+/// names a JSON `CheckpointBundle` (as served by `/checkpoint/bundle`), the node
+/// boots from a weak-subjectivity anchor sitting on a retarget boundary instead
+/// of replaying the full chain from genesis. The bundle is self-verifying: the
+/// anchor's `state_root` must match the embedded checkpoint state, and every
+/// forward block is validated against consensus during `rebuild_state`.
+fn checkpoint_chain() -> Option<Blockchain> {
+    let path = std::env::var("HIKMALAYER_CHECKPOINT")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("⚠️  HIKMALAYER_CHECKPOINT set but {} could not be read: {err}", path);
+            return None;
+        }
+    };
+    let bundle = match serde_json::from_slice(&bytes) {
+        Ok(bundle) => bundle,
+        Err(err) => {
+            eprintln!("⚠️  HIKMALAYER_CHECKPOINT {} is not a valid bundle: {err}", path);
+            return None;
+        }
+    };
+    match Blockchain::from_bundle(bundle) {
+        Ok(chain) => {
+            eprintln!(
+                "✅ Fast-synced from checkpoint {} — anchored at height {}, tip {}.",
+                path,
+                chain.base_height,
+                chain.tip_index()
+            );
+            Some(chain)
+        }
+        Err(err) => {
+            eprintln!("⚠️  Checkpoint bundle {} failed verification: {err}", path);
+            None
+        }
+    }
+}
+
 fn fresh_chain(difficulty: usize) -> Blockchain {
     // Genesis network parameters. When unset, the well-known DEV defaults
     // apply — suitable for local networks only.
@@ -57,10 +98,13 @@ async fn main() {
     // Load persisted node state; chain state (balances/stakes/nonces) is
     // deterministically rebuilt from the block history.
     let snapshot = load_state();
-    let mut loaded_chain = snapshot
-        .as_ref()
-        .map(|state| state.chain.clone())
-        .unwrap_or_else(|| fresh_chain(difficulty));
+    let mut loaded_chain = match snapshot.as_ref().map(|state| state.chain.clone()) {
+        // A persisted chain always wins: a running node keeps its own history.
+        Some(chain) => chain,
+        // No local history yet — fast-sync from a checkpoint bundle if one is
+        // configured, otherwise start from a fresh genesis.
+        None => checkpoint_chain().unwrap_or_else(|| fresh_chain(difficulty)),
+    };
     if let Err(err) = loaded_chain.rebuild_state() {
         eprintln!(
             "⚠️  Persisted chain failed state replay ({}). Starting from a fresh genesis.",

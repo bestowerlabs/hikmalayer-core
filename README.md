@@ -38,9 +38,15 @@ signing conventions. It provides:
 - **Peer reputation & banning.** Useful blocks/transactions raise a peer's score, invalid
   or malformed messages lower it, and repeat offenders are auto-banned; an optional
   `P2P_ALLOWLIST` restricts participation to named validator node ids.
-- **Snapshots & checkpoints.** `GET /snapshot` exports the tip state with its
+- **Snapshots, checkpoints & fast-sync.** `GET /snapshot` exports the tip state with its
   authenticating commitments; `GET /checkpoint` returns a pinnable finalized
-  (height, block_hash, state_root) triple for weak-subjectivity anchoring.
+  (height, block_hash, state_root) triple for weak-subjectivity anchoring;
+  `GET /checkpoint/bundle` serves a self-verifying **checkpoint bundle** (a
+  retarget-boundary anchor + its state + the forward blocks to the tip). A new
+  node started with `HIKMALAYER_CHECKPOINT=<bundle.json>` boots directly from
+  that anchor — skipping full genesis replay — and reconstructs a byte-identical
+  state root, randomness beacon, and difficulty, then keeps mining. The anchor is
+  pinned to a retarget boundary so difficulty math stays exact under pruning.
 - **Permissionless slashing with an unbonding guarantee:** anyone holding a proof that a
   validator signed two blocks at the same height can submit it; the offender's stake is
   burned on-chain. Withdrawn stake unbonds over 20 blocks and stays slashable for the
@@ -54,7 +60,11 @@ signing conventions. It provides:
 - **Self-adjusting difficulty.** PoW difficulty retargets deterministically every 10
   blocks toward a 15-second block time — consensus-validated, not operator-set — and
   mining runs off the async executor so the node stays responsive.
-- Block rewards minted to the producing validator on block acceptance.
+- **Bitcoin-style halving emission.** The block reward minted to the producing
+  validator halves every 1,000,000 blocks (`reward = BLOCK_REWARD >> (height /
+  HALVING_INTERVAL)`), giving a fixed, disinflationary supply schedule that trends
+  to zero. The reward amount for each height is consensus-verified, so no node can
+  mint more than the schedule allows.
 - An offline wallet/validator signing CLI (`hikma-wallet`) — private keys never touch
   the node or the network.
 - Persistence to disk (chain only; balances/stakes/nonces are replayed on startup).
@@ -136,6 +146,7 @@ Hikmalayer Core is developed in phases:
 - **Phase 7**: VRF unbiasable leader election + Proof-of-Credential registry.
 - **Phase 8**: Unbonding + slashing window, tx fees, difficulty retargeting, DoS bounds.
 - **Phase 9**: Signed P2P identity, peer scoring/banning, snapshots/checkpoints, observability.
+- **Phase 10**: Bitcoin-style halving emission + checkpoint fast-sync/pruning (boundary-anchored, self-verifying).
 - **Mainnet (pending)**: External audit + adversarial testnet, economic modeling, ops hardening.
 
 
@@ -452,6 +463,7 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 | Phase 7 | ✅ VRF randomness beacon (unbiasable leader election) + Proof-of-Credential registry |
 | Phase 8 | ✅ Unbonding + slashing window, tx fees, difficulty retargeting, mempool/DoS bounds, async mining |
 | Phase 9 | ✅ Signed P2P identity, peer scoring/banning, allow-list, snapshots/checkpoints, observability |
+| Phase 10 | ✅ Bitcoin-style halving emission + boundary-anchored checkpoint fast-sync/pruning (self-verifying, byte-identical convergence) |
 | Mainnet | 🚧 External audit + adversarial testnet, economic modeling, ops hardening (see `docs/mainnet_readiness.md`) |
 
 

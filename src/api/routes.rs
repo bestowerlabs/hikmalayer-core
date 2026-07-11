@@ -564,6 +564,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/p2p/peers/scores", get(get_peer_scores))
         .route("/snapshot", get(get_snapshot))
         .route("/checkpoint", get(get_checkpoint))
+        .route("/checkpoint/bundle", get(get_checkpoint_bundle))
         .route("/p2p/protocol", post(receive_protocol_message))
         // Governance & slashing routes
         .route("/governance/config", get(get_governance))
@@ -813,7 +814,7 @@ async fn get_credential_proof(
             "error".to_string()
         },
         credential,
-        height: chain.blocks.len() as u64 - 1,
+        height: chain.tip_index(),
         state_root: chain.state.state_root(),
         block_hash: chain.latest_hash(),
     })
@@ -893,7 +894,7 @@ async fn faucet_tokens(
         let chain = state.chain.lock().await;
         let pending = state.pending_transactions.lock().await;
         let projected =
-            project_pending_state(&chain.state, &pending, chain.blocks.len() as u64);
+            project_pending_state(&chain.state, &pending, chain.next_index());
         projected.nonce_of(&treasury.address) + 1
     };
 
@@ -967,7 +968,7 @@ async fn get_account_nonce(
 ) -> Json<NonceStateResponse> {
     let chain = state.chain.lock().await;
     let pending = state.pending_transactions.lock().await;
-    let projected = project_pending_state(&chain.state, &pending, chain.blocks.len() as u64);
+    let projected = project_pending_state(&chain.state, &pending, chain.next_index());
     Json(NonceStateResponse {
         next_nonce: projected.nonce_of(&account) + 1,
         base_fee: chain.state.base_fee,
@@ -1022,7 +1023,7 @@ async fn get_state_summary(State(state): State<AppState>) -> Json<StateSummaryRe
         .state
         .balance_of(crate::blockchain::state::STAKING_POOL_ACCOUNT);
     Json(StateSummaryResponse {
-        height: chain.blocks.len() as u64 - 1,
+        height: chain.tip_index(),
         state_root: chain.state.state_root(),
         total_supply: chain.state.total_supply,
         burned: chain.state.burned,
@@ -1172,7 +1173,7 @@ fn plan_block(chain: &Blockchain, pending: &[Transaction]) -> Result<BlockPlan, 
     }
 
     let validator_set = chain.state.validator_set();
-    let next_index = chain.blocks.len() as u64;
+    let next_index = chain.next_index();
     // Slot seed from the VRF randomness beacon: unbiasable by grinding.
     let slot_input = chain.next_slot_input();
     let validator = pos::select_staker_with_seed(&slot_input, &validator_set)
@@ -1392,7 +1393,7 @@ async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
     }
 
     let transactions_count = plan.transactions.len();
-    let mine_index = chain.blocks.len() as u64;
+    let mine_index = chain.next_index();
     let mine_prev_hash = chain.latest_hash();
     let mine_difficulty = chain.current_difficulty;
     // Release the locks while PoW runs on the blocking pool.
@@ -1486,7 +1487,7 @@ async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
     let accepted_block = block.clone();
     chain.commit_block(block, post_state);
     chain.apply_finality(finality_depth);
-    let block_index = chain.blocks.len() as u64 - 1;
+    let block_index = chain.tip_index();
 
     // Included transactions leave the pending pool.
     let included: HashSet<String> = plan.included_ids.into_iter().collect();
@@ -1596,7 +1597,7 @@ async fn submit_block(
     let transactions_count = block.transactions.len();
     chain.commit_block(block, post_state);
     chain.apply_finality(finality_depth);
-    let block_index = chain.blocks.len() as u64 - 1;
+    let block_index = chain.tip_index();
     drop(chain);
 
     prune_pending(&state, std::slice::from_ref(&accepted_block)).await;
@@ -1775,7 +1776,7 @@ async fn get_unbonding(
             .get(&address)
             .cloned()
             .unwrap_or_default(),
-        current_height: chain.blocks.len() as u64 - 1,
+        current_height: chain.tip_index(),
         address,
     })
 }
@@ -1977,7 +1978,7 @@ pub struct SnapshotResponse {
 async fn get_snapshot(State(state): State<AppState>) -> Json<SnapshotResponse> {
     let chain = state.chain.lock().await;
     Json(SnapshotResponse {
-        height: chain.blocks.len() as u64 - 1,
+        height: chain.tip_index(),
         block_hash: chain.latest_hash(),
         state_root: chain.state.state_root(),
         randomness: chain.randomness.clone(),
@@ -2000,13 +2001,29 @@ pub struct CheckpointResponse {
 /// new nodes and light clients anchor to a trusted point.
 async fn get_checkpoint(State(state): State<AppState>) -> Json<CheckpointResponse> {
     let chain = state.chain.lock().await;
-    let height = chain.finalized_height as usize;
-    let block = chain.blocks.get(height).cloned().unwrap_or_else(|| chain.blocks[0].clone());
+    let local = (chain.finalized_height.saturating_sub(chain.base_height)) as usize;
+    let block = chain.blocks.get(local).cloned().unwrap_or_else(|| chain.blocks[0].clone());
     Json(CheckpointResponse {
         finalized_height: chain.finalized_height,
         block_hash: block.hash.clone(),
         state_root: block.state_root.clone(),
     })
+}
+
+/// Export a fast-sync bundle (anchor checkpoint + forward blocks). P2P-gated
+/// because it is heavy; a fresh node imports it via HIKMALAYER_CHECKPOINT.
+async fn get_checkpoint_bundle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::blockchain::chain::CheckpointBundle>, (StatusCode, String)> {
+    if !authorize_p2p(&headers, &state) {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
+    }
+    let chain = state.chain.lock().await;
+    chain
+        .export_bundle()
+        .map(Json)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err))
 }
 
 async fn get_peer_scores(
@@ -2138,7 +2155,7 @@ async fn receive_protocol_message(
             {
                 let chain = state.chain.lock().await;
                 let mut pending = state.pending_transactions.lock().await;
-                let next_height = chain.blocks.len() as u64;
+                let next_height = chain.next_index();
                 let mut projected = project_pending_state(&chain.state, &pending, next_height);
                 if projected.apply_transaction(&transaction, next_height).is_err() {
                     drop(pending);

@@ -90,6 +90,43 @@ pub struct Blockchain {
     /// persisted (`difficulty` is the genesis/base parameter).
     #[serde(skip)]
     pub current_difficulty: usize,
+    /// Absolute height of `blocks[0]`. Zero for a genesis-rooted chain; for a
+    /// checkpoint-synced (pruned) chain it is the anchor's height. All height
+    /// math uses `base_height + local_index`.
+    #[serde(default)]
+    pub base_height: u64,
+    /// Trusted root for a checkpoint-synced chain. When present, `blocks[0]`
+    /// is the anchor and validation starts from this state instead of genesis.
+    #[serde(default)]
+    pub checkpoint: Option<CheckpointRoot>,
+}
+
+/// A weak-subjectivity checkpoint: the trusted state at an anchor block, used
+/// to fast-sync a node without replaying history from genesis. Anchors must
+/// sit on a difficulty-retarget boundary so the schedule stays exact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointRoot {
+    /// Trusted post-execution state of the anchor block (`blocks[0]`).
+    pub state: ChainState,
+    /// Randomness beacon after folding the anchor block's VRF output.
+    pub randomness: String,
+    /// `current_difficulty` at the anchor (the difficulty for the next block).
+    pub difficulty: usize,
+}
+
+/// A self-contained fast-sync bundle: the trusted checkpoint anchor plus the
+/// blocks that follow it, and the genesis network parameters (chain identity).
+/// A fresh node can import this and be current without replaying from genesis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointBundle {
+    pub difficulty: usize,
+    pub genesis_treasury: String,
+    pub genesis_validator_public_key: Option<String>,
+    pub genesis_validator_vrf_public_key: Option<String>,
+    pub genesis_supply: u64,
+    pub anchor: Block,
+    pub checkpoint: CheckpointRoot,
+    pub forward_blocks: Vec<Block>,
 }
 
 /// A validation failure. `slashable` distinguishes provable validator
@@ -157,7 +194,74 @@ impl Blockchain {
             state,
             randomness,
             current_difficulty: difficulty,
+            base_height: 0,
+            checkpoint: None,
         }
+    }
+
+    /// Absolute index the next appended block will carry.
+    pub fn next_index(&self) -> u64 {
+        self.base_height + self.blocks.len() as u64
+    }
+
+    /// Absolute height of the current tip.
+    pub fn tip_index(&self) -> u64 {
+        self.next_index().saturating_sub(1)
+    }
+
+    /// Deterministic retarget decision shared by block production and
+    /// validation: at retarget boundaries, adjust difficulty from the last
+    /// RETARGET_INTERVAL blocks' timestamps (excluding genesis when rooted at
+    /// it). `blocks` is the prefix ending at the just-produced block.
+    fn retarget(blocks: &[Block], produced_abs: u64, base_height: u64, current: usize) -> usize {
+        if (produced_abs + 1) % RETARGET_INTERVAL != 0 {
+            return current;
+        }
+        let mut start = blocks.len().saturating_sub(RETARGET_INTERVAL as usize);
+        if base_height == 0 {
+            start = start.max(1); // never fold the fixed-timestamp genesis block
+        }
+        adjusted_difficulty(current, &blocks[start..])
+    }
+
+    /// Bootstrap a pruned chain from a trusted checkpoint bundle plus the
+    /// blocks that follow. The anchor must be a retarget boundary and commit
+    /// to the checkpoint state; forward blocks are validated normally.
+    pub fn from_checkpoint(
+        difficulty: usize,
+        genesis_treasury: String,
+        genesis_validator_public_key: Option<String>,
+        genesis_validator_vrf_public_key: Option<String>,
+        genesis_supply: u64,
+        anchor: Block,
+        checkpoint: CheckpointRoot,
+        forward_blocks: Vec<Block>,
+    ) -> Result<Self, String> {
+        if anchor.index % RETARGET_INTERVAL != 0 {
+            return Err("Checkpoint anchor must sit on a retarget boundary".to_string());
+        }
+        if anchor.state_root != checkpoint.state.state_root() {
+            return Err("Anchor state root does not match the checkpoint state".to_string());
+        }
+        let mut blocks = Vec::with_capacity(1 + forward_blocks.len());
+        blocks.push(anchor.clone());
+        blocks.extend(forward_blocks);
+        let mut chain = Blockchain {
+            blocks,
+            difficulty: pow::clamp_difficulty(difficulty),
+            finalized_height: anchor.index,
+            genesis_treasury,
+            genesis_validator_public_key,
+            genesis_validator_vrf_public_key,
+            genesis_supply,
+            state: ChainState::default(),
+            randomness: String::new(),
+            current_difficulty: checkpoint.difficulty,
+            base_height: anchor.index,
+            checkpoint: Some(checkpoint),
+        };
+        chain.rebuild_state()?;
+        Ok(chain)
     }
 
     fn genesis_state(&self) -> ChainState {
@@ -183,7 +287,7 @@ impl Blockchain {
         validator_public_key: Option<String>,
         state_root: String,
     ) -> Block {
-        let index = self.blocks.len() as u64;
+        let index = self.next_index();
         let previous_hash = self.latest_hash();
         Block::new(
             index,
@@ -206,31 +310,26 @@ impl Blockchain {
         );
         self.blocks.push(block);
         self.state = post_state;
-        // Deterministic retarget at interval boundaries. The genesis block
-        // (fixed network timestamp) is excluded from timing windows.
-        let len = self.blocks.len() as u64;
-        if len % RETARGET_INTERVAL == 0 {
-            let start = (len - RETARGET_INTERVAL).max(1) as usize;
-            let window = &self.blocks[start..];
-            self.current_difficulty = adjusted_difficulty(self.current_difficulty, window);
-        }
+        // Deterministic retarget at interval boundaries.
+        self.current_difficulty = Self::retarget(
+            &self.blocks,
+            self.tip_index(),
+            self.base_height,
+            self.current_difficulty,
+        );
     }
 
     pub fn apply_finality(&mut self, finality_depth: u64) {
         if self.blocks.is_empty() {
-            self.finalized_height = 0;
+            self.finalized_height = self.base_height;
             return;
         }
-        if finality_depth == 0 {
-            self.finalized_height = self.blocks.len() as u64 - 1;
-            return;
-        }
-        let chain_len = self.blocks.len() as u64;
-        if chain_len > finality_depth {
-            self.finalized_height = chain_len - 1 - finality_depth;
+        let tip = self.tip_index();
+        self.finalized_height = if finality_depth == 0 {
+            tip
         } else {
-            self.finalized_height = 0;
-        }
+            tip.saturating_sub(finality_depth).max(self.base_height)
+        };
     }
 
     /// Total expected PoW work across the chain — the fork-choice weight.
@@ -403,7 +502,7 @@ impl Blockchain {
 
         Self::validate_block_at(
             block,
-            self.blocks.len() as u64,
+            self.next_index(),
             &self.latest_hash(),
             &self.state,
             &self.randomness,
@@ -415,7 +514,7 @@ impl Blockchain {
     /// The VRF input for the next slot at the current tip. Exposed so the
     /// selected validator can compute its VRF proof offline.
     pub fn next_slot_input(&self) -> String {
-        vrf::slot_input(&self.randomness, self.blocks.len() as u64)
+        vrf::slot_input(&self.randomness, self.next_index())
     }
 
     /// Cheap integrity probe for hot read endpoints: verifies the tip
@@ -439,30 +538,52 @@ impl Blockchain {
     pub fn validate_full(
         &self,
     ) -> Result<(ChainState, String, usize), (usize, BlockError)> {
-        let genesis = self
+        let anchor = self
             .blocks
             .first()
             .ok_or((0, BlockError::structural("Chain is empty")))?;
-        if !genesis.has_valid_pow() || !genesis.has_valid_merkle_root() {
-            return Err((0, BlockError::structural("Genesis block failed validation")));
+        if !anchor.has_valid_pow() || !anchor.has_valid_merkle_root() {
+            return Err((0, BlockError::structural("Root block failed validation")));
         }
-
-        let mut state = self.genesis_state();
-        if state.state_root() != genesis.state_root {
+        if anchor.index != self.base_height {
             return Err((
                 0,
-                BlockError::structural("Genesis state root does not match network parameters"),
+                BlockError::structural("Root block index does not match base height"),
             ));
         }
 
-        let mut randomness = genesis.hash.clone();
-        let mut difficulty = self.difficulty;
+        // Seed the replay: from a trusted checkpoint, or from genesis params.
+        let (mut state, mut randomness, mut difficulty) = match &self.checkpoint {
+            Some(cp) => {
+                if anchor.state_root != cp.state.state_root() {
+                    return Err((
+                        0,
+                        BlockError::structural("Anchor state root does not match checkpoint"),
+                    ));
+                }
+                (cp.state.clone(), cp.randomness.clone(), cp.difficulty)
+            }
+            None => {
+                let g = self.genesis_state();
+                if g.state_root() != anchor.state_root {
+                    return Err((
+                        0,
+                        BlockError::structural(
+                            "Genesis state root does not match network parameters",
+                        ),
+                    ));
+                }
+                (g, anchor.hash.clone(), self.difficulty)
+            }
+        };
+
         for i in 1..self.blocks.len() {
             let current = &self.blocks[i];
             let previous = &self.blocks[i - 1];
+            let expected_index = self.base_height + i as u64;
             state = Self::validate_block_at(
                 current,
-                i as u64,
+                expected_index,
                 &previous.hash,
                 &state,
                 &randomness,
@@ -473,12 +594,12 @@ impl Blockchain {
                 &randomness,
                 current.vrf_output.as_deref().unwrap_or_default(),
             );
-            let produced = (i + 1) as u64;
-            if produced % RETARGET_INTERVAL == 0 {
-                let start = (produced - RETARGET_INTERVAL).max(1) as usize;
-                let window = &self.blocks[start..=i];
-                difficulty = adjusted_difficulty(difficulty, window);
-            }
+            difficulty = Self::retarget(
+                &self.blocks[..=i],
+                expected_index,
+                self.base_height,
+                difficulty,
+            );
         }
         Ok((state, randomness, difficulty))
     }
@@ -510,20 +631,26 @@ impl Blockchain {
         }
     }
 
+    /// Evaluate a block (by ABSOLUTE height) for slashable behavior.
     pub fn evaluate_slash_evidence(&self, block_index: u64) -> Result<SlashEvidence, String> {
-        let index = block_index as usize;
-        if index == 0 {
+        if block_index == 0 {
             return Err("Cannot slash genesis block".to_string());
         }
-        if index >= self.blocks.len() {
+        if block_index < self.base_height || block_index >= self.next_index() {
             return Err("Block index out of range".to_string());
+        }
+        // Map the absolute height to the local vector; the anchor (local 0)
+        // is trusted and cannot be re-evaluated on a pruned chain.
+        let local = (block_index - self.base_height) as usize;
+        if local == 0 {
+            return Err("Cannot evaluate the checkpoint anchor".to_string());
         }
 
         match self.validate_full() {
             Ok(_) => Err("Block does not contain slashable behavior".to_string()),
-            Err((failed_index, error)) if failed_index == index && error.slashable => {
+            Err((failed_local, error)) if failed_local == local && error.slashable => {
                 Ok(SlashEvidence {
-                    validator: self.blocks[index]
+                    validator: self.blocks[local]
                         .validator
                         .clone()
                         .unwrap_or_else(|| "unknown".to_string()),
@@ -548,19 +675,22 @@ impl Blockchain {
             .first()
             .ok_or_else(|| "Candidate chain is empty".to_string())?;
 
-        if our_genesis.hash != their_genesis.hash {
-            return Err("Candidate chain has a different genesis block".to_string());
+        // Same root: identical anchor/genesis hash AND the same base height
+        // (a pruned node only fork-choices peers sharing its checkpoint).
+        if our_genesis.hash != their_genesis.hash || self.base_height != candidate.base_height {
+            return Err("Candidate chain has a different root".to_string());
         }
 
         // Finalized blocks are irreversible: the candidate must contain the
-        // identical prefix up to our finalized height.
-        for height in 0..=self.finalized_height as usize {
-            let local = &self.blocks[height];
+        // identical prefix up to our finalized height (local indexing).
+        let finalized_local = (self.finalized_height - self.base_height) as usize;
+        for local in 0..=finalized_local {
+            let ours = &self.blocks[local];
             let remote = candidate
                 .blocks
-                .get(height)
+                .get(local)
                 .ok_or_else(|| "Candidate chain rewrites finalized history".to_string())?;
-            if local.hash != remote.hash {
+            if ours.hash != remote.hash {
                 return Err("Candidate chain rewrites finalized history".to_string());
             }
         }
@@ -570,18 +700,20 @@ impl Blockchain {
         }
 
         // Never trust the candidate's own genesis parameters: replay its
-        // blocks under our network configuration.
+        // blocks under our network configuration and checkpoint root.
         let mut replay = Blockchain {
             blocks: candidate.blocks.clone(),
             difficulty: self.difficulty,
-            finalized_height: 0,
+            finalized_height: self.base_height,
             genesis_treasury: self.genesis_treasury.clone(),
             genesis_validator_public_key: self.genesis_validator_public_key.clone(),
             genesis_validator_vrf_public_key: self.genesis_validator_vrf_public_key.clone(),
             genesis_supply: self.genesis_supply,
             state: ChainState::default(),
             randomness: String::new(),
-            current_difficulty: self.difficulty,
+            current_difficulty: self.current_difficulty,
+            base_height: self.base_height,
+            checkpoint: self.checkpoint.clone(),
         };
         replay
             .rebuild_state()
@@ -592,6 +724,75 @@ impl Blockchain {
         self.randomness = replay.randomness;
         self.current_difficulty = replay.current_difficulty;
         Ok(true)
+    }
+
+    /// Export a checkpoint bundle at the current tip so another node can
+    /// fast-sync from here (the tip must be a retarget boundary).
+    pub fn export_checkpoint(&self) -> Result<(Block, CheckpointRoot), String> {
+        if self.tip_index() == 0 || self.tip_index() % RETARGET_INTERVAL != 0 {
+            return Err(format!(
+                "Checkpoints can only be exported when the tip height is a positive multiple of {}",
+                RETARGET_INTERVAL
+            ));
+        }
+        let anchor = self
+            .blocks
+            .last()
+            .cloned()
+            .ok_or_else(|| "Chain is empty".to_string())?;
+        Ok((
+            anchor,
+            CheckpointRoot {
+                state: self.state.clone(),
+                randomness: self.randomness.clone(),
+                difficulty: self.current_difficulty,
+            },
+        ))
+    }
+
+    /// Build a fast-sync bundle: the checkpoint at the latest retarget
+    /// boundary at or below the tip, plus every block after it, so an
+    /// importing node lands current.
+    pub fn export_bundle(&self) -> Result<CheckpointBundle, String> {
+        let tip = self.tip_index();
+        let boundary = (tip / RETARGET_INTERVAL) * RETARGET_INTERVAL;
+        if boundary == 0 {
+            return Err("Chain is too short to checkpoint".to_string());
+        }
+        let boundary_local = (boundary - self.base_height) as usize;
+
+        // Replay a truncated clone to obtain the trusted state at the boundary.
+        let mut trunc = self.clone();
+        trunc.blocks.truncate(boundary_local + 1);
+        trunc.finalized_height = trunc.base_height;
+        trunc.rebuild_state()?;
+        let (anchor, checkpoint) = trunc.export_checkpoint()?;
+
+        let forward_blocks = self.blocks[(boundary_local + 1)..].to_vec();
+        Ok(CheckpointBundle {
+            difficulty: self.difficulty,
+            genesis_treasury: self.genesis_treasury.clone(),
+            genesis_validator_public_key: self.genesis_validator_public_key.clone(),
+            genesis_validator_vrf_public_key: self.genesis_validator_vrf_public_key.clone(),
+            genesis_supply: self.genesis_supply,
+            anchor,
+            checkpoint,
+            forward_blocks,
+        })
+    }
+
+    /// Reconstruct a chain from a fast-sync bundle.
+    pub fn from_bundle(bundle: CheckpointBundle) -> Result<Self, String> {
+        Self::from_checkpoint(
+            bundle.difficulty,
+            bundle.genesis_treasury,
+            bundle.genesis_validator_public_key,
+            bundle.genesis_validator_vrf_public_key,
+            bundle.genesis_supply,
+            bundle.anchor,
+            bundle.checkpoint,
+            bundle.forward_blocks,
+        )
     }
 }
 
@@ -1006,6 +1207,135 @@ mod tests {
         let runtime = chain.current_difficulty;
         chain.rebuild_state().unwrap();
         assert_eq!(chain.current_difficulty, runtime);
+    }
+
+    #[test]
+    fn checkpoint_fast_sync_matches_full_node_across_retarget() {
+        // Build a full chain well past one retarget boundary.
+        let mut full = Blockchain::default();
+        let boundary = RETARGET_INTERVAL; // export anchor at this height
+        let total = RETARGET_INTERVAL + RETARGET_INTERVAL + 3; // cross another boundary
+        for _ in 0..total {
+            mine_valid_block(&mut full);
+        }
+        assert!(full.is_valid());
+        assert_eq!(full.tip_index(), total);
+
+        // Export a checkpoint at the boundary height and take the forward
+        // blocks that follow it.
+        let anchor = full.blocks[boundary as usize].clone();
+        assert_eq!(anchor.index, boundary);
+        // Reconstruct the checkpoint state at the boundary from a truncated
+        // clone validated up to it — exactly what a real exporter at that tip
+        // would have committed.
+        let mut trunc = full.clone();
+        trunc.blocks.truncate(boundary as usize + 1);
+        trunc.finalized_height = 0;
+        trunc.rebuild_state().unwrap();
+        let (bundle_anchor, checkpoint) = trunc.export_checkpoint().unwrap();
+        assert_eq!(bundle_anchor.hash, anchor.hash);
+
+        let forward: Vec<Block> = full.blocks[(boundary as usize + 1)..].to_vec();
+        let synced = Blockchain::from_checkpoint(
+            2,
+            full.genesis_treasury.clone(),
+            full.genesis_validator_public_key.clone(),
+            full.genesis_validator_vrf_public_key.clone(),
+            full.genesis_supply,
+            bundle_anchor,
+            checkpoint,
+            forward,
+        )
+        .unwrap();
+
+        // Byte-identical convergence: same tip, state root, beacon, difficulty.
+        assert_eq!(synced.tip_index(), full.tip_index());
+        assert_eq!(synced.base_height, boundary);
+        assert_eq!(synced.state.state_root(), full.state.state_root());
+        assert_eq!(synced.randomness, full.randomness);
+        assert_eq!(synced.current_difficulty, full.current_difficulty);
+        assert!(synced.is_valid());
+    }
+
+    #[test]
+    fn checkpoint_bundle_json_round_trip_matches_full_node() {
+        // Exercise the exact production path: export_bundle() → JSON (as the
+        // /checkpoint/bundle endpoint serves) → from_bundle() (as main.rs loads
+        // when HIKMALAYER_CHECKPOINT is set).
+        let mut full = Blockchain::default();
+        let total = RETARGET_INTERVAL + RETARGET_INTERVAL + 4;
+        for _ in 0..total {
+            mine_valid_block(&mut full);
+        }
+        assert!(full.is_valid());
+
+        let bundle = full.export_bundle().expect("bundle export");
+        // The exporter must anchor on the latest retarget boundary at or below tip.
+        let expected_anchor = (full.tip_index() / RETARGET_INTERVAL) * RETARGET_INTERVAL;
+        assert_eq!(bundle.anchor.index, expected_anchor);
+
+        // Serialize and deserialize through JSON, exactly like the wire path.
+        let wire = serde_json::to_vec(&bundle).expect("serialize bundle");
+        let decoded: CheckpointBundle = serde_json::from_slice(&wire).expect("deserialize bundle");
+
+        let synced = Blockchain::from_bundle(decoded).expect("fast-sync from bundle");
+
+        // Byte-identical convergence with the full node.
+        assert_eq!(synced.tip_index(), full.tip_index());
+        assert_eq!(synced.base_height, expected_anchor);
+        assert_eq!(synced.state.state_root(), full.state.state_root());
+        assert_eq!(synced.randomness, full.randomness);
+        assert_eq!(synced.current_difficulty, full.current_difficulty);
+        assert!(synced.is_valid());
+
+        // The fast-synced node keeps producing valid blocks that a full node accepts.
+        let mut synced = synced;
+        mine_valid_block(&mut synced);
+        assert!(synced.is_valid());
+    }
+
+    #[test]
+    fn checkpoint_sync_rejects_a_forged_forward_block() {
+        let mut full = Blockchain::default();
+        for _ in 0..(RETARGET_INTERVAL + 2) {
+            mine_valid_block(&mut full);
+        }
+        let boundary = RETARGET_INTERVAL;
+        let mut trunc = full.clone();
+        trunc.blocks.truncate(boundary as usize + 1);
+        trunc.finalized_height = 0;
+        trunc.rebuild_state().unwrap();
+        let (bundle_anchor, checkpoint) = trunc.export_checkpoint().unwrap();
+
+        // Corrupt a forward block's state root.
+        let mut forward: Vec<Block> = full.blocks[(boundary as usize + 1)..].to_vec();
+        forward[0].state_root = "forged".to_string();
+
+        let result = Blockchain::from_checkpoint(
+            2,
+            full.genesis_treasury.clone(),
+            full.genesis_validator_public_key.clone(),
+            full.genesis_validator_vrf_public_key.clone(),
+            full.genesis_supply,
+            bundle_anchor,
+            checkpoint,
+            forward,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn checkpoint_rejects_non_boundary_anchor() {
+        let mut full = Blockchain::default();
+        for _ in 0..(RETARGET_INTERVAL + 5) {
+            mine_valid_block(&mut full);
+        }
+        // Height 3 is not a retarget boundary.
+        let mut trunc = full.clone();
+        trunc.blocks.truncate(4);
+        trunc.finalized_height = 0;
+        trunc.rebuild_state().unwrap();
+        assert!(trunc.export_checkpoint().is_err());
     }
 
     #[test]

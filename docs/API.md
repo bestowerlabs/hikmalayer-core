@@ -64,7 +64,10 @@ account; it requires the node to hold `TREASURY_PRIVATE_KEY` (dev only).
 validators use `POST /mine/propose` (returns the PoW-mined unsigned block, whose
 `state_root` already reflects execution, plus its hash), sign the hash offline
 (`hikma-wallet sign-block`), and submit to `POST /mine/submit`. Every accepted
-block mints a fixed reward to its validator.
+block mints a **halving** reward to its validator: `reward = BLOCK_REWARD >>
+(height / 1_000_000)`, so emission halves every 1,000,000 blocks and trends to
+zero. The reward for each height is consensus-verified — no node can mint more
+than the schedule allows.
 
 **Slashing.** `POST /slashing/equivocation` is permissionless: submit a
 `{ "block_a": <Block>, "block_b": <Block> }` proof that a validator signed two
@@ -83,9 +86,22 @@ within the 20-block slashing window. Difficulty retargets deterministically
 every 10 blocks toward a 15s block time; `POST /mining/difficulty` no longer
 sets it. Mempool caps: 1,000 pending txs, 100 txs/block, 1 MiB request bodies.
 
+**Fast-sync (checkpoint pruning).** `GET /checkpoint/bundle` (p2p) serves a
+self-verifying `CheckpointBundle`: a retarget-boundary anchor block, its full
+state, and the forward blocks up to the tip. Start a fresh node with
+`HIKMALAYER_CHECKPOINT=<bundle.json>` (fetched from a trusted peer) and it boots
+directly from that anchor — no full genesis replay — then reconstructs a
+byte-identical state root, randomness beacon, and difficulty before it resumes
+mining. The anchor is constrained to a retarget boundary so difficulty math is
+exact under pruning, and the anchor's `state_root` must match its embedded state
+or import is rejected; every forward block is re-validated against consensus on
+load. A persisted local chain always takes precedence over the bundle, so this
+only fast-syncs a genuinely fresh node.
+
 **New/changed endpoints:** `GET /blockchain/state`, `POST /slashing/equivocation`,
 `POST /tokens/faucet` (admin), `GET /tokens/nonce/{account}`, `POST /mine/propose`,
-`POST /mine/submit`, `GET /p2p/chain` (p2p), `POST /certificates/attest` (admin).
+`POST /mine/submit`, `GET /p2p/chain` (p2p), `GET /checkpoint/bundle` (p2p),
+`POST /certificates/attest` (admin).
 `POST /certificates/verify` is a read-only lookup. `POST /auth/verify` now also
 requires a `public_key` field (native signature).
 

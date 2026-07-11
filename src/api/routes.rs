@@ -1206,7 +1206,7 @@ fn plan_block(chain: &Blockchain, pending: &[Transaction]) -> Result<BlockPlan, 
         included_ids.push(tx.id.clone());
     }
 
-    let reward = Transaction::new_reward(&validator);
+    let reward = Transaction::new_reward(&validator, next_index);
     post_state
         .apply_transaction(&reward, next_index)
         .map_err(|err| format!("Failed to apply reward: {}", err))?;
@@ -3251,9 +3251,9 @@ mod tests {
         // Produce two conflicting signed blocks at the next height.
         let (block_a, block_b) = {
             let chain = state.chain.lock().await;
-            let reward = Transaction::new_reward(&treasury.address);
-            let mut post = chain.state.clone();
             let next_height = chain.blocks.len() as u64;
+            let reward = Transaction::new_reward(&treasury.address, next_height);
+            let mut post = chain.state.clone();
             post.apply_transaction(&reward, next_height).unwrap();
             post.end_block(next_height, &treasury.address);
             let root = post.state_root();

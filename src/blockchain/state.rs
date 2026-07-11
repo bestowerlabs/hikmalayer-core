@@ -746,7 +746,7 @@ mod tests {
     #[test]
     fn reward_mints_supply() {
         let (mut state, treasury, _, _) = genesis_state();
-        let reward = Transaction::new_reward(&treasury);
+        let reward = Transaction::new_reward(&treasury, 1);
         let supply_before = state.total_supply;
         state.apply_transaction(&reward, 1).unwrap();
         assert_eq!(state.total_supply, supply_before + BLOCK_REWARD);

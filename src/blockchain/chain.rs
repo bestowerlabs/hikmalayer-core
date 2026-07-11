@@ -363,6 +363,14 @@ impl Blockchain {
                 .map_err(BlockError::slashable)?;
             if tx.transaction_type == TransactionType::Reward {
                 reward_count += 1;
+                // Emission is consensus-enforced: the reward must equal the
+                // deterministic halving schedule for this block's height.
+                let expected = crate::blockchain::transaction::block_reward(block.index);
+                if tx.amount != expected {
+                    return Err(BlockError::slashable(
+                        "Block reward does not match the emission schedule",
+                    ));
+                }
             }
         }
         if reward_count != 1 {
@@ -649,7 +657,7 @@ mod tests {
             post.apply_transaction(tx, next_height)?;
             txs.push(serde_json::to_string(tx).unwrap());
         }
-        let reward = Transaction::new_reward(&validator);
+        let reward = Transaction::new_reward(&validator, next_height);
         post.apply_transaction(&reward, next_height)?;
         txs.push(serde_json::to_string(&reward).unwrap());
         post.end_block(next_height, &validator);
@@ -766,7 +774,7 @@ mod tests {
         let chain = Blockchain::default();
         let (t_addr, t_pub, t_key) = treasury();
 
-        let reward = Transaction::new_reward(&t_addr);
+        let reward = Transaction::new_reward(&t_addr, 1);
         let mut post = chain.state.clone();
         post.apply_transaction(&reward, 1).unwrap();
         post.end_block(1, &t_addr);
@@ -793,7 +801,7 @@ mod tests {
     fn rejects_unsigned_candidate_and_wrong_key() {
         let chain = Blockchain::default();
         let (t_addr, t_pub, _) = treasury();
-        let reward = Transaction::new_reward(&t_addr);
+        let reward = Transaction::new_reward(&t_addr, 1);
         let mut post = chain.state.clone();
         post.apply_transaction(&reward, 1).unwrap();
         post.end_block(1, &t_addr);
@@ -877,7 +885,7 @@ mod tests {
     fn rejects_future_timestamps() {
         let chain = Blockchain::default();
         let (t_addr, t_pub, t_key) = treasury();
-        let reward = Transaction::new_reward(&t_addr);
+        let reward = Transaction::new_reward(&t_addr, 1);
         let mut post = chain.state.clone();
         post.apply_transaction(&reward, 1).unwrap();
         post.end_block(1, &t_addr);
@@ -899,7 +907,7 @@ mod tests {
     fn rejects_missing_or_forged_vrf() {
         let chain = Blockchain::default();
         let (t_addr, t_pub, t_key) = treasury();
-        let reward = Transaction::new_reward(&t_addr);
+        let reward = Transaction::new_reward(&t_addr, 1);
         let mut post = chain.state.clone();
         post.apply_transaction(&reward, 1).unwrap();
         post.end_block(1, &t_addr);
@@ -970,8 +978,8 @@ mod tests {
 
         // A candidate carrying the stale difficulty is rejected.
         let (t_addr, t_pub, t_key) = treasury();
-        let reward = Transaction::new_reward(&t_addr);
         let next_height = chain.blocks.len() as u64;
+        let reward = Transaction::new_reward(&t_addr, next_height);
         let mut post = chain.state.clone();
         post.apply_transaction(&reward, next_height).unwrap();
         post.end_block(next_height, &t_addr);
@@ -1006,7 +1014,7 @@ mod tests {
         let (t_addr, t_pub, t_key) = treasury();
 
         // The treasury validator signs two DIFFERENT blocks at height 1.
-        let reward = Transaction::new_reward(&t_addr);
+        let reward = Transaction::new_reward(&t_addr, 1);
         let mut post = chain.state.clone();
         post.apply_transaction(&reward, 1).unwrap();
         post.end_block(1, &t_addr);

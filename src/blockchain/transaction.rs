@@ -5,8 +5,28 @@ use uuid::Uuid;
 use crate::blockchain::block::Block;
 use crate::consensus::pos;
 
-/// Reward minted to the block validator for each accepted block.
+/// Initial block reward (height 1 through the first halving).
 pub const BLOCK_REWARD: u64 = 5;
+
+/// Blocks between reward halvings — a Bitcoin-style deterministic emission
+/// schedule. The reward halves every interval until it reaches zero, after
+/// which validators are compensated purely by transaction fees.
+pub const HALVING_INTERVAL: u64 = 1_000_000;
+
+/// Deterministic block reward for the block at `height`. Genesis (height 0)
+/// pays nothing; every subsequent block pays `BLOCK_REWARD >> halvings`,
+/// where `halvings = (height - 1) / HALVING_INTERVAL`. Every node computes
+/// the identical schedule, so emission is consensus-enforced.
+pub fn block_reward(height: u64) -> u64 {
+    if height == 0 {
+        return 0;
+    }
+    let halvings = (height - 1) / HALVING_INTERVAL;
+    if halvings >= 63 {
+        return 0;
+    }
+    BLOCK_REWARD >> halvings
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TransactionType {
@@ -144,9 +164,15 @@ impl Transaction {
         }
     }
 
-    /// The block reward paid to the validator that produced the block.
-    pub fn new_reward(validator: &str) -> Self {
-        Self::new(None, validator.to_string(), BLOCK_REWARD, TransactionType::Reward)
+    /// The block reward paid to the validator producing the block at
+    /// `height` — the amount follows the deterministic halving schedule.
+    pub fn new_reward(validator: &str, height: u64) -> Self {
+        Self::new(
+            None,
+            validator.to_string(),
+            block_reward(height),
+            TransactionType::Reward,
+        )
     }
 
     /// Canonical message a sender signs to authorize a transfer.
@@ -235,9 +261,9 @@ impl Transaction {
                 if self.to != validator {
                     return Err("Reward transaction must pay the block validator".to_string());
                 }
-                if self.amount != BLOCK_REWARD {
-                    return Err("Reward transaction has invalid amount".to_string());
-                }
+                // The exact amount follows the halving schedule for the
+                // block's height; it is enforced in `Blockchain::validate_block_at`
+                // where the height is known.
                 Ok(())
             }
             TransactionType::Certificate => {
@@ -327,14 +353,23 @@ mod tests {
     }
 
     #[test]
-    fn reward_verification_enforces_recipient_and_amount() {
-        let reward = Transaction::new_reward("validator-1");
+    fn reward_verification_enforces_recipient() {
+        let reward = Transaction::new_reward("validator-1", 1);
+        assert_eq!(reward.amount, BLOCK_REWARD);
         assert!(reward.verify_for_block("validator-1").is_ok());
+        // Must pay the block validator.
         assert!(reward.verify_for_block("validator-2").is_err());
+    }
 
-        let mut inflated = Transaction::new_reward("validator-1");
-        inflated.amount = BLOCK_REWARD + 100;
-        assert!(inflated.verify_for_block("validator-1").is_err());
+    #[test]
+    fn emission_halves_on_schedule() {
+        assert_eq!(block_reward(0), 0); // genesis pays nothing
+        assert_eq!(block_reward(1), BLOCK_REWARD);
+        assert_eq!(block_reward(HALVING_INTERVAL), BLOCK_REWARD);
+        assert_eq!(block_reward(HALVING_INTERVAL + 1), BLOCK_REWARD / 2);
+        assert_eq!(block_reward(2 * HALVING_INTERVAL + 1), BLOCK_REWARD / 4);
+        // Eventually emission stops; fees carry the chain.
+        assert_eq!(block_reward(100 * HALVING_INTERVAL + 1), 0);
     }
 
     #[test]

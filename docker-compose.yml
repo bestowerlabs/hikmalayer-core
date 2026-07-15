@@ -12,6 +12,7 @@ services:
   bootnode:
     build: .
     container_name: hikmalayer-bootnode
+    command: cargo run --release --bin hikmalayer
     environment:
       <<: *common-env
       NODE_ID: bootnode
@@ -23,6 +24,7 @@ services:
   validator1:
     build: .
     container_name: hikmalayer-validator1
+    command: cargo run --release --bin hikmalayer
     environment:
       <<: *common-env
       NODE_ID: validator1
@@ -34,6 +36,7 @@ services:
   validator2:
     build: .
     container_name: hikmalayer-validator2
+    command: cargo run --release --bin hikmalayer
     environment:
       <<: *common-env
       NODE_ID: validator2
@@ -45,6 +48,7 @@ services:
   validator3:
     build: .
     container_name: hikmalayer-validator3
+    command: cargo run --release --bin hikmalayer
     environment:
       <<: *common-env
       NODE_ID: validator3
@@ -56,6 +60,7 @@ services:
   validator4:
     build: .
     container_name: hikmalayer-validator4
+    command: cargo run --release --bin hikmalayer
     environment:
       <<: *common-env
       NODE_ID: validator4
@@ -67,6 +72,7 @@ services:
   rpc:
     build: .
     container_name: hikmalayer-rpc
+    command: cargo run --release --bin hikmalayer
     environment:
       <<: *common-env
       NODE_ID: rpc
@@ -102,3 +108,18 @@ services:
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD}
+      
+  caddy:
+    image: caddy:latest
+    container_name: hikmalayer-caddy
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./ops/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - bootnode
+
+volumes:
+  caddy_data:

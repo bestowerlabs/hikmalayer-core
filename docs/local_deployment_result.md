@@ -4,16 +4,16 @@ Date: 2026-07-14
 
 ## Containers Running
 ```
-NAME                       IMAGE                                      COMMAND                  SERVICE         CREATED          STATUS          PORTS
-hikmalayer-bootnode        hikmalayer-core-bootnode                   "cargo run --release…"   bootnode        13 minutes ago   Up 13 minutes   0.0.0.0:3000->3000/tcp, [::]:3000->3000/tcp
-hikmalayer-grafana         grafana/grafana:latest                     "/run.sh"                grafana         13 minutes ago   Up 13 minutes   0.0.0.0:3005->3000/tcp, [::]:3005->3000/tcp
-hikmalayer-json-exporter   prometheuscommunity/json-exporter:latest   "/bin/json_exporter …"   json_exporter   13 minutes ago   Up 13 minutes   0.0.0.0:7979->7979/tcp, [::]:7979->7979/tcp
-hikmalayer-prometheus      prom/prometheus:latest                     "/bin/prometheus --c…"   prometheus      13 minutes ago   Up 13 minutes   0.0.0.0:9090->9090/tcp, [::]:9090->9090/tcp
-hikmalayer-rpc             hikmalayer-core-rpc                        "cargo run --release…"   rpc             13 minutes ago   Up 13 minutes   0.0.0.0:3010->3000/tcp, [::]:3010->3000/tcp
-hikmalayer-validator1      hikmalayer-core-validator1                 "cargo run --release…"   validator1      13 minutes ago   Up 2 minutes    0.0.0.0:3001->3000/tcp, [::]:3001->3000/tcp
-hikmalayer-validator2      hikmalayer-core-validator2                 "cargo run --release…"   validator2      13 minutes ago   Up 2 minutes    0.0.0.0:3002->3000/tcp, [::]:3002->3000/tcp
-hikmalayer-validator3      hikmalayer-core-validator3                 "cargo run --release…"   validator3      13 minutes ago   Up 2 minutes    0.0.0.0:3003->3000/tcp, [::]:3003->3000/tcp
-hikmalayer-validator4      hikmalayer-core-validator4                 "cargo run --release…"   validator4      13 minutes ago   Up 2 minutes    0.0.0.0:3004->3000/tcp, [::]:3004->3000/tcp
+NAME                       IMAGE                                      COMMAND                  SERVICE         CREATED              STATUS              PORTS
+hikmalayer-bootnode        hikmalayer-core-bootnode                   "cargo run --release…"   bootnode        About a minute ago   Up About a minute   0.0.0.0:3000->3000/tcp, [::]:3000->3000/tcp
+hikmalayer-grafana         grafana/grafana:latest                     "/run.sh"                grafana         16 hours ago         Up About a minute   0.0.0.0:3005->3000/tcp, [::]:3005->3000/tcp
+hikmalayer-json-exporter   prometheuscommunity/json-exporter:latest   "/bin/json_exporter …"   json_exporter   16 hours ago         Up About a minute   0.0.0.0:7979->7979/tcp, [::]:7979->7979/tcp
+hikmalayer-prometheus      prom/prometheus:latest                     "/bin/prometheus --c…"   prometheus      16 hours ago         Up About a minute   0.0.0.0:9090->9090/tcp, [::]:9090->9090/tcp
+hikmalayer-rpc             hikmalayer-core-rpc                        "cargo run --release…"   rpc             About a minute ago   Up About a minute   0.0.0.0:3010->3000/tcp, [::]:3010->3000/tcp
+hikmalayer-validator1      hikmalayer-core-validator1                 "cargo run --release…"   validator1      About a minute ago   Up About a minute   0.0.0.0:3001->3000/tcp, [::]:3001->3000/tcp
+hikmalayer-validator2      hikmalayer-core-validator2                 "cargo run --release…"   validator2      About a minute ago   Up About a minute   0.0.0.0:3002->3000/tcp, [::]:3002->3000/tcp
+hikmalayer-validator3      hikmalayer-core-validator3                 "cargo run --release…"   validator3      About a minute ago   Up About a minute   0.0.0.0:3003->3000/tcp, [::]:3003->3000/tcp
+hikmalayer-validator4      hikmalayer-core-validator4                 "cargo run --release…"   validator4      About a minute ago   Up About a minute   0.0.0.0:3004->3000/tcp, [::]:3004->3000/tcp
 ```
 
 ## On-Chain Validator Set

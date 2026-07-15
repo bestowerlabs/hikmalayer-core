@@ -1,0 +1,8 @@
+:443 {
+    tls internal
+    reverse_proxy bootnode:3000
+}
+
+:80 {
+    redir https://{host}{uri} permanent
+}

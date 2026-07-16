@@ -79,6 +79,18 @@ pub fn slot_input(parent_randomness: &str, height: u64) -> String {
     format!("{}:{}", parent_randomness, height)
 }
 
+/// The VRF input for a (height, round) slot. Round 0 keeps the legacy
+/// `randomness:height` form so every existing block stays valid; each
+/// fallback round appends its number, giving a distinct, ungrindable seed
+/// per rotation.
+pub fn slot_input_at_round(parent_randomness: &str, height: u64, round: u64) -> String {
+    if round == 0 {
+        slot_input(parent_randomness, height)
+    } else {
+        format!("{}:{}:{}", parent_randomness, height, round)
+    }
+}
+
 /// Fold a block's VRF output into the randomness beacon.
 pub fn next_randomness(parent_randomness: &str, vrf_output_hex: &str) -> String {
     let mut hasher = Sha256::new();
@@ -107,6 +119,18 @@ mod tests {
         assert!(!verify("other-input", &pk, &output, &proof));
         let other_pk = derive_vrf_public_key(&secret(2)).unwrap();
         assert!(!verify(&input, &other_pk, &output, &proof));
+    }
+
+    #[test]
+    fn round_slot_inputs_are_distinct_and_round_zero_is_legacy() {
+        // Round 0 must equal the legacy form so every existing block
+        // remains valid; fallback rounds get distinct, ungrindable seeds.
+        assert_eq!(slot_input_at_round("beacon", 7, 0), slot_input("beacon", 7));
+        assert_ne!(
+            slot_input_at_round("beacon", 7, 1),
+            slot_input_at_round("beacon", 7, 2)
+        );
+        assert_ne!(slot_input_at_round("beacon", 7, 1), slot_input("beacon", 7));
     }
 
     #[test]

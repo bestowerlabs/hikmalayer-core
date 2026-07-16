@@ -38,19 +38,43 @@ signing conventions. It provides:
 - **Peer reputation & banning.** Useful blocks/transactions raise a peer's score, invalid
   or malformed messages lower it, and repeat offenders are auto-banned; an optional
   `P2P_ALLOWLIST` restricts participation to named validator node ids.
-- **Snapshots & checkpoints.** `GET /snapshot` exports the tip state with its
+- **Snapshots, checkpoints & fast-sync.** `GET /snapshot` exports the tip state with its
   authenticating commitments; `GET /checkpoint` returns a pinnable finalized
-  (height, block_hash, state_root) triple for weak-subjectivity anchoring.
+  (height, block_hash, state_root) triple for weak-subjectivity anchoring;
+  `GET /checkpoint/bundle` serves a self-verifying **checkpoint bundle** (a
+  retarget-boundary anchor + its state + the forward blocks to the tip). A new
+  node started with `HIKMALAYER_CHECKPOINT=<bundle.json>` boots directly from
+  that anchor — skipping full genesis replay — and reconstructs a byte-identical
+  state root, randomness beacon, and difficulty, then keeps mining. The anchor is
+  pinned to a retarget boundary so difficulty math stays exact under pruning.
 - **Permissionless slashing with an unbonding guarantee:** anyone holding a proof that a
   validator signed two blocks at the same height can submit it; the offender's stake is
   burned on-chain. Withdrawn stake unbonds over 20 blocks and stays slashable for the
   entire slashing window — misbehaving stake can never exit before punishment.
-- **Fee economics + DoS bounds.** Flat per-transaction fee paid to the block validator;
-  mempool cap, per-block transaction cap, and request-body limits.
+- **Dynamic fee market + DoS bounds.** A congestion-responsive **base fee**
+  (EIP-1559-style, ±12.5%/block toward a target block fullness) is charged per
+  value-bearing transaction and paid to the block validator. The base fee lives
+  in the state root, so every node recomputes the identical fee — a consensus-
+  enforced fee market on a hybrid PoW+PoS+VRF chain. Plus mempool, per-block,
+  and request-body caps. Query the live fee at `GET /fees`.
 - **Self-adjusting difficulty.** PoW difficulty retargets deterministically every 10
   blocks toward a 15-second block time — consensus-validated, not operator-set — and
   mining runs off the async executor so the node stays responsive.
-- Block rewards minted to the producing validator on block acceptance.
+- **Liveness-guaranteed leader rotation.** The VRF-selected leader for each height is
+  the primary producer; if it hasn't produced within a 30-second slot timeout, the next
+  round's leader becomes eligible (and so on), so **an offline validator can delay the
+  chain by at most one timeout — never stall it**. Rounds are derived from consensus-
+  constrained block timestamps (a block may never predate its parent), each round has
+  its own ungrindable VRF seed, and validation enforces that a block is produced by
+  the smallest eligible round's leader with a VRF bound to exactly that round.
+- **Restart-free credential rotation (R-05).** Optional HMAC-signed, self-expiring
+  admin/P2P tokens (minted offline with `mint_token`) are accepted alongside static
+  bearer tokens; verification is stateless, constant-time, and fail-closed.
+- **Bitcoin-style halving emission.** The block reward minted to the producing
+  validator halves every 1,000,000 blocks (`reward = BLOCK_REWARD >> (height /
+  HALVING_INTERVAL)`), giving a fixed, disinflationary supply schedule that trends
+  to zero. The reward amount for each height is consensus-verified, so no node can
+  mint more than the schedule allows.
 - An offline wallet/validator signing CLI (`hikma-wallet`) — private keys never touch
   the node or the network.
 - Persistence to disk (chain only; balances/stakes/nonces are replayed on startup).
@@ -132,6 +156,8 @@ Hikmalayer Core is developed in phases:
 - **Phase 7**: VRF unbiasable leader election + Proof-of-Credential registry.
 - **Phase 8**: Unbonding + slashing window, tx fees, difficulty retargeting, DoS bounds.
 - **Phase 9**: Signed P2P identity, peer scoring/banning, snapshots/checkpoints, observability.
+- **Phase 10**: Bitcoin-style halving emission + checkpoint fast-sync/pruning (boundary-anchored, self-verifying).
+- **Phase 11**: Liveness-guaranteed leader rotation (slot-timeout fallback), timestamp monotonicity, R-05 signed self-expiring tokens, atomic persistence.
 - **Mainnet (pending)**: External audit + adversarial testnet, economic modeling, ops hardening.
 
 
@@ -448,6 +474,8 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 | Phase 7 | ✅ VRF randomness beacon (unbiasable leader election) + Proof-of-Credential registry |
 | Phase 8 | ✅ Unbonding + slashing window, tx fees, difficulty retargeting, mempool/DoS bounds, async mining |
 | Phase 9 | ✅ Signed P2P identity, peer scoring/banning, allow-list, snapshots/checkpoints, observability |
+| Phase 10 | ✅ Bitcoin-style halving emission + boundary-anchored checkpoint fast-sync/pruning (self-verifying, byte-identical convergence) |
+| Phase 11 | ✅ Slot-timeout leader rotation (offline leader can never stall the chain — live-verified), timestamp monotonicity, R-05 signed tokens, atomic persistence |
 | Mainnet | 🚧 External audit + adversarial testnet, economic modeling, ops hardening (see `docs/mainnet_readiness.md`) |
 
 

@@ -43,12 +43,17 @@ pub fn load_state() -> Option<AppSnapshot> {
     serde_json::from_str(&contents).ok()
 }
 
+/// Atomic persistence (HM-05): serialize to a temp file in the same
+/// directory, then rename over the target. A crash mid-write can never
+/// leave a truncated/corrupt state file — the old snapshot survives until
+/// the new one is fully on disk.
 pub fn save_state(snapshot: &AppSnapshot) -> std::io::Result<()> {
     let path = state_path();
     if let Some(parent) = Path::new(&path).parent() {
         fs::create_dir_all(parent)?;
     }
-    let data = serde_json::to_string_pretty(snapshot)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-    fs::write(path, data)
+    let data = serde_json::to_string_pretty(snapshot).map_err(std::io::Error::other)?;
+    let tmp_path = format!("{}.tmp", path);
+    fs::write(&tmp_path, data)?;
+    fs::rename(&tmp_path, path)
 }

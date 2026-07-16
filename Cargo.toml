@@ -1,28 +1,17 @@
 [package]
-name = "hikmalayer"
+name = "hikmalayer_r05"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.37", features = ["full"] }
-axum = "0.8.4"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+hmac = "0.12"
 sha2 = "0.10"
-chrono = { version = "0.4", features = ["serde"] }
-rand = "0.9.2"
-uuid = { version = "1", features = ["v4"] }
-tower = "0.4"
-tower-http = { version = "0.6.6", features = ["cors"] }
-reqwest = { version = "0.12", features = ["json"] }
-
-# Authentication dependencies
-secp256k1 = { version = "0.28", features = ["recovery", "rand"] }
-sha3 = "0.10"
+subtle = "2.5"
 hex = "0.4"
-jsonwebtoken = "9.2"  # Optional: for JWT tokens instead of UUIDs
+base64 = "0.21"
+http = "1.1"
+rand = "0.8"
 
-# Optional: For more secure session management
-argon2 = "0.5"        # For password hashing if you add password auth
-base64 = "0.21"       # For encoding/decoding
-schnorrkel = "0.11"
+[[bin]]
+name = "mint_token"
+path = "src/bin/mint_token.rs"

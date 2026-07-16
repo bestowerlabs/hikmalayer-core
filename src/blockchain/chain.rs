@@ -2,7 +2,7 @@ use super::block::Block;
 use super::state::ChainState;
 use super::transaction::{Transaction, TransactionType};
 use crate::consensus::{pos, pow, vrf};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Maximum tolerated clock skew (seconds) for incoming block timestamps.
@@ -16,6 +16,17 @@ pub const TARGET_BLOCK_SECONDS: i64 = 15;
 
 /// Blocks between deterministic difficulty adjustments.
 pub const RETARGET_INTERVAL: u64 = 10;
+
+/// Liveness rotation: if the selected leader has not produced within this
+/// many seconds of the parent block, the next round's leader also becomes
+/// eligible. Rounds accumulate (round r opens at r × timeout), so a dead
+/// validator can delay the chain by at most one timeout, never stall it.
+pub const SLOT_TIMEOUT_SECONDS: i64 = 30;
+
+/// Upper bound on fallback rounds considered per height. Bounds validation
+/// work; with the whole validator set cycled through well before the cap,
+/// liveness never depends on rounds beyond it.
+pub const MAX_SLOT_ROUNDS: u64 = 16;
 
 /// Deterministic difficulty adjustment: compare the average interval of the
 /// last window against the target and step by at most 1, inside PoW bounds.
@@ -343,17 +354,39 @@ impl Blockchain {
     /// Full consensus validation of a single non-genesis block against its
     /// expected position, the state at its parent, and the randomness beacon
     /// at its parent. On success returns the post-execution state.
+    /// Number of leader rounds open for a block produced at `block_ts`,
+    /// given its parent's timestamp. Round r opens r × SLOT_TIMEOUT_SECONDS
+    /// after the parent; the count is capped at MAX_SLOT_ROUNDS.
+    fn open_rounds(parent_ts: DateTime<Utc>, block_ts: DateTime<Utc>) -> u64 {
+        let elapsed = (block_ts - parent_ts).num_seconds();
+        if elapsed <= 0 {
+            return 0;
+        }
+        ((elapsed / SLOT_TIMEOUT_SECONDS) as u64).min(MAX_SLOT_ROUNDS)
+    }
+
     fn validate_block_at(
         block: &Block,
         expected_index: u64,
         expected_previous_hash: &str,
         parent_state: &ChainState,
         parent_randomness: &str,
+        parent_timestamp: DateTime<Utc>,
         expected_difficulty: usize,
     ) -> Result<ChainState, BlockError> {
         if block.index != expected_index {
             return Err(BlockError::structural(
                 "Block index does not match chain tip",
+            ));
+        }
+
+        // Timestamps are consensus-constrained in BOTH directions: the
+        // future is bounded by MAX_TIMESTAMP_SKEW (candidate check), and a
+        // block may never predate its parent — otherwise a producer could
+        // backdate timestamps to manipulate difficulty retargeting.
+        if block.timestamp < parent_timestamp {
+            return Err(BlockError::slashable(
+                "Block timestamp precedes its parent",
             ));
         }
 
@@ -383,22 +416,43 @@ impl Blockchain {
             ));
         }
 
-        // PoS: the validator set is the ON-CHAIN set at the parent state,
-        // and the slot seed comes from the VRF randomness beacon — the
-        // producer of the parent block could not grind it.
+        // PoS with liveness rotation: the validator set is the ON-CHAIN set
+        // at the parent state, and every slot seed comes from the VRF
+        // randomness beacon — the producer of the parent block could not
+        // grind it. Round 0's leader is the primary; each elapsed
+        // SLOT_TIMEOUT opens the next round's leader as a fallback so an
+        // offline validator can never stall the chain. The block must be
+        // produced by the SMALLEST open round (per the block's own,
+        // parent-bounded timestamp) that selects its validator, and its VRF
+        // must verify against exactly that round's slot input.
         let validator_set = parent_state.validator_set();
-        let slot_input = vrf::slot_input(parent_randomness, block.index);
-        let expected_validator = pos::select_staker_with_seed(&slot_input, &validator_set);
-        if expected_validator.is_none() {
+        if pos::select_staker_with_seed(
+            &vrf::slot_input(parent_randomness, block.index),
+            &validator_set,
+        )
+        .is_none()
+        {
             return Err(BlockError::structural(
                 "No validators registered at parent state",
             ));
         }
-        if expected_validator != block.validator {
-            return Err(BlockError::slashable(
-                "Block validator does not match PoS selection",
-            ));
+        let claimed_validator = block.validator.as_deref().unwrap();
+        let rounds = Self::open_rounds(parent_timestamp, block.timestamp);
+        let mut slot_input = None;
+        for round in 0..=rounds {
+            let candidate = vrf::slot_input_at_round(parent_randomness, block.index, round);
+            if pos::select_staker_with_seed(&candidate, &validator_set).as_deref()
+                == Some(claimed_validator)
+            {
+                slot_input = Some(candidate);
+                break;
+            }
         }
+        let Some(slot_input) = slot_input else {
+            return Err(BlockError::slashable(
+                "Block validator does not match PoS selection for any open round",
+            ));
+        };
 
         // The block must be signed with the validator's on-chain key.
         let validator = block.validator.as_ref().unwrap();
@@ -499,6 +553,11 @@ impl Blockchain {
         if block.timestamp > now + Duration::seconds(MAX_TIMESTAMP_SKEW_SECONDS) {
             return Err("Block timestamp is too far in the future".to_string());
         }
+        let parent_timestamp = self
+            .blocks
+            .last()
+            .map(|tip| tip.timestamp)
+            .ok_or_else(|| "Chain is empty".to_string())?;
 
         Self::validate_block_at(
             block,
@@ -506,6 +565,7 @@ impl Blockchain {
             &self.latest_hash(),
             &self.state,
             &self.randomness,
+            parent_timestamp,
             self.current_difficulty,
         )
         .map_err(|err| err.reason)
@@ -515,6 +575,45 @@ impl Blockchain {
     /// selected validator can compute its VRF proof offline.
     pub fn next_slot_input(&self) -> String {
         vrf::slot_input(&self.randomness, self.next_index())
+    }
+
+    /// Leader-eligibility for `validator` at the next height as of now: the
+    /// smallest open round whose PoS selection picks it. Returns that
+    /// round's (round, slot_input) when eligible, None otherwise. Mirrors
+    /// the consensus rule in `validate_block_at`.
+    pub fn eligible_slot_for(&self, validator: &str) -> Option<(u64, String)> {
+        let parent_ts = self.blocks.last()?.timestamp;
+        let rounds = Self::open_rounds(parent_ts, Utc::now());
+        let validator_set = self.state.validator_set();
+        for round in 0..=rounds {
+            let input = vrf::slot_input_at_round(&self.randomness, self.next_index(), round);
+            if pos::select_staker_with_seed(&input, &validator_set).as_deref() == Some(validator) {
+                return Some((round, input));
+            }
+        }
+        None
+    }
+
+    /// The leaders currently allowed to produce the next block, one per open
+    /// round in priority order (round 0 = primary, later rounds = timeout
+    /// fallbacks). Each entry is (round, validator, slot_input); a validator
+    /// appears only at its smallest eligible round.
+    pub fn open_leaders(&self) -> Vec<(u64, String, String)> {
+        let Some(parent_ts) = self.blocks.last().map(|tip| tip.timestamp) else {
+            return Vec::new();
+        };
+        let rounds = Self::open_rounds(parent_ts, Utc::now());
+        let validator_set = self.state.validator_set();
+        let mut leaders: Vec<(u64, String, String)> = Vec::new();
+        for round in 0..=rounds {
+            let input = vrf::slot_input_at_round(&self.randomness, self.next_index(), round);
+            if let Some(validator) = pos::select_staker_with_seed(&input, &validator_set) {
+                if !leaders.iter().any(|(_, v, _)| *v == validator) {
+                    leaders.push((round, validator, input));
+                }
+            }
+        }
+        leaders
     }
 
     /// Cheap integrity probe for hot read endpoints: verifies the tip
@@ -587,6 +686,7 @@ impl Blockchain {
                 &previous.hash,
                 &state,
                 &randomness,
+                previous.timestamp,
                 difficulty,
             )
             .map_err(|error| (i, error))?;
@@ -967,6 +1067,176 @@ mod tests {
         for _ in 0..4 {
             mine_valid_block(&mut chain);
         }
+        assert!(chain.is_valid());
+    }
+
+    /// Build a reward-only block for `validator` at the next height with an
+    /// explicit timestamp, signed and carrying a VRF proof over `slot_input`.
+    fn build_block_at(
+        chain: &Blockchain,
+        validator: &str,
+        private_key: &str,
+        slot_input: &str,
+        timestamp: chrono::DateTime<Utc>,
+    ) -> Block {
+        let height = chain.next_index();
+        let mut post = chain.state.clone();
+        let reward = Transaction::new_reward(validator, height);
+        post.apply_transaction(&reward, height).unwrap();
+        post.end_block(height, validator);
+        let public_key = chain.state.stakers.get(validator).unwrap().public_key.clone();
+
+        let mut block = Block::new_at(
+            timestamp,
+            height,
+            vec![serde_json::to_string(&reward).unwrap()],
+            chain.latest_hash(),
+            chain.current_difficulty,
+            Some(validator.to_string()),
+            Some(public_key),
+            None,
+            post.state_root(),
+        );
+        let (vrf_output, vrf_proof) = vrf::prove(slot_input, private_key).unwrap();
+        block.vrf_output = Some(vrf_output);
+        block.vrf_proof = Some(vrf_proof);
+        block.validator_signature =
+            Some(pos::sign_block_hash(&block.hash, private_key).unwrap());
+        block
+    }
+
+    #[test]
+    fn backdated_block_timestamp_is_rejected() {
+        let mut chain = Blockchain::default();
+        mine_valid_block(&mut chain); // parent now has a fresh timestamp
+        let (t_addr, _, t_key) = treasury();
+
+        let parent_ts = chain.blocks.last().unwrap().timestamp;
+        let input = chain.next_slot_input();
+        let block = build_block_at(
+            &chain,
+            &t_addr,
+            &t_key,
+            &input,
+            parent_ts - Duration::seconds(600),
+        );
+
+        let err = chain.validate_block_candidate(&block).unwrap_err();
+        assert!(err.contains("precedes its parent"), "got: {err}");
+    }
+
+    #[test]
+    fn fallback_leader_rotates_in_after_slot_timeout() {
+        let mut chain = Blockchain::default();
+        let (t_addr, t_pub, t_key) = treasury();
+        let (v_addr, v_pub, v_key) = wallet(2);
+
+        // Fund and stake a second validator with comparable weight so both
+        // validators show up as leaders across rounds.
+        let fund = signed_transfer((&t_addr, &t_pub, &t_key), &v_addr, 900, 1);
+        mine_block_with(&mut chain, vec![fund]).unwrap();
+        let mut stake = Transaction::new(
+            Some(v_addr.clone()),
+            STAKING_POOL_ACCOUNT.to_string(),
+            800,
+            TransactionType::Stake,
+        );
+        stake.nonce = 1;
+        stake.public_key = Some(v_pub.clone());
+        let v_vrf = vrf::derive_vrf_public_key(&v_key).unwrap();
+        stake.vrf_public_key = Some(v_vrf.clone());
+        let message = Transaction::stake_signing_message(&v_addr, 800, 1, &v_vrf);
+        stake.signature = Some(pos::sign_message(&message, &v_key).unwrap());
+        mine_block_with(&mut chain, vec![stake]).unwrap();
+        assert_eq!(chain.state.validator_set().len(), 2);
+
+        // Advance until round 0 and round 1 select DIFFERENT leaders.
+        let mut guard = 0;
+        loop {
+            let set = chain.state.validator_set();
+            let height = chain.next_index();
+            let l0 = pos::select_staker_with_seed(
+                &vrf::slot_input_at_round(&chain.randomness, height, 0),
+                &set,
+            )
+            .unwrap();
+            let l1 = pos::select_staker_with_seed(
+                &vrf::slot_input_at_round(&chain.randomness, height, 1),
+                &set,
+            )
+            .unwrap();
+            if l0 != l1 {
+                break;
+            }
+            mine_valid_block(&mut chain);
+            guard += 1;
+            assert!(guard < 200, "never found differing round leaders");
+        }
+
+        let height = chain.next_index();
+        let set = chain.state.validator_set();
+        let input1 = vrf::slot_input_at_round(&chain.randomness, height, 1);
+        let leader1 = pos::select_staker_with_seed(&input1, &set).unwrap();
+        let key1 = keyring()
+            .into_iter()
+            .find(|(addr, _)| *addr == leader1)
+            .map(|(_, key)| key)
+            .unwrap();
+        let parent_ts = chain.blocks.last().unwrap().timestamp;
+
+        // BEFORE the timeout only round 0 is open: the fallback leader's
+        // block must be rejected.
+        let early = build_block_at(
+            &chain,
+            &leader1,
+            &key1,
+            &input1,
+            parent_ts + Duration::seconds(1),
+        );
+        let err = chain.validate_block_candidate(&early).unwrap_err();
+        assert!(err.contains("any open round"), "got: {err}");
+
+        // A fallback leader may not smuggle a round-0 VRF either: with the
+        // timeout elapsed, its smallest eligible round is 1, so the VRF must
+        // be bound to the round-1 slot input.
+        let input0 = vrf::slot_input_at_round(&chain.randomness, height, 0);
+        let wrong_vrf = build_block_at(
+            &chain,
+            &leader1,
+            &key1,
+            &input0,
+            parent_ts + Duration::seconds(SLOT_TIMEOUT_SECONDS + 1),
+        );
+        assert!(chain.validate_block_candidate(&wrong_vrf).is_err());
+
+        // AFTER the timeout, the round-1 leader with a round-1 VRF is a
+        // fully valid producer — liveness is preserved.
+        let late = build_block_at(
+            &chain,
+            &leader1,
+            &key1,
+            &input1,
+            parent_ts + Duration::seconds(SLOT_TIMEOUT_SECONDS + 1),
+        );
+        let post_state = chain.validate_block_candidate(&late).expect("fallback accepted");
+        chain.commit_block(late, post_state);
+        assert!(chain.is_valid(), "full replay accepts the fallback block");
+
+        // And the chain keeps extending normally afterwards (timestamps stay
+        // monotonic relative to the fallback block).
+        let next_height = chain.next_index();
+        let set = chain.state.validator_set();
+        let next_input = vrf::slot_input_at_round(&chain.randomness, next_height, 0);
+        let next_leader = pos::select_staker_with_seed(&next_input, &set).unwrap();
+        let next_key = keyring()
+            .into_iter()
+            .find(|(addr, _)| *addr == next_leader)
+            .map(|(_, key)| key)
+            .unwrap();
+        let next_ts = chain.blocks.last().unwrap().timestamp + Duration::seconds(1);
+        let next_block = build_block_at(&chain, &next_leader, &next_key, &next_input, next_ts);
+        let post = chain.validate_block_candidate(&next_block).expect("chain extends");
+        chain.commit_block(next_block, post);
         assert!(chain.is_valid());
     }
 

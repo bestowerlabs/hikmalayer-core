@@ -60,8 +60,13 @@ derived from state.
 account; it requires the node to hold `TREASURY_PRIVATE_KEY` (dev only).
 
 **Mining.** `POST /mine` produces a block only when the node's own
-`VALIDATOR_PRIVATE_KEY` identity is the PoS-selected validator. External
-validators use `POST /mine/propose` (returns the PoW-mined unsigned block, whose
+`VALIDATOR_PRIVATE_KEY` identity is an **eligible leader**: the VRF-selected
+primary for the height, or — after each elapsed 30s slot timeout — the next
+round's fallback leader, so an offline validator can never stall the chain.
+Operators should drive `/mine` on every validator node (the testnet script
+does); ineligible nodes answer with an informative `info` status. External
+validators use `POST /mine/propose` (optionally `?validator=<address>` to plan
+for a specific eligible leader; returns the PoW-mined unsigned block, whose
 `state_root` already reflects execution, plus its hash), sign the hash offline
 (`hikma-wallet sign-block`), and submit to `POST /mine/submit`. Every accepted
 block mints a **halving** reward to its validator: `reward = BLOCK_REWARD >>
@@ -97,6 +102,13 @@ exact under pruning, and the anchor's `state_root` must match its embedded state
 or import is rejected; every forward block is re-validated against consensus on
 load. A persisted local chain always takes precedence over the bundle, so this
 only fast-syncs a genuinely fresh node.
+
+**Authorization (R-05).** Admin/P2P endpoints accept either the static bearer
+tokens (`ADMIN_TOKEN`/`P2P_TOKEN`, with `_CURRENT`/`_PREVIOUS` rotation) or —
+when `ADMIN_TOKEN_SIGNING_KEY`/`P2P_TOKEN_SIGNING_KEY` are configured —
+HMAC-signed **self-expiring** tokens minted offline with
+`cargo run --bin mint_token -- --scope admin --ttl 86400`. Signed-token
+verification is stateless, scope-bound, constant-time, and fail-closed.
 
 **New/changed endpoints:** `GET /blockchain/state`, `POST /slashing/equivocation`,
 `POST /tokens/faucet` (admin), `GET /tokens/nonce/{account}`, `POST /mine/propose`,

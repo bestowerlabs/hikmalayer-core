@@ -29,6 +29,9 @@ is a launch blocker until closed.
 | Unbonding | Withdrawn stake stays locked and slashable for UNBONDING_BLOCKS before release; exit only completes when nothing remains bonded or unbonding |
 | Slashing window | Equivocation proofs accepted only within SLASHING_WINDOW_BLOCKS (= unbonding period), so misbehaving stake can never exit before punishment |
 | Difficulty retargeting | Deterministic per-chain schedule (every 10 blocks toward 15s target); block difficulty is consensus-validated, not operator-set |
+| Liveness (leader rotation) | Slot-timeout fallback: the VRF-selected primary leader has 30s to produce; each timeout opens the next round's leader, so an offline validator delays the chain by at most one timeout — live-verified by killing a validator mid-network. Block timestamps are consensus-constrained in both directions (never before the parent, bounded future skew), closing retarget manipulation |
+| Credential rotation (R-05) | Optional HMAC-signed self-expiring admin/P2P tokens minted offline (`mint_token`); stateless, scope-bound, constant-time, fail-closed verification alongside static token rotation |
+| Atomic persistence (HM-05) | `save_state` writes to a temp file and renames — a crash mid-write can never corrupt the node's state file |
 | Node responsiveness | PoW mining runs on the blocking thread pool with a tip-moved recheck; hot reads use an O(1) integrity probe |
 | DoS bounds | Mempool cap (1,000 txs), per-block tx cap (100), 1 MiB request-body limit |
 | P2P node identity | Every gossip envelope is signed by the sender's node key; `node_id` = derived address; `P2P_REQUIRE_IDENTITY=true` rejects unsigned envelopes (per-node keypair handshake atop the bearer token) |
@@ -37,7 +40,7 @@ is a launch blocker until closed.
 | Checkpoint fast-sync / pruning | `GET /checkpoint/bundle` (p2p) serves a self-verifying bundle (retarget-boundary anchor + state + forward blocks); `HIKMALAYER_CHECKPOINT=<bundle.json>` boots a fresh node from the anchor without full genesis replay and reconstructs a byte-identical state root, randomness beacon, and difficulty; anchor pinned to a retarget boundary, state-root-bound, forward blocks re-validated; a persisted local chain always takes precedence |
 | Observability | Metrics include blocks mined/received/rejected, reorgs, gossip, txs, slashes, peers banned, invalid-from-peers; structured startup logging of identity/enforcement |
 | Tooling | `hikma-wallet` offline keygen/signing; propose/sign/submit flow for external validators |
-| Tests | 78 automated tests across consensus, state machine, security, replay, fork choice, slashing, emission, checkpoint fast-sync, and API flows |
+| Tests | 90 automated tests across consensus, state machine, security, replay, fork choice, slashing, emission, checkpoint fast-sync, leader rotation, token auth, and API flows |
 
 ## 🚧 Remaining before mainnet
 

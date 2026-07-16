@@ -92,7 +92,7 @@ impl Block {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn new_at(
+    pub(crate) fn new_at(
         timestamp: DateTime<Utc>,
         index: u64,
         transactions: Vec<String>,

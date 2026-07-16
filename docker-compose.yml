@@ -7,6 +7,8 @@ x-common-env: &common-env
   P2P_TOKEN: ${P2P_TOKEN}
   ADMIN_TOKEN: ${ADMIN_TOKEN}
   RUST_LOG: info
+  P2P_ALLOWLIST: ${P2P_ALLOWLIST}
+  P2P_REQUIRE_IDENTITY: ${P2P_REQUIRE_IDENTITY}
 
 services:
   bootnode:

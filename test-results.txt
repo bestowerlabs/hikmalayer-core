@@ -1,0 +1,95 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.36s
+     Running unittests src\lib.rs (target\debug\deps\hikmalayer-75904b4047f4ff79.exe)
+
+running 70 tests
+test api::routes::tests::difficulty_is_consensus_derived_not_admin_set ... ok
+test api::routes::tests::p2p_endpoints_reject_missing_token_and_replays ... ok
+test api::routes::tests::mempool_rejects_when_full ... ok
+test api::routes::tests::gossiped_transactions_are_validated_and_queued ... ok
+test api::routes::tests::repeated_invalid_gossip_bans_the_peer ... ok
+test api::routes::tests::submit_rejects_unsigned_or_forged_blocks ... ok
+test api::routes::tests::transfer_with_wrong_sender_binding_is_rejected ... ok
+test auth::signature::tests::verifies_native_signatures_and_rejects_mismatches ... ok
+test api::routes::tests::transfer_without_signature_is_rejected ... ok
+test blockchain::block::tests::tampering_with_transactions_breaks_integrity ... ok
+test blockchain::block::tests::tampering_with_state_root_breaks_pow ... ok
+test blockchain::block::tests::genesis_is_deterministic ... ok
+test blockchain::block::tests::test_block_creation ... ok
+test api::routes::tests::signed_transfer_executes_on_chain_and_replay_fails ... ok
+test blockchain::block::tests::zero_difficulty_blocks_are_rejected ... ok
+test api::routes::tests::snapshot_and_checkpoint_expose_consistent_commitments ... ok
+test api::routes::tests::faucet_requires_admin_and_treasury_key ... ok
+test api::routes::tests::submit_rejects_forged_state_root ... ok
+test api::routes::tests::propose_and_submit_flow_produces_valid_block ... ok
+test api::routes::tests::mine_with_local_validator_key_end_to_end ... ok
+test api::routes::tests::equivocation_endpoint_slashes_on_chain ... ok
+test api::routes::tests::credential_lifecycle_on_chain ... ok
+test blockchain::chain::tests::rejects_future_timestamps ... ok
+test blockchain::chain::tests::detects_tampered_transactions ... ok
+test api::routes::tests::on_chain_staking_and_withdrawal_flow ... ok
+test blockchain::chain::tests::equivocation_proof_slashes_validator_on_chain ... ok
+test blockchain::chain::tests::rejects_forged_state_root ... ok
+test blockchain::state::tests::fees_flow_to_the_block_validator ... ok
+test blockchain::state::tests::genesis_allocates_supply_and_registers_validator ... ok
+test blockchain::state::tests::reward_mints_supply ... ok
+test blockchain::state::tests::stake_withdraw_unbonding_lifecycle ... ok
+test blockchain::chain::tests::rejects_unsigned_candidate_and_wrong_key ... ok
+test blockchain::state::tests::transfer_rejects_overdraft ... ok
+test blockchain::state::tests::state_root_is_deterministic_and_sensitive ... ok
+test blockchain::state::tests::transfer_updates_balances_and_nonce ... ok
+test blockchain::state::tests::slash_reaches_unbonding_stake_and_respects_window ... ok
+test blockchain::transaction::tests::reward_verification_enforces_recipient_and_amount ... ok
+test blockchain::transaction::tests::test_transaction_creation ... ok
+test blockchain::state::tests::withdraw_rejects_wrong_key ... ok
+test blockchain::transaction::tests::transfer_rejects_key_not_matching_sender ... ok
+test blockchain::transaction::tests::stake_verification_binds_pool_and_signature ... ok
+test consensus::pos::tests::derive_address_is_native_and_stable ... ok
+test consensus::pos::tests::selection_is_deterministic_and_height_salted ... ok
+test consensus::pos::tests::slash_reduces_stake ... ok
+test consensus::pos::tests::test_select_staker ... ok
+test blockchain::transaction::tests::transfer_verification_requires_valid_native_signature ... ok
+test consensus::pow::tests::clamps_out_of_range_difficulty ... ok
+test consensus::pos::tests::message_signatures_roundtrip ... ok
+test consensus::pow::tests::work_grows_with_difficulty ... ok
+test consensus::vrf::tests::beacon_evolves_with_outputs ... ok
+test consensus::pow::tests::mined_block_satisfies_difficulty ... ok
+test p2p::peerbook::tests::allow_list_excludes_unlisted_nodes ... ok
+test p2p::peerbook::tests::good_and_bad_move_the_score ... ok
+test p2p::peerbook::tests::repeated_misbehavior_bans_the_peer ... ok
+test p2p::protocol::tests::rejects_bad_version ... ok
+test p2p::protocol::tests::require_identity_rejects_unsigned ... ok
+test p2p::protocol::tests::seen_cache_rejects_replays_and_evicts ... ok
+test p2p::protocol::tests::signed_envelope_roundtrips_and_binds_identity ... ok
+test p2p::protocol::tests::validates_fresh_envelope ... ok
+test blockchain::chain::tests::randomness_beacon_evolves_and_replays ... ok
+test consensus::vrf::tests::output_is_deterministic_and_ungrindable ... ok
+test blockchain::chain::tests::chain_grows_and_replays_deterministically ... ok
+test blockchain::chain::tests::rejects_missing_or_forged_vrf ... ok
+test blockchain::chain::tests::transfers_execute_on_chain ... ok
+test blockchain::chain::tests::fork_choice_ignores_lighter_chain ... ok
+test consensus::vrf::tests::prove_verify_roundtrip ... ok
+test blockchain::chain::tests::fork_choice_protects_finalized_history ... ok
+test blockchain::chain::tests::fork_choice_adopts_heavier_chain_and_rebuilds_state ... ok
+test blockchain::chain::tests::on_chain_staking_admits_new_validator ... ok
+test blockchain::chain::tests::difficulty_retargets_deterministically ... ok
+
+test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.21s
+
+     Running unittests src\bin\hikma-wallet.rs (target\debug\deps\hikma_wallet-8fe0b78d6a78697c.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\hikmalayer-7341c4b64f029def.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hikmalayer
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

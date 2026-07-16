@@ -2,11 +2,13 @@
 //!
 //! Token format: base64(issued_at:expires_at:scope) . hex(hmac_sha256(payload))
 //!
-//! Replaces the static ADMIN_TOKEN / P2P_TOKEN shared secrets with tokens minted
-//! from a long-lived signing key. Verification is stateless (no DB/session store),
-//! fail-closed if the signing key is missing/malformed, and uses constant-time
-//! signature comparison to avoid timing side channels.
+//! Complements the static ADMIN_TOKEN / P2P_TOKEN shared secrets with tokens
+//! minted from a long-lived signing key (rotate by minting, no restart).
+//! Verification is stateless (no DB/session store), fail-closed if the
+//! signing key is missing/malformed, and uses constant-time signature
+//! comparison to avoid timing side channels.
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,7 +30,7 @@ impl Scope {
         }
     }
 
-    fn from_str(s: &str) -> Option<Self> {
+    fn parse(s: &str) -> Option<Self> {
         match s {
             "admin" => Some(Scope::Admin),
             "p2p" => Some(Scope::P2p),
@@ -46,8 +48,9 @@ pub enum TokenError {
 }
 
 /// Loads a signing key from an env var containing a 64-character hex string
-/// (e.g. generated via `openssl rand -hex 32`). Returns None if unset or malformed,
-/// so callers can fail closed rather than falling back to a default key.
+/// (e.g. generated via `openssl rand -hex 32`). Returns None if unset or
+/// malformed, so callers can fail closed rather than falling back to a
+/// default key.
 pub fn signing_key_from_env(var_name: &str) -> Option<Vec<u8>> {
     let hex_key = std::env::var(var_name).ok()?;
     if hex_key.len() != 64 {
@@ -64,29 +67,32 @@ fn current_timestamp() -> u64 {
 }
 
 /// Mints a new signed token for the given scope with a TTL in seconds.
-/// This is the rotation mechanism: calling this again produces a fresh token
-/// without needing to redeploy or restart the app.
+/// This is the rotation mechanism: calling this again produces a fresh
+/// token without needing to redeploy or restart the node.
 pub fn generate_token(signing_key: &[u8], scope: Scope, ttl_seconds: u64) -> String {
     let issued_at = current_timestamp();
-    let expires_at = issued_at + ttl_seconds;
+    let expires_at = issued_at.saturating_add(ttl_seconds);
     let payload = format!("{}:{}:{}", issued_at, expires_at, scope.as_str());
 
     let mut mac = HmacSha256::new_from_slice(signing_key).expect("HMAC accepts any key length");
     mac.update(payload.as_bytes());
     let signature = mac.finalize().into_bytes();
 
-    let b64_payload = base64::encode(&payload);
-    let hex_sig = hex::encode(signature);
-
-    format!("{}.{}", b64_payload, hex_sig)
+    format!("{}.{}", BASE64.encode(payload.as_bytes()), hex::encode(signature))
 }
 
 /// Verifies a token: signature integrity, scope binding, and expiry.
 /// Rejects on any tamper, mismatch, or expiry — never fails open.
-pub fn verify_token(token: &str, signing_key: &[u8], expected_scope: Scope) -> Result<(), TokenError> {
+pub fn verify_token(
+    token: &str,
+    signing_key: &[u8],
+    expected_scope: Scope,
+) -> Result<(), TokenError> {
     let (b64_payload, hex_sig) = token.split_once('.').ok_or(TokenError::MalformedToken)?;
 
-    let payload_bytes = base64::decode(b64_payload).map_err(|_| TokenError::MalformedToken)?;
+    let payload_bytes = BASE64
+        .decode(b64_payload)
+        .map_err(|_| TokenError::MalformedToken)?;
     let payload = String::from_utf8(payload_bytes).map_err(|_| TokenError::MalformedToken)?;
     let sig_bytes = hex::decode(hex_sig).map_err(|_| TokenError::MalformedToken)?;
 
@@ -94,8 +100,8 @@ pub fn verify_token(token: &str, signing_key: &[u8], expected_scope: Scope) -> R
     mac.update(payload.as_bytes());
     let expected_sig = mac.finalize().into_bytes();
 
-    // Constant-time comparison — same timing-side-channel mitigation as HM-07,
-    // rather than a plain `==` string check.
+    // Constant-time comparison — same timing-side-channel mitigation as the
+    // static-token path, rather than a plain `==` check.
     if expected_sig.as_slice().ct_eq(&sig_bytes).unwrap_u8() != 1 {
         return Err(TokenError::InvalidSignature);
     }
@@ -113,7 +119,7 @@ pub fn verify_token(token: &str, signing_key: &[u8], expected_scope: Scope) -> R
         .map_err(|_| TokenError::MalformedToken)?;
     let scope_str = parts.next().ok_or(TokenError::MalformedToken)?;
 
-    let token_scope = Scope::from_str(scope_str).ok_or(TokenError::MalformedToken)?;
+    let token_scope = Scope::parse(scope_str).ok_or(TokenError::MalformedToken)?;
     if token_scope != expected_scope {
         return Err(TokenError::ScopeMismatch);
     }
@@ -126,7 +132,7 @@ pub fn verify_token(token: &str, signing_key: &[u8], expected_scope: Scope) -> R
 }
 
 /// Convenience boolean wrapper around `verify_token` for call sites that
-/// don't need the specific failure reason (e.g. authorize_admin/authorize_p2p).
+/// don't need the specific failure reason (authorize_admin/authorize_p2p).
 pub fn is_valid(token: &str, signing_key: &[u8], expected_scope: Scope) -> bool {
     verify_token(token, signing_key, expected_scope).is_ok()
 }
@@ -151,14 +157,20 @@ mod tests {
         let key = test_key();
         let token = generate_token(&key, Scope::Admin, 0);
         std::thread::sleep(std::time::Duration::from_secs(1));
-        assert_eq!(verify_token(&token, &key, Scope::Admin), Err(TokenError::Expired));
+        assert_eq!(
+            verify_token(&token, &key, Scope::Admin),
+            Err(TokenError::Expired)
+        );
     }
 
     #[test]
     fn scope_mismatch_rejected() {
         let key = test_key();
         let token = generate_token(&key, Scope::Admin, 3600);
-        assert_eq!(verify_token(&token, &key, Scope::P2p), Err(TokenError::ScopeMismatch));
+        assert_eq!(
+            verify_token(&token, &key, Scope::P2p),
+            Err(TokenError::ScopeMismatch)
+        );
     }
 
     #[test]
@@ -169,7 +181,10 @@ mod tests {
         let bad_sig = "0".repeat(parts[1].len());
         parts[1] = &bad_sig;
         let tampered = parts.join(".");
-        assert_eq!(verify_token(&tampered, &key, Scope::Admin), Err(TokenError::InvalidSignature));
+        assert_eq!(
+            verify_token(&tampered, &key, Scope::Admin),
+            Err(TokenError::InvalidSignature)
+        );
     }
 
     #[test]
@@ -177,9 +192,12 @@ mod tests {
         let key = test_key();
         let token = generate_token(&key, Scope::Admin, 3600);
         let parts: Vec<&str> = token.split('.').collect();
-        let forged_payload = base64::encode("0:9999999999:admin");
+        let forged_payload = BASE64.encode("0:9999999999:admin".as_bytes());
         let tampered = format!("{}.{}", forged_payload, parts[1]);
-        assert_eq!(verify_token(&tampered, &key, Scope::Admin), Err(TokenError::InvalidSignature));
+        assert_eq!(
+            verify_token(&tampered, &key, Scope::Admin),
+            Err(TokenError::InvalidSignature)
+        );
     }
 
     #[test]
@@ -187,7 +205,10 @@ mod tests {
         let key = test_key();
         let other_key = vec![0x24; 32];
         let token = generate_token(&key, Scope::Admin, 3600);
-        assert_eq!(verify_token(&token, &other_key, Scope::Admin), Err(TokenError::InvalidSignature));
+        assert_eq!(
+            verify_token(&token, &other_key, Scope::Admin),
+            Err(TokenError::InvalidSignature)
+        );
     }
 
     #[test]

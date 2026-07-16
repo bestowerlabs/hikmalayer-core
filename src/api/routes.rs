@@ -74,6 +74,11 @@ pub struct AppState {
     /// Accepted bearer tokens (first = current; extras support rotation).
     pub p2p_tokens: Vec<String>,
     pub admin_tokens: Vec<String>,
+    /// R-05: optional HMAC signing keys. When set, self-expiring signed
+    /// tokens (minted via `mint_token`) are accepted alongside the static
+    /// bearer tokens, enabling restart-free rotation with automatic expiry.
+    pub admin_signing_key: Option<Vec<u8>>,
+    pub p2p_signing_key: Option<Vec<u8>>,
     pub p2p_service: Arc<P2PService>,
     /// When true, inbound P2P envelopes must carry a valid node-identity
     /// signature (per-node keypair handshake), not just the bearer token.
@@ -206,6 +211,7 @@ pub struct BlockchainStats {
     pub state_root: String,
     pub total_supply: u64,
     pub burned: u64,
+    pub base_fee: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -303,6 +309,7 @@ pub struct SlashEvidenceResponse {
 pub struct NonceStateResponse {
     pub account: String,
     pub next_nonce: u64,
+    pub base_fee: u64,
 }
 
 #[derive(Serialize)]
@@ -409,12 +416,16 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 fn authorize_p2p(headers: &HeaderMap, state: &AppState) -> bool {
-    if state.p2p_tokens.is_empty() {
-        return false;
-    }
     let Some(supplied) = headers.get("x-p2p-token").and_then(|v| v.to_str().ok()) else {
         return false;
     };
+    // R-05: HMAC-signed self-expiring token (when a signing key is set).
+    if let Some(key) = &state.p2p_signing_key {
+        if crate::auth::token::is_valid(supplied, key, crate::auth::token::Scope::P2p) {
+            return true;
+        }
+    }
+    // Static bearer tokens (constant-time; supports current/previous rotation).
     state.p2p_tokens.iter().any(|t| constant_time_eq(t, supplied))
 }
 
@@ -444,12 +455,16 @@ async fn reward_peer(state: &AppState, node_id: &str) {
 }
 
 fn authorize_admin(headers: &HeaderMap, state: &AppState) -> bool {
-    if state.admin_tokens.is_empty() {
-        return false;
-    }
     let Some(supplied) = headers.get("x-admin-token").and_then(|v| v.to_str().ok()) else {
         return false;
     };
+    // R-05: HMAC-signed self-expiring token (when a signing key is set).
+    if let Some(key) = &state.admin_signing_key {
+        if crate::auth::token::is_valid(supplied, key, crate::auth::token::Scope::Admin) {
+            return true;
+        }
+    }
+    // Static bearer tokens (constant-time; supports current/previous rotation).
     state.admin_tokens.iter().any(|t| constant_time_eq(t, supplied))
 }
 
@@ -523,6 +538,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/tokens/faucet", post(faucet_tokens))
         .route("/tokens/balance/{account}", get(get_token_balance))
         .route("/tokens/nonce/{account}", get(get_account_nonce))
+        .route("/fees", get(get_fees))
         // Blockchain routes
         .route("/blocks", get(get_blocks))
         .route("/blocks/{index}", get(get_block_by_index))
@@ -561,6 +577,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/p2p/peers/scores", get(get_peer_scores))
         .route("/snapshot", get(get_snapshot))
         .route("/checkpoint", get(get_checkpoint))
+        .route("/checkpoint/bundle", get(get_checkpoint_bundle))
         .route("/p2p/protocol", post(receive_protocol_message))
         // Governance & slashing routes
         .route("/governance/config", get(get_governance))
@@ -810,7 +827,7 @@ async fn get_credential_proof(
             "error".to_string()
         },
         credential,
-        height: chain.blocks.len() as u64 - 1,
+        height: chain.tip_index(),
         state_root: chain.state.state_root(),
         block_hash: chain.latest_hash(),
     })
@@ -890,7 +907,7 @@ async fn faucet_tokens(
         let chain = state.chain.lock().await;
         let pending = state.pending_transactions.lock().await;
         let projected =
-            project_pending_state(&chain.state, &pending, chain.blocks.len() as u64);
+            project_pending_state(&chain.state, &pending, chain.next_index());
         projected.nonce_of(&treasury.address) + 1
     };
 
@@ -931,6 +948,24 @@ async fn faucet_tokens(
     }
 }
 
+#[derive(Serialize)]
+pub struct FeesResponse {
+    pub base_fee: u64,
+    pub target_txs: u64,
+    pub max_block_txs: usize,
+}
+
+/// The current dynamic base fee (per value-bearing transaction) and the
+/// congestion parameters that move it.
+async fn get_fees(State(state): State<AppState>) -> Json<FeesResponse> {
+    let chain = state.chain.lock().await;
+    Json(FeesResponse {
+        base_fee: chain.state.base_fee,
+        target_txs: crate::blockchain::state::BASE_FEE_TARGET_TXS,
+        max_block_txs: MAX_BLOCK_TXS,
+    })
+}
+
 async fn get_token_balance(
     State(state): State<AppState>,
     Path(account): Path<String>,
@@ -946,9 +981,10 @@ async fn get_account_nonce(
 ) -> Json<NonceStateResponse> {
     let chain = state.chain.lock().await;
     let pending = state.pending_transactions.lock().await;
-    let projected = project_pending_state(&chain.state, &pending, chain.blocks.len() as u64);
+    let projected = project_pending_state(&chain.state, &pending, chain.next_index());
     Json(NonceStateResponse {
         next_nonce: projected.nonce_of(&account) + 1,
+        base_fee: chain.state.base_fee,
         account,
     })
 }
@@ -990,6 +1026,7 @@ async fn get_blockchain_stats(State(state): State<AppState>) -> Json<BlockchainS
         state_root: chain.state.state_root(),
         total_supply: chain.state.total_supply,
         burned: chain.state.burned,
+        base_fee: chain.state.base_fee,
     })
 }
 
@@ -999,7 +1036,7 @@ async fn get_state_summary(State(state): State<AppState>) -> Json<StateSummaryRe
         .state
         .balance_of(crate::blockchain::state::STAKING_POOL_ACCOUNT);
     Json(StateSummaryResponse {
-        height: chain.blocks.len() as u64 - 1,
+        height: chain.tip_index(),
         state_root: chain.state.state_root(),
         total_supply: chain.state.total_supply,
         burned: chain.state.burned,
@@ -1142,18 +1179,56 @@ struct BlockPlan {
 
 /// Select the validator for the next slot, execute the pending transactions
 /// against the current chain state, and commit to the resulting state root.
-fn plan_block(chain: &Blockchain, pending: &[Transaction]) -> Result<BlockPlan, String> {
+///
+/// Leader rotation: round 0's PoS-selected leader is the primary; every
+/// SLOT_TIMEOUT_SECONDS without a block opens the next round's leader as a
+/// fallback (mirroring consensus validation), so an offline leader can
+/// never stall block production. When `producer` is set (the local /mine
+/// path), the plan is built for that validator at its smallest open round;
+/// otherwise (external propose flow) it targets the highest-priority
+/// currently-open leader.
+fn plan_block(
+    chain: &Blockchain,
+    pending: &[Transaction],
+    producer: Option<&str>,
+) -> Result<BlockPlan, String> {
     let has_only_genesis = chain.blocks.len() == 1;
     if pending.is_empty() && !has_only_genesis {
         return Err("No pending transactions to mine".to_string());
     }
 
-    let validator_set = chain.state.validator_set();
-    let next_index = chain.blocks.len() as u64;
-    // Slot seed from the VRF randomness beacon: unbiasable by grinding.
-    let slot_input = chain.next_slot_input();
-    let validator = pos::select_staker_with_seed(&slot_input, &validator_set)
-        .ok_or_else(|| "No validators available. Stake tokens to become a validator.".to_string())?;
+    let next_index = chain.next_index();
+    // Slot seeds come from the VRF randomness beacon: unbiasable by grinding.
+    let (validator, slot_input) = match producer {
+        Some(addr) => match chain.eligible_slot_for(addr) {
+            Some((_, input)) => (addr.to_string(), input),
+            None => {
+                let primary = chain
+                    .open_leaders()
+                    .into_iter()
+                    .next()
+                    .map(|(_, leader, _)| leader)
+                    .ok_or_else(|| {
+                        "No validators available. Stake tokens to become a validator.".to_string()
+                    })?;
+                return Err(format!(
+                    "PoS: validator {} is not an eligible leader for this slot. Current leader \
+                     is {}; a fallback leader rotates in every {}s without a block.",
+                    addr,
+                    primary,
+                    crate::blockchain::chain::SLOT_TIMEOUT_SECONDS
+                ));
+            }
+        },
+        None => chain
+            .open_leaders()
+            .into_iter()
+            .next()
+            .map(|(_, leader, input)| (leader, input))
+            .ok_or_else(|| {
+                "No validators available. Stake tokens to become a validator.".to_string()
+            })?,
+    };
     let public_key = chain
         .state
         .stakers
@@ -1183,7 +1258,7 @@ fn plan_block(chain: &Blockchain, pending: &[Transaction]) -> Result<BlockPlan, 
         included_ids.push(tx.id.clone());
     }
 
-    let reward = Transaction::new_reward(&validator);
+    let reward = Transaction::new_reward(&validator, next_index);
     post_state
         .apply_transaction(&reward, next_index)
         .map_err(|err| format!("Failed to apply reward: {}", err))?;
@@ -1321,12 +1396,17 @@ async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
     let pending = state.pending_transactions.lock().await;
     let chain = state.chain.lock().await;
 
-    let plan = match plan_block(&chain, &pending) {
+    // Plan for THIS node's validator: eligible at round 0 when it is the
+    // primary leader, or at a later round once the slot timeout has rotated
+    // leadership to it.
+    let plan = match plan_block(&chain, &pending, Some(&validator_key.address)) {
         Ok(plan) => plan,
         Err(message) => {
             drop(chain);
             drop(pending);
-            let status = if message.contains("No pending") {
+            let status = if message.contains("No pending")
+                || message.contains("not an eligible leader")
+            {
                 "info"
             } else {
                 "error"
@@ -1339,22 +1419,6 @@ async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
             });
         }
     };
-
-    if plan.validator != validator_key.address {
-        let message = format!(
-            "PoS selected validator {} for this slot; this node's validator is {}. \
-             The selected validator must produce the block.",
-            plan.validator, validator_key.address
-        );
-        drop(chain);
-        drop(pending);
-        return Json(MiningResponse {
-            status: "info".to_string(),
-            message,
-            block_index: 0,
-            transactions_count: 0,
-        });
-    }
 
     if plan.public_key != validator_key.public_key {
         drop(chain);
@@ -1369,7 +1433,7 @@ async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
     }
 
     let transactions_count = plan.transactions.len();
-    let mine_index = chain.blocks.len() as u64;
+    let mine_index = chain.next_index();
     let mine_prev_hash = chain.latest_hash();
     let mine_difficulty = chain.current_difficulty;
     // Release the locks while PoW runs on the blocking pool.
@@ -1463,7 +1527,7 @@ async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
     let accepted_block = block.clone();
     chain.commit_block(block, post_state);
     chain.apply_finality(finality_depth);
-    let block_index = chain.blocks.len() as u64 - 1;
+    let block_index = chain.tip_index();
 
     // Included transactions leave the pending pool.
     let included: HashSet<String> = plan.included_ids.into_iter().collect();
@@ -1498,11 +1562,22 @@ async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
 /// validator. The validator signs `block_hash` offline (hikma-wallet
 /// sign-block) and submits the signed block to /mine/submit. Chain state is
 /// not modified.
-async fn propose_block(State(state): State<AppState>) -> Json<ProposeBlockResponse> {
+#[derive(Deserialize, Default)]
+pub struct ProposeQuery {
+    /// Optional validator address to plan for. Must be an eligible leader
+    /// (primary, or a fallback whose round has opened). Defaults to the
+    /// highest-priority currently-open leader.
+    pub validator: Option<String>,
+}
+
+async fn propose_block(
+    State(state): State<AppState>,
+    Query(query): Query<ProposeQuery>,
+) -> Json<ProposeBlockResponse> {
     let pending = state.pending_transactions.lock().await;
     let chain = state.chain.lock().await;
 
-    let plan = match plan_block(&chain, &pending) {
+    let plan = match plan_block(&chain, &pending, query.validator.as_deref()) {
         Ok(plan) => plan,
         Err(message) => {
             return Json(ProposeBlockResponse {
@@ -1573,7 +1648,7 @@ async fn submit_block(
     let transactions_count = block.transactions.len();
     chain.commit_block(block, post_state);
     chain.apply_finality(finality_depth);
-    let block_index = chain.blocks.len() as u64 - 1;
+    let block_index = chain.tip_index();
     drop(chain);
 
     prune_pending(&state, std::slice::from_ref(&accepted_block)).await;
@@ -1752,7 +1827,7 @@ async fn get_unbonding(
             .get(&address)
             .cloned()
             .unwrap_or_default(),
-        current_height: chain.blocks.len() as u64 - 1,
+        current_height: chain.tip_index(),
         address,
     })
 }
@@ -1954,7 +2029,7 @@ pub struct SnapshotResponse {
 async fn get_snapshot(State(state): State<AppState>) -> Json<SnapshotResponse> {
     let chain = state.chain.lock().await;
     Json(SnapshotResponse {
-        height: chain.blocks.len() as u64 - 1,
+        height: chain.tip_index(),
         block_hash: chain.latest_hash(),
         state_root: chain.state.state_root(),
         randomness: chain.randomness.clone(),
@@ -1977,13 +2052,29 @@ pub struct CheckpointResponse {
 /// new nodes and light clients anchor to a trusted point.
 async fn get_checkpoint(State(state): State<AppState>) -> Json<CheckpointResponse> {
     let chain = state.chain.lock().await;
-    let height = chain.finalized_height as usize;
-    let block = chain.blocks.get(height).cloned().unwrap_or_else(|| chain.blocks[0].clone());
+    let local = (chain.finalized_height.saturating_sub(chain.base_height)) as usize;
+    let block = chain.blocks.get(local).cloned().unwrap_or_else(|| chain.blocks[0].clone());
     Json(CheckpointResponse {
         finalized_height: chain.finalized_height,
         block_hash: block.hash.clone(),
         state_root: block.state_root.clone(),
     })
+}
+
+/// Export a fast-sync bundle (anchor checkpoint + forward blocks). P2P-gated
+/// because it is heavy; a fresh node imports it via HIKMALAYER_CHECKPOINT.
+async fn get_checkpoint_bundle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::blockchain::chain::CheckpointBundle>, (StatusCode, String)> {
+    if !authorize_p2p(&headers, &state) {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
+    }
+    let chain = state.chain.lock().await;
+    chain
+        .export_bundle()
+        .map(Json)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err))
 }
 
 async fn get_peer_scores(
@@ -2115,7 +2206,7 @@ async fn receive_protocol_message(
             {
                 let chain = state.chain.lock().await;
                 let mut pending = state.pending_transactions.lock().await;
-                let next_height = chain.blocks.len() as u64;
+                let next_height = chain.next_index();
                 let mut projected = project_pending_state(&chain.state, &pending, next_height);
                 if projected.apply_transaction(&transaction, next_height).is_err() {
                     drop(pending);
@@ -2494,6 +2585,8 @@ mod tests {
             peer_book: Arc::new(Mutex::new(PeerBook::new())),
             p2p_tokens: vec![P2P_TOKEN.to_string()],
             admin_tokens: vec![ADMIN_TOKEN.to_string()],
+            admin_signing_key: None,
+            p2p_signing_key: None,
             p2p_service: Arc::new(P2PService::new("node-test".to_string(), None).unwrap()),
             p2p_require_identity: false,
             validator_key: with_local_validator.then(|| treasury.clone()),
@@ -2513,6 +2606,44 @@ mod tests {
         headers
     }
 
+    #[test]
+    fn signed_self_expiring_tokens_authorize_and_expire() {
+        use crate::auth::token::{generate_token, Scope};
+
+        let mut state = test_state(false);
+        let key = vec![0x42u8; 32];
+        state.admin_signing_key = Some(key.clone());
+        state.p2p_signing_key = Some(key.clone());
+
+        // A live signed admin token authorizes admin (not P2P) endpoints,
+        // and static tokens keep working alongside it.
+        let admin_token = generate_token(&key, Scope::Admin, 3600);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-admin-token",
+            HeaderValue::from_str(&admin_token).unwrap(),
+        );
+        assert!(authorize_admin(&headers, &state));
+        assert!(authorize_admin(&admin_headers(), &state));
+
+        let mut cross = HeaderMap::new();
+        cross.insert("x-p2p-token", HeaderValue::from_str(&admin_token).unwrap());
+        assert!(!authorize_p2p(&cross, &state), "admin scope must not open P2P");
+
+        // An expired token is dead — automatic rotation.
+        let expired = generate_token(&key, Scope::Admin, 0);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let mut stale = HeaderMap::new();
+        stale.insert("x-admin-token", HeaderValue::from_str(&expired).unwrap());
+        assert!(!authorize_admin(&stale, &state));
+
+        // A signed P2P token authorizes P2P endpoints.
+        let p2p_token = generate_token(&key, Scope::P2p, 3600);
+        let mut p2p = HeaderMap::new();
+        p2p.insert("x-p2p-token", HeaderValue::from_str(&p2p_token).unwrap());
+        assert!(authorize_p2p(&p2p, &state));
+    }
+
     fn test_wallet(seed: u8) -> (String, String, String) {
         let private_key = hex::encode([seed; 32]);
         let public_key = pos::derive_public_key(&private_key).unwrap();
@@ -2523,7 +2654,7 @@ mod tests {
     /// Mine the next block regardless of which validator is selected, using
     /// the provided keyring.
     async fn mine_next(state: &AppState, keyring: &[(String, String)]) {
-        let proposal = propose_block(State(state.clone())).await;
+        let proposal = propose_block(State(state.clone()), Query(ProposeQuery::default())).await;
         assert_eq!(proposal.0.status, "success", "{}", proposal.0.message);
         let mut block = proposal.0.block.unwrap();
         let selected = proposal.0.selected_validator.unwrap();
@@ -2806,7 +2937,7 @@ mod tests {
     async fn submit_rejects_unsigned_or_forged_blocks() {
         let state = test_state(false);
 
-        let proposal = propose_block(State(state.clone())).await;
+        let proposal = propose_block(State(state.clone()), Query(ProposeQuery::default())).await;
         let mut block = proposal.0.block.unwrap();
 
         // Unsigned submission fails.
@@ -2828,7 +2959,7 @@ mod tests {
         let state = test_state(false);
         let treasury = treasury_key();
 
-        let proposal = propose_block(State(state.clone())).await;
+        let proposal = propose_block(State(state.clone()), Query(ProposeQuery::default())).await;
         let mut block = proposal.0.block.unwrap();
 
         // Forge the state root, re-sign honestly — consensus must catch it.
@@ -2995,6 +3126,20 @@ mod tests {
         let response =
             receive_protocol_message(State(state.clone()), p2p_headers(), Json(envelope)).await;
         assert_eq!(response.0.status, "error");
+    }
+
+    #[tokio::test]
+    async fn fees_endpoint_and_nonce_expose_base_fee() {
+        let state = test_state(false);
+        let fees = get_fees(State(state.clone())).await.0;
+        assert_eq!(fees.base_fee, crate::blockchain::state::TX_FEE);
+        assert_eq!(fees.target_txs, crate::blockchain::state::BASE_FEE_TARGET_TXS);
+
+        let nonce = get_account_nonce(State(state.clone()), Path("hkmx".to_string()))
+            .await
+            .0;
+        assert_eq!(nonce.base_fee, crate::blockchain::state::TX_FEE);
+        assert_eq!(nonce.next_nonce, 1);
     }
 
     #[tokio::test]
@@ -3214,9 +3359,9 @@ mod tests {
         // Produce two conflicting signed blocks at the next height.
         let (block_a, block_b) = {
             let chain = state.chain.lock().await;
-            let reward = Transaction::new_reward(&treasury.address);
-            let mut post = chain.state.clone();
             let next_height = chain.blocks.len() as u64;
+            let reward = Transaction::new_reward(&treasury.address, next_height);
+            let mut post = chain.state.clone();
             post.apply_transaction(&reward, next_height).unwrap();
             post.end_block(next_height, &treasury.address);
             let root = post.state_root();

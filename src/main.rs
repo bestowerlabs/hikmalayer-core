@@ -11,6 +11,47 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
+/// Fast-sync a fresh node from a checkpoint bundle. When `HIKMALAYER_CHECKPOINT`
+/// names a JSON `CheckpointBundle` (as served by `/checkpoint/bundle`), the node
+/// boots from a weak-subjectivity anchor sitting on a retarget boundary instead
+/// of replaying the full chain from genesis. The bundle is self-verifying: the
+/// anchor's `state_root` must match the embedded checkpoint state, and every
+/// forward block is validated against consensus during `rebuild_state`.
+fn checkpoint_chain() -> Option<Blockchain> {
+    let path = std::env::var("HIKMALAYER_CHECKPOINT")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("⚠️  HIKMALAYER_CHECKPOINT set but {} could not be read: {err}", path);
+            return None;
+        }
+    };
+    let bundle = match serde_json::from_slice(&bytes) {
+        Ok(bundle) => bundle,
+        Err(err) => {
+            eprintln!("⚠️  HIKMALAYER_CHECKPOINT {} is not a valid bundle: {err}", path);
+            return None;
+        }
+    };
+    match Blockchain::from_bundle(bundle) {
+        Ok(chain) => {
+            eprintln!(
+                "✅ Fast-synced from checkpoint {} — anchored at height {}, tip {}.",
+                path,
+                chain.base_height,
+                chain.tip_index()
+            );
+            Some(chain)
+        }
+        Err(err) => {
+            eprintln!("⚠️  Checkpoint bundle {} failed verification: {err}", path);
+            None
+        }
+    }
+}
+
 fn fresh_chain(difficulty: usize) -> Blockchain {
     // Genesis network parameters. When unset, the well-known DEV defaults
     // apply — suitable for local networks only.
@@ -57,10 +98,13 @@ async fn main() {
     // Load persisted node state; chain state (balances/stakes/nonces) is
     // deterministically rebuilt from the block history.
     let snapshot = load_state();
-    let mut loaded_chain = snapshot
-        .as_ref()
-        .map(|state| state.chain.clone())
-        .unwrap_or_else(|| fresh_chain(difficulty));
+    let mut loaded_chain = match snapshot.as_ref().map(|state| state.chain.clone()) {
+        // A persisted chain always wins: a running node keeps its own history.
+        Some(chain) => chain,
+        // No local history yet — fast-sync from a checkpoint bundle if one is
+        // configured, otherwise start from a fresh genesis.
+        None => checkpoint_chain().unwrap_or_else(|| fresh_chain(difficulty)),
+    };
     if let Err(err) = loaded_chain.rebuild_state() {
         eprintln!(
             "⚠️  Persisted chain failed state replay ({}). Starting from a fresh genesis.",
@@ -146,11 +190,23 @@ async fn main() {
     let p2p_tokens = load_token_list("P2P_TOKEN", "P2P_TOKEN_CURRENT", "P2P_TOKEN_PREVIOUS");
     let admin_tokens = load_token_list("ADMIN_TOKEN", "ADMIN_TOKEN_CURRENT", "ADMIN_TOKEN_PREVIOUS");
 
-    if p2p_tokens.is_empty() {
-        eprintln!("⚠️  No P2P token set (P2P_TOKEN / P2P_TOKEN_CURRENT): all P2P endpoints will reject requests.");
+    // R-05: optional HMAC signing keys enable self-expiring signed tokens
+    // (minted with the `mint_token` binary) alongside the static tokens.
+    let admin_signing_key =
+        hikmalayer::auth::token::signing_key_from_env("ADMIN_TOKEN_SIGNING_KEY");
+    let p2p_signing_key = hikmalayer::auth::token::signing_key_from_env("P2P_TOKEN_SIGNING_KEY");
+    if admin_signing_key.is_some() {
+        println!("🔐 Admin endpoints also accept signed self-expiring tokens (R-05).");
     }
-    if admin_tokens.is_empty() {
-        eprintln!("⚠️  No admin token set (ADMIN_TOKEN / ADMIN_TOKEN_CURRENT): all admin endpoints will reject requests.");
+    if p2p_signing_key.is_some() {
+        println!("🔐 P2P endpoints also accept signed self-expiring tokens (R-05).");
+    }
+
+    if p2p_tokens.is_empty() && p2p_signing_key.is_none() {
+        eprintln!("⚠️  No P2P credential set (P2P_TOKEN / P2P_TOKEN_CURRENT / P2P_TOKEN_SIGNING_KEY): all P2P endpoints will reject requests.");
+    }
+    if admin_tokens.is_empty() && admin_signing_key.is_none() {
+        eprintln!("⚠️  No admin credential set (ADMIN_TOKEN / ADMIN_TOKEN_CURRENT / ADMIN_TOKEN_SIGNING_KEY): all admin endpoints will reject requests.");
     }
 
     // This node's validator identity. The private key never leaves the node.
@@ -239,6 +295,8 @@ async fn main() {
         peer_book,
         p2p_tokens,
         admin_tokens,
+        admin_signing_key,
+        p2p_signing_key,
         p2p_service,
         p2p_require_identity,
         validator_key,

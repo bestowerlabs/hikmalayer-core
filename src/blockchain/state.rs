@@ -21,10 +21,38 @@ pub const SLASH_PERCENT: u64 = 10;
 /// Stake registered at genesis for the genesis validator (the treasury).
 pub const GENESIS_VALIDATOR_STAKE: u64 = 1_000;
 
-/// Flat protocol fee charged on value-bearing transactions (Transfer,
-/// Stake, Withdraw). Credited to the block validator. Credential actions
-/// stay free (anti-spam via nonces and mempool caps).
+/// Minimum (and genesis) base fee charged on value-bearing transactions
+/// (Transfer, Stake, Withdraw). Credited to the block validator. Credential
+/// actions stay free (anti-spam via nonces and mempool caps). The effective
+/// fee is the dynamic `ChainState::base_fee`, which floors at this value.
 pub const TX_FEE: u64 = 1;
+
+/// Congestion target for the fee market: when a block carries more than this
+/// many fee-paying transactions the base fee rises; fewer and it falls.
+pub const BASE_FEE_TARGET_TXS: u64 = 50;
+
+/// Upper bound on the base fee so it cannot run away.
+pub const BASE_FEE_MAX: u64 = 100_000;
+
+/// Deterministic EIP-1559-style base-fee update: at most a 1/8 (12.5%) step
+/// per block toward relieving or applying congestion, bounded to
+/// `[TX_FEE, BASE_FEE_MAX]`. Because it is a pure function of the parent
+/// block's fee-paying tx count, every node computes the identical next fee.
+pub fn next_base_fee(current: u64, fee_paying_txs: u64) -> u64 {
+    let target = BASE_FEE_TARGET_TXS;
+    if fee_paying_txs == target {
+        return current.clamp(TX_FEE, BASE_FEE_MAX);
+    }
+    let max_step = (current / 8).max(1);
+    let next = if fee_paying_txs > target {
+        let step = (max_step.saturating_mul(fee_paying_txs - target) / target).max(1);
+        current.saturating_add(step)
+    } else {
+        let step = (max_step.saturating_mul(target - fee_paying_txs) / target).max(1);
+        current.saturating_sub(step)
+    };
+    next.clamp(TX_FEE, BASE_FEE_MAX)
+}
 
 /// Blocks a withdrawn stake stays locked (and slashable) before release.
 pub const UNBONDING_BLOCKS: u64 = 20;
@@ -84,8 +112,16 @@ pub struct ChainState {
     /// zeroed by `end_block`, so it is always 0 at block boundaries.
     #[serde(default)]
     pub fee_pot: u64,
+    /// Current dynamic base fee (per value-bearing transaction). Updated
+    /// deterministically each block from the parent's congestion.
+    #[serde(default = "default_base_fee")]
+    pub base_fee: u64,
     pub total_supply: u64,
     pub burned: u64,
+}
+
+fn default_base_fee() -> u64 {
+    TX_FEE
 }
 
 impl ChainState {
@@ -100,6 +136,7 @@ impl ChainState {
     ) -> Self {
         let mut state = ChainState {
             total_supply: initial_supply,
+            base_fee: TX_FEE,
             ..Default::default()
         };
         state
@@ -203,9 +240,10 @@ impl ChainState {
                     .as_ref()
                     .ok_or_else(|| "Transfer missing sender".to_string())?;
                 self.consume_nonce(from, tx.nonce)?;
-                self.debit(from, tx.amount + TX_FEE)?;
+                let fee = self.base_fee;
+                self.debit(from, tx.amount + fee)?;
                 self.credit(&tx.to, tx.amount);
-                self.fee_pot += TX_FEE;
+                self.fee_pot += fee;
                 Ok(())
             }
             TransactionType::Stake => {
@@ -222,9 +260,10 @@ impl ChainState {
                     .as_ref()
                     .ok_or_else(|| "Stake missing VRF public key".to_string())?;
                 self.consume_nonce(from, tx.nonce)?;
-                self.debit(from, tx.amount + TX_FEE)?;
+                let fee = self.base_fee;
+                self.debit(from, tx.amount + fee)?;
                 self.credit(STAKING_POOL_ACCOUNT, tx.amount);
-                self.fee_pot += TX_FEE;
+                self.fee_pot += fee;
                 let entry = self.stakers.entry(from.clone()).or_default();
                 entry.stake += tx.amount;
                 entry.public_key = public_key.clone();
@@ -263,8 +302,9 @@ impl ChainState {
                 // The withdrawal fee comes from liquid balance; the stake
                 // itself enters unbonding — it stays in the pool, remains
                 // slashable, and is released after UNBONDING_BLOCKS.
-                self.debit(from, TX_FEE)?;
-                self.fee_pot += TX_FEE;
+                let fee = self.base_fee;
+                self.debit(from, fee)?;
+                self.fee_pot += fee;
                 self.stakers.get_mut(from).unwrap().stake = info.stake - tx.amount;
                 self.unbonding
                     .entry(from.clone())
@@ -424,6 +464,16 @@ impl ChainState {
                 self.stakers.remove(&account);
             }
         }
+
+        // Fee market: derive the number of fee-paying transactions in this
+        // block from the pot (all paid the same base fee), then set the base
+        // fee for the NEXT block. Deterministic — every node computes it.
+        let fee_paying_txs = if self.base_fee > 0 {
+            self.fee_pot / self.base_fee
+        } else {
+            0
+        };
+        self.base_fee = next_base_fee(self.base_fee, fee_paying_txs);
 
         // Pay this block's fees to its validator.
         if self.fee_pot > 0 {
@@ -628,6 +678,38 @@ mod tests {
     }
 
     #[test]
+    fn base_fee_rises_with_congestion_and_falls_when_idle() {
+        // Above target → rises (bounded to +1/8 per step at minimum +1).
+        let up = next_base_fee(1000, BASE_FEE_TARGET_TXS + BASE_FEE_TARGET_TXS);
+        assert!(up > 1000);
+        assert!(up <= 1000 + 1000 / 8 + 1);
+        // Below target → falls but never past the floor.
+        let down = next_base_fee(1000, 0);
+        assert!(down < 1000 && down >= TX_FEE);
+        // At the floor, an idle block keeps it at the floor.
+        assert_eq!(next_base_fee(TX_FEE, 0), TX_FEE);
+        // At target → unchanged.
+        assert_eq!(next_base_fee(500, BASE_FEE_TARGET_TXS), 500);
+        // Never exceeds the ceiling.
+        assert!(next_base_fee(BASE_FEE_MAX, 10_000) <= BASE_FEE_MAX);
+    }
+
+    #[test]
+    fn end_block_updates_base_fee_deterministically() {
+        let (mut state, treasury, _, _) = genesis_state();
+        // Simulate a full block: BASE_FEE_TARGET_TXS + 40 fee-paying txs by
+        // seeding the pot directly (each paid base_fee).
+        state.base_fee = 100;
+        let fee_paying = BASE_FEE_TARGET_TXS + 40;
+        state.fee_pot = state.base_fee * fee_paying;
+        let expected = next_base_fee(100, fee_paying);
+        state.end_block(1, &treasury);
+        assert_eq!(state.base_fee, expected);
+        assert!(state.base_fee > 100, "congested block should raise the fee");
+        assert_eq!(state.fee_pot, 0);
+    }
+
+    #[test]
     fn fees_flow_to_the_block_validator() {
         let (mut state, treasury, _, _) = genesis_state();
         let mut tx = Transaction::new(
@@ -664,7 +746,7 @@ mod tests {
     #[test]
     fn reward_mints_supply() {
         let (mut state, treasury, _, _) = genesis_state();
-        let reward = Transaction::new_reward(&treasury);
+        let reward = Transaction::new_reward(&treasury, 1);
         let supply_before = state.total_supply;
         state.apply_transaction(&reward, 1).unwrap();
         assert_eq!(state.total_supply, supply_before + BLOCK_REWARD);

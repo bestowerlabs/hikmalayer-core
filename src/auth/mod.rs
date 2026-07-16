@@ -2,6 +2,7 @@
 pub mod middleware;
 pub mod routes;
 pub mod signature;
+pub mod token;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

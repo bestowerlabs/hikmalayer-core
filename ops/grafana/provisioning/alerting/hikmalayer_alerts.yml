@@ -1,0 +1,407 @@
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: Hikmalayer Security Alerts
+    folder: Hikmalayer
+    interval: 1m
+    rules:
+
+      - uid: hkm-blocks-rejected
+        title: "Forged Block Attack Detected"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: sum by(node) (increase(hikmalayer_blocks_rejected[5m]))
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings:
+                mode: dropNN
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [5]
+                    type: gt
+                  query:
+                    params: [B]
+        noDataState: OK
+        execErrState: OK
+        for: 1m
+        annotations:
+          summary: "High block rejection rate"
+          description: "More than 5 blocks rejected in 5 minutes. Possible forged block attack."
+        labels:
+          severity: critical
+
+      - uid: hkm-peers-low
+        title: "Network Partition Detected"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: sum by(node) (hikmalayer_peer_count)
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings:
+                mode: dropNN
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [2]
+                    type: lt
+                  query:
+                    params: [B]
+        noDataState: Alerting
+        execErrState: OK
+        for: 2m
+        annotations:
+          summary: "Node has fewer than 2 peers"
+          description: "Possible network partition. Node may be isolated from the network."
+        labels:
+          severity: critical
+
+      - uid: hkm-slashing
+        title: "Validator Slashed — Equivocation Detected"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: sum by(node) (increase(hikmalayer_slashes_submitted[5m]))
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings:
+                mode: dropNN
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [0]
+                    type: gt
+                  query:
+                    params: [B]
+        noDataState: OK
+        execErrState: OK
+        for: 0s
+        annotations:
+          summary: "Slashing event detected"
+          description: "A validator was slashed. Investigate for equivocation or double-signing."
+        labels:
+          severity: critical
+
+      - uid: hkm-reorg
+        title: "Chain Reorganisation Detected"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: sum by(node) (increase(hikmalayer_reorgs[5m]))
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings:
+                mode: dropNN
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [0]
+                    type: gt
+                  query:
+                    params: [B]
+        noDataState: OK
+        execErrState: OK
+        for: 0s
+        annotations:
+          summary: "Chain reorganisation occurred"
+          description: "A chain reorg was detected. Possible fork or consensus failure."
+        labels:
+          severity: critical
+
+      - uid: hkm-peers-banned
+        title: "Peer Banned — Possible Sybil Activity"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: sum by(node) (increase(hikmalayer_peers_banned[10m]))
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings:
+                mode: dropNN
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [0]
+                    type: gt
+                  query:
+                    params: [B]
+        noDataState: OK
+        execErrState: OK
+        for: 0s
+        annotations:
+          summary: "Peer banned for misbehaviour"
+          description: "A peer was banned. Investigate for Sybil attack or malicious node."
+        labels:
+          severity: warning
+
+      - uid: hkm-gossip-failed
+        title: "High Gossip Failure Rate"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: sum by(node) (increase(hikmalayer_gossip_failed[5m]))
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings:
+                mode: dropNN
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [10]
+                    type: gt
+                  query:
+                    params: [B]
+        noDataState: OK
+        execErrState: OK
+        for: 2m
+        annotations:
+          summary: "High gossip failure rate"
+          description: "More than 10 gossip failures in 5 minutes. P2P network degradation."
+        labels:
+          severity: warning
+
+      - uid: hkm-invalid-peers
+        title: "High Invalid Message Rate from Peers"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: sum by(node) (increase(hikmalayer_invalid_from_peers[5m]))
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings:
+                mode: dropNN
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [10]
+                    type: gt
+                  query:
+                    params: [B]
+        noDataState: OK
+        execErrState: OK
+        for: 1m
+        annotations:
+          summary: "High invalid message rate from peers"
+          description: "High rate of invalid P2P messages received. Possible active attack."
+        labels:
+          severity: warning
+
+      - uid: hkm-tx-spam
+        title: "Transaction Spam — Possible Mempool DoS"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: sum by(node) (increase(hikmalayer_transactions_received[1m]))
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings:
+                mode: dropNN
+          - refId: C
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [100]
+                    type: gt
+                  query:
+                    params: [B]
+        noDataState: OK
+        execErrState: OK
+        for: 1m
+        annotations:
+          summary: "Transaction spam detected"
+          description: "Over 100 transactions per minute. Possible mempool DoS attack."
+        labels:
+          severity: warning

@@ -2,21 +2,7 @@ global:
   scrape_interval: 5s
 
 scrape_configs:
-  - job_name: "hikmalayer-json-metrics"
-    metrics_path: /probe
-    params:
-      module: [hikmalayer]
+  - job_name: "hikmalayer"
     static_configs:
       - targets:
-          - http://bootnode:3000/metrics
-          - http://validator1:3000/metrics
-          - http://validator2:3000/metrics
-          - http://validator3:3000/metrics
-          - http://validator4:3000/metrics
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: __param_target
-      - source_labels: [__param_target]
-        target_label: instance
-      - target_label: __address__
-        replacement: json_exporter:7979
+          - "hikmalayer-exporter:8000"

@@ -64,13 +64,35 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
         .ok()
         .filter(|v| !v.is_empty());
 
+    // Launch posture: an optional comma-separated validator allowlist,
+    // baked into the genesis state root. When set, only listed addresses
+    // can register as validators — the honest "permissioned hybrid at
+    // launch" configuration, opened later via a scheduled upgrade.
+    let allowlist: Vec<String> = std::env::var("GENESIS_VALIDATOR_ALLOWLIST")
+        .unwrap_or_default()
+        .split(',')
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    if !allowlist.is_empty() {
+        println!(
+            "🔒 Validator registration is allowlist-gated at genesis ({} addresses).",
+            allowlist.len()
+        );
+    }
+
     match (
         std::env::var("GENESIS_TREASURY_ADDRESS").ok().filter(|v| !v.is_empty()),
         std::env::var("GENESIS_VALIDATOR_PUBLIC_KEY").ok().filter(|v| !v.is_empty()),
     ) {
-        (Some(treasury), validator_key) => {
-            Blockchain::new_with_genesis(difficulty, treasury, validator_key, vrf_key, supply)
-        }
+        (Some(treasury), validator_key) => Blockchain::new_with_genesis(
+            difficulty,
+            treasury,
+            validator_key,
+            vrf_key,
+            supply,
+            allowlist,
+        ),
         (None, Some(validator_key)) => {
             let treasury = pos::derive_address(&validator_key).unwrap_or_default();
             Blockchain::new_with_genesis(
@@ -79,6 +101,7 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
                 Some(validator_key),
                 vrf_key,
                 supply,
+                allowlist,
             )
         }
         (None, None) => {
@@ -86,7 +109,9 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
                 "⚠️  GENESIS_TREASURY_ADDRESS not set: using the well-known DEV genesis. \
                  Configure real genesis parameters for any shared network."
             );
-            Blockchain::new(difficulty)
+            // The allowlist is honored on EVERY genesis path — a configured
+            // allowlist silently dropped here would launch permissionless.
+            Blockchain::new_dev_with_allowlist(difficulty, allowlist)
         }
     }
 }

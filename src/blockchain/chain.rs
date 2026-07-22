@@ -91,6 +91,10 @@ pub struct Blockchain {
     pub genesis_validator_vrf_public_key: Option<String>,
     #[serde(default = "default_genesis_supply")]
     pub genesis_supply: u64,
+    /// Genesis validator allowlist (empty = permissionless staking). Part
+    /// of chain identity: baked into the genesis state root.
+    #[serde(default)]
+    pub genesis_validator_allowlist: Vec<String>,
     /// Current chain state: derived from the blocks, never persisted.
     /// Rebuilt via `rebuild_state` after deserialization.
     #[serde(skip)]
@@ -138,6 +142,8 @@ pub struct CheckpointBundle {
     pub genesis_validator_public_key: Option<String>,
     pub genesis_validator_vrf_public_key: Option<String>,
     pub genesis_supply: u64,
+    #[serde(default)]
+    pub genesis_validator_allowlist: Vec<String>,
     pub anchor: Block,
     pub checkpoint: CheckpointRoot,
     pub forward_blocks: Vec<Block>,
@@ -171,12 +177,21 @@ impl BlockError {
 impl Blockchain {
     /// New chain with default (development) genesis parameters.
     pub fn new(difficulty: usize) -> Self {
+        Self::new_dev_with_allowlist(difficulty, Vec::new())
+    }
+
+    /// Well-known DEV genesis parameters plus an explicit validator
+    /// allowlist. Used by the node when no genesis parameters are
+    /// configured but an allowlist is — the allowlist must be honored on
+    /// EVERY genesis path, never silently dropped.
+    pub fn new_dev_with_allowlist(difficulty: usize, allowlist: Vec<String>) -> Self {
         Self::new_with_genesis(
             difficulty,
             default_genesis_treasury(),
             default_genesis_validator_public_key(),
             default_genesis_validator_vrf_public_key(),
             default_genesis_supply(),
+            allowlist,
         )
     }
 
@@ -186,6 +201,7 @@ impl Blockchain {
         genesis_validator_public_key: Option<String>,
         genesis_validator_vrf_public_key: Option<String>,
         genesis_supply: u64,
+        genesis_validator_allowlist: Vec<String>,
     ) -> Self {
         let difficulty = pow::clamp_difficulty(difficulty);
         let state = ChainState::genesis(
@@ -193,6 +209,7 @@ impl Blockchain {
             genesis_validator_public_key.as_deref(),
             genesis_validator_vrf_public_key.as_deref(),
             genesis_supply,
+            &genesis_validator_allowlist,
         );
         let genesis_block = Block::genesis(difficulty, state.state_root());
         // The beacon starts at the (deterministic) genesis hash.
@@ -205,6 +222,7 @@ impl Blockchain {
             genesis_validator_public_key,
             genesis_validator_vrf_public_key,
             genesis_supply,
+            genesis_validator_allowlist,
             state,
             randomness,
             current_difficulty: difficulty,
@@ -241,12 +259,14 @@ impl Blockchain {
     /// Bootstrap a pruned chain from a trusted checkpoint bundle plus the
     /// blocks that follow. The anchor must be a retarget boundary and commit
     /// to the checkpoint state; forward blocks are validated normally.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_checkpoint(
         difficulty: usize,
         genesis_treasury: String,
         genesis_validator_public_key: Option<String>,
         genesis_validator_vrf_public_key: Option<String>,
         genesis_supply: u64,
+        genesis_validator_allowlist: Vec<String>,
         anchor: Block,
         checkpoint: CheckpointRoot,
         forward_blocks: Vec<Block>,
@@ -268,6 +288,7 @@ impl Blockchain {
             genesis_validator_public_key,
             genesis_validator_vrf_public_key,
             genesis_supply,
+            genesis_validator_allowlist,
             state: ChainState::default(),
             randomness: String::new(),
             current_difficulty: checkpoint.difficulty,
@@ -284,6 +305,7 @@ impl Blockchain {
             self.genesis_validator_public_key.as_deref(),
             self.genesis_validator_vrf_public_key.as_deref(),
             self.genesis_supply,
+            &self.genesis_validator_allowlist,
         )
     }
 
@@ -798,7 +820,29 @@ impl Blockchain {
             }
         }
 
-        if candidate.cumulative_work() <= self.cumulative_work() {
+        // A fork cannot claim time that has not passed: its tip must sit
+        // within the tolerated clock skew of NOW (ancestors are bounded by
+        // the tip through timestamp monotonicity). Blocks future-dating
+        // their timestamps to open fallback leader rounds fail here.
+        let now = Utc::now();
+        if let Some(tip) = candidate.blocks.last() {
+            if tip.timestamp > now + Duration::seconds(MAX_TIMESTAMP_SKEW_SECONDS) {
+                return Err("Candidate chain tip timestamp is too far in the future".to_string());
+            }
+        }
+
+        // SOVEREIGN-FINALITY FORK CHOICE: validator-sealed progress decides.
+        // A candidate must carry MORE validator-produced blocks than we
+        // have; cumulative PoW work only breaks exact height ties. Mining
+        // hardware alone — however fast — can never displace blocks sealed
+        // by the validator set, because every block of a heavier-work fork
+        // still has to be produced by a PoS-selected, stake-bonded leader.
+        let our_tip = self.tip_index();
+        let their_tip = candidate.tip_index();
+        if their_tip < our_tip {
+            return Ok(false);
+        }
+        if their_tip == our_tip && candidate.cumulative_work() <= self.cumulative_work() {
             return Ok(false);
         }
 
@@ -812,6 +856,7 @@ impl Blockchain {
             genesis_validator_public_key: self.genesis_validator_public_key.clone(),
             genesis_validator_vrf_public_key: self.genesis_validator_vrf_public_key.clone(),
             genesis_supply: self.genesis_supply,
+            genesis_validator_allowlist: self.genesis_validator_allowlist.clone(),
             state: ChainState::default(),
             randomness: String::new(),
             current_difficulty: self.current_difficulty,
@@ -878,6 +923,7 @@ impl Blockchain {
             genesis_validator_public_key: self.genesis_validator_public_key.clone(),
             genesis_validator_vrf_public_key: self.genesis_validator_vrf_public_key.clone(),
             genesis_supply: self.genesis_supply,
+            genesis_validator_allowlist: self.genesis_validator_allowlist.clone(),
             anchor,
             checkpoint,
             forward_blocks,
@@ -892,6 +938,7 @@ impl Blockchain {
             bundle.genesis_validator_public_key,
             bundle.genesis_validator_vrf_public_key,
             bundle.genesis_supply,
+            bundle.genesis_validator_allowlist,
             bundle.anchor,
             bundle.checkpoint,
             bundle.forward_blocks,
@@ -1344,6 +1391,45 @@ mod tests {
     }
 
     #[test]
+    fn equal_progress_fork_is_not_adopted() {
+        // Same tip height, same consensus-derived work: no displacement.
+        // Validator-sealed progress — not mining effort — decides fork
+        // choice, so hashrate alone can never swing a node between forks.
+        let mut local = Blockchain::default();
+        mine_valid_block(&mut local);
+        let mut remote = Blockchain::default();
+        mine_valid_block(&mut remote);
+        assert!(!local.try_adopt_chain(&remote).unwrap());
+        assert_eq!(local.blocks.len(), 2);
+    }
+
+    #[test]
+    fn adoption_rejects_a_future_dated_fork_tip() {
+        let mut local = Blockchain::default();
+        mine_valid_block(&mut local);
+
+        // Adversarial fork: longer than ours, but its tip claims a
+        // timestamp beyond the tolerated clock skew (e.g. to open fallback
+        // leader rounds that real time has not opened). Candidate
+        // validation is bypassed to emulate a malicious peer.
+        let mut remote = Blockchain::default();
+        mine_valid_block(&mut remote);
+        let (t_addr, _, t_key) = treasury();
+        let input = remote.next_slot_input();
+        let future_ts = Utc::now() + Duration::seconds(MAX_TIMESTAMP_SKEW_SECONDS + 300);
+        let block = build_block_at(&remote, &t_addr, &t_key, &input, future_ts);
+        let mut post = remote.state.clone();
+        let reward: Transaction = serde_json::from_str(&block.transactions[0]).unwrap();
+        post.apply_transaction(&reward, block.index).unwrap();
+        post.end_block(block.index, &t_addr);
+        remote.commit_block(block, post);
+
+        let err = local.try_adopt_chain(&remote).unwrap_err();
+        assert!(err.contains("future"), "{err}");
+        assert_eq!(local.blocks.len(), 2, "fork was not adopted");
+    }
+
+    #[test]
     fn fork_choice_protects_finalized_history() {
         let mut local = Blockchain::default();
         mine_valid_block(&mut local);
@@ -1519,6 +1605,7 @@ mod tests {
             full.genesis_validator_public_key.clone(),
             full.genesis_validator_vrf_public_key.clone(),
             full.genesis_supply,
+            Vec::new(),
             bundle_anchor,
             checkpoint,
             forward,
@@ -1594,6 +1681,7 @@ mod tests {
             full.genesis_validator_public_key.clone(),
             full.genesis_validator_vrf_public_key.clone(),
             full.genesis_supply,
+            Vec::new(),
             bundle_anchor,
             checkpoint,
             forward,

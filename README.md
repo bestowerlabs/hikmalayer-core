@@ -88,6 +88,23 @@ signing conventions. It provides:
 - **Minimum validator stake (10,000 HKM).** A stake must reach the floor to join
   the validator set, and a withdrawal must exit fully or stay at/above it —
   preventing trivial-stake spam validators from bloating leader election.
+- **Sovereign finality — hashrate cannot rewrite history.** Fork choice is
+  validator-progress-first: finalized blocks can never be reorged, a competing
+  fork must carry MORE validator-sealed blocks to displace the local chain, and
+  cumulative PoW only breaks exact height ties. Every block of any fork must
+  still be produced by a PoS-selected, stake-bonded, VRF-proven leader, so a
+  stranger with fast mining hardware — however fast — can produce nothing and
+  reorg nothing. PoW in Hikmalayer is a per-block finalization stamp mined by
+  the selected validator itself (difficulty consensus-derived and capped), not
+  an open mining race.
+- **Permissioned-hybrid launch posture (honest and explicit).** Set
+  `GENESIS_VALIDATOR_ALLOWLIST` at genesis to bake a validator allowlist into
+  the genesis state root: only listed addresses can register stakes (existing
+  validators may top up). Combined with the treasury holding the initial supply
+  and the 10,000 HKM floor, the launch network is **permissioned by design and
+  documented as such** — the allowlist is opened later via a scheduled network
+  upgrade when independent validators are worth having. An empty allowlist
+  means permissionless staking.
 - An offline wallet/validator signing CLI (`hikma-wallet`) — private keys never touch
   the node or the network.
 - Persistence to disk (chain only; balances/stakes/nonces are replayed on startup).

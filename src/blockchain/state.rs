@@ -157,6 +157,14 @@ pub struct ChainState {
     /// Tokens vesting toward each recipient (team/investor lockups).
     #[serde(default)]
     pub vesting: BTreeMap<String, Vec<VestingEntry>>,
+    /// Genesis-configured validator allowlist. When NON-EMPTY, only listed
+    /// addresses may register a NEW stake (existing validators may top up);
+    /// empty means permissionless staking. Set once at genesis and part of
+    /// the state root, so every node enforces the identical policy — this
+    /// is the honest "permissioned hybrid at launch" lever, opened later
+    /// via a scheduled network upgrade.
+    #[serde(default)]
+    pub validator_allowlist: std::collections::BTreeSet<String>,
     /// Fees collected within the current block; paid to the validator and
     /// zeroed by `end_block`, so it is always 0 at block boundaries.
     #[serde(default)]
@@ -182,10 +190,12 @@ impl ChainState {
         treasury_public_key: Option<&str>,
         treasury_vrf_public_key: Option<&str>,
         initial_supply: u64,
+        validator_allowlist: &[String],
     ) -> Self {
         let mut state = ChainState {
             total_supply: initial_supply,
             base_fee: TX_FEE,
+            validator_allowlist: validator_allowlist.iter().cloned().collect(),
             ..Default::default()
         };
         state
@@ -308,6 +318,19 @@ impl ChainState {
                     .vrf_public_key
                     .as_ref()
                     .ok_or_else(|| "Stake missing VRF public key".to_string())?;
+                // Launch posture: when an allowlist is configured, only
+                // listed addresses may JOIN the validator set (existing
+                // validators may add stake). Checked before any mutation.
+                if !self.validator_allowlist.is_empty()
+                    && !self.stakers.contains_key(from)
+                    && !self.validator_allowlist.contains(from)
+                {
+                    return Err(format!(
+                        "Validator registration is allowlist-gated at this network's genesis; \
+                         {} is not on the allowlist",
+                        from
+                    ));
+                }
                 // Validator floor: the resulting total stake must meet the
                 // minimum (checked before any state mutation).
                 let current = self.stakers.get(from).map(|i| i.stake).unwrap_or(0);
@@ -629,7 +652,7 @@ mod tests {
     fn genesis_state() -> (ChainState, String, String, String) {
         let (address, public_key, private_key) = wallet(1);
         let vrf_key = crate::consensus::vrf::derive_vrf_public_key(&private_key).unwrap();
-        let state = ChainState::genesis(&address, Some(&public_key), Some(&vrf_key), TEST_SUPPLY);
+        let state = ChainState::genesis(&address, Some(&public_key), Some(&vrf_key), TEST_SUPPLY, &[]);
         (state, address, public_key, private_key)
     }
 
@@ -801,6 +824,79 @@ mod tests {
         withdraw.signature = Some(pos::sign_message(&message, &treasury_key).unwrap());
         let err = state.apply_transaction(&withdraw, 1).unwrap_err();
         assert!(err.contains("validator minimum"), "{err}");
+    }
+
+    #[test]
+    fn allowlist_gates_new_validator_registration() {
+        let (t_addr, t_pub, t_priv) = wallet(1);
+        let t_vrf = crate::consensus::vrf::derive_vrf_public_key(&t_priv).unwrap();
+        let (allowed_addr, allowed_pub, allowed_key) = wallet(2);
+        let (outsider_addr, outsider_pub, outsider_key) = wallet(3);
+
+        // Genesis with an allowlist naming only wallet(2).
+        let mut state = ChainState::genesis(
+            &t_addr,
+            Some(&t_pub),
+            Some(&t_vrf),
+            TEST_SUPPLY,
+            &[allowed_addr.clone()],
+        );
+
+        // Fund both candidates.
+        let funded = MIN_VALIDATOR_STAKE * 2;
+        for (i, dest) in [(1u64, &allowed_addr), (2u64, &outsider_addr)] {
+            let mut fund = Transaction::new(
+                Some(t_addr.clone()),
+                dest.to_string(),
+                funded,
+                TransactionType::Transfer,
+            );
+            fund.nonce = i;
+            state.apply_transaction(&fund, 1).unwrap();
+        }
+
+        let make_stake = |addr: &str, pubkey: &str, key: &str| {
+            let mut stake = Transaction::new(
+                Some(addr.to_string()),
+                STAKING_POOL_ACCOUNT.to_string(),
+                MIN_VALIDATOR_STAKE,
+                TransactionType::Stake,
+            );
+            stake.nonce = 1;
+            stake.public_key = Some(pubkey.to_string());
+            stake.vrf_public_key =
+                Some(crate::consensus::vrf::derive_vrf_public_key(key).unwrap());
+            stake
+        };
+
+        // An address NOT on the allowlist cannot join the validator set.
+        let err = state
+            .apply_transaction(&make_stake(&outsider_addr, &outsider_pub, &outsider_key), 1)
+            .unwrap_err();
+        assert!(err.contains("allowlist"), "{err}");
+        assert_eq!(state.validator_set().len(), 1);
+
+        // An allowlisted address joins normally.
+        state
+            .apply_transaction(&make_stake(&allowed_addr, &allowed_pub, &allowed_key), 1)
+            .unwrap();
+        assert_eq!(state.validator_set().len(), 2);
+
+        // Existing validators (the genesis treasury) may top up regardless.
+        let mut top_up = Transaction::new(
+            Some(t_addr.clone()),
+            STAKING_POOL_ACCOUNT.to_string(),
+            MIN_VALIDATOR_STAKE,
+            TransactionType::Stake,
+        );
+        top_up.nonce = 3;
+        top_up.public_key = Some(t_pub.clone());
+        top_up.vrf_public_key = Some(t_vrf.clone());
+        state.apply_transaction(&top_up, 1).unwrap();
+        assert_eq!(
+            state.stakers[&t_addr].stake,
+            GENESIS_VALIDATOR_STAKE + MIN_VALIDATOR_STAKE
+        );
     }
 
     #[test]

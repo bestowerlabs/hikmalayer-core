@@ -8,8 +8,11 @@ use serde::{Deserialize, Serialize};
 /// Maximum tolerated clock skew (seconds) for incoming block timestamps.
 pub const MAX_TIMESTAMP_SKEW_SECONDS: i64 = 120;
 
-/// Default initial supply for networks that do not configure one.
-pub const DEFAULT_GENESIS_SUPPLY: u64 = 1_000_000;
+/// Default initial supply for networks that do not configure one:
+/// 20,000,000,000 HKM (the 20% genesis allocation of the ~100B HKM supply;
+/// the remaining ~80B is mined via the halving schedule with tail).
+pub const DEFAULT_GENESIS_SUPPLY: u64 =
+    20_000_000_000 * crate::blockchain::transaction::UNITS_PER_HKM;
 
 /// Target seconds between blocks for difficulty retargeting.
 pub const TARGET_BLOCK_SECONDS: i64 = 15;
@@ -1042,21 +1045,23 @@ mod tests {
         let (t_addr, t_pub, t_key) = treasury();
         let (v_addr, v_pub, v_key) = wallet(2);
 
-        // Fund the new validator, then stake on-chain.
-        let fund = signed_transfer((&t_addr, &t_pub, &t_key), &v_addr, 500, 1);
+        // Fund the new validator, then stake the minimum on-chain.
+        let stake_amount = crate::blockchain::state::MIN_VALIDATOR_STAKE;
+        let funded = stake_amount * 2;
+        let fund = signed_transfer((&t_addr, &t_pub, &t_key), &v_addr, funded, 1);
         mine_block_with(&mut chain, vec![fund]).unwrap();
 
         let mut stake = Transaction::new(
             Some(v_addr.clone()),
             STAKING_POOL_ACCOUNT.to_string(),
-            300,
+            stake_amount,
             TransactionType::Stake,
         );
         stake.nonce = 1;
         stake.public_key = Some(v_pub.clone());
         let v_vrf = vrf::derive_vrf_public_key(&v_key).unwrap();
         stake.vrf_public_key = Some(v_vrf.clone());
-        let message = Transaction::stake_signing_message(&v_addr, 300, 1, &v_vrf);
+        let message = Transaction::stake_signing_message(&v_addr, stake_amount, 1, &v_vrf);
         stake.signature = Some(pos::sign_message(&message, &v_key).unwrap());
         mine_block_with(&mut chain, vec![stake]).unwrap();
 
@@ -1131,21 +1136,23 @@ mod tests {
         let (t_addr, t_pub, t_key) = treasury();
         let (v_addr, v_pub, v_key) = wallet(2);
 
-        // Fund and stake a second validator with comparable weight so both
-        // validators show up as leaders across rounds.
-        let fund = signed_transfer((&t_addr, &t_pub, &t_key), &v_addr, 900, 1);
+        // Fund and stake a second validator with weight EQUAL to the
+        // genesis validator, so both show up as leaders across rounds.
+        let stake_amount = crate::blockchain::state::GENESIS_VALIDATOR_STAKE;
+        let funded = stake_amount + stake_amount / 2;
+        let fund = signed_transfer((&t_addr, &t_pub, &t_key), &v_addr, funded, 1);
         mine_block_with(&mut chain, vec![fund]).unwrap();
         let mut stake = Transaction::new(
             Some(v_addr.clone()),
             STAKING_POOL_ACCOUNT.to_string(),
-            800,
+            stake_amount,
             TransactionType::Stake,
         );
         stake.nonce = 1;
         stake.public_key = Some(v_pub.clone());
         let v_vrf = vrf::derive_vrf_public_key(&v_key).unwrap();
         stake.vrf_public_key = Some(v_vrf.clone());
-        let message = Transaction::stake_signing_message(&v_addr, 800, 1, &v_vrf);
+        let message = Transaction::stake_signing_message(&v_addr, stake_amount, 1, &v_vrf);
         stake.signature = Some(pos::sign_message(&message, &v_key).unwrap());
         mine_block_with(&mut chain, vec![stake]).unwrap();
         assert_eq!(chain.state.validator_set().len(), 2);

@@ -25,7 +25,9 @@ is a launch blocker until closed.
 | Slashing | Permissionless equivocation proofs burn the offender's stake on-chain; double-slash prevented |
 | Authorization | Deny-by-default admin and P2P tokens |
 | Resource bounds | Difficulty clamped 1–5; input length limits |
-| Rewards & fees | **Bitcoin-style halving block reward** (halves every 1,000,000 blocks, consensus-verified per height) + **dynamic base fee** (EIP-1559-style, congestion-responsive) paid to the block validator; the base fee lives in the state root and is recomputed identically by every node |
+| Rewards & fees | **Calibrated mainnet emission**: 6-decimal HKM, 20B genesis + ~80B mined, 5,000 HKM initial reward halving every 8,000,000 blocks (~3.8y), **50 HKM/block tail emission** as a perpetual security budget — all consensus-verified per height. Plus a **dynamic base fee** (EIP-1559-style, floor 0.001 HKM, cap 100 HKM) paid to the block validator; the base fee lives in the state root and is recomputed identically by every node |
+| Vesting (lockups) | **On-chain cliff + linear vesting**: `Vest` transactions lock funds in a consensus-managed pool that releases block-by-block after the cliff; schedules are inspectable at `GET /vesting/{address}` — team/investor lockups are protocol guarantees, live-verified end-to-end |
+| Validator floor | **10,000 HKM minimum stake** to join (or remain in, on withdrawal) the validator set — no trivial-stake spam validators |
 | Unbonding | Withdrawn stake stays locked and slashable for UNBONDING_BLOCKS before release; exit only completes when nothing remains bonded or unbonding |
 | Slashing window | Equivocation proofs accepted only within SLASHING_WINDOW_BLOCKS (= unbonding period), so misbehaving stake can never exit before punishment |
 | Difficulty retargeting | Deterministic per-chain schedule (every 10 blocks toward 15s target); block difficulty is consensus-validated, not operator-set |
@@ -40,7 +42,7 @@ is a launch blocker until closed.
 | Checkpoint fast-sync / pruning | `GET /checkpoint/bundle` (p2p) serves a self-verifying bundle (retarget-boundary anchor + state + forward blocks); `HIKMALAYER_CHECKPOINT=<bundle.json>` boots a fresh node from the anchor without full genesis replay and reconstructs a byte-identical state root, randomness beacon, and difficulty; anchor pinned to a retarget boundary, state-root-bound, forward blocks re-validated; a persisted local chain always takes precedence |
 | Observability | Metrics include blocks mined/received/rejected, reorgs, gossip, txs, slashes, peers banned, invalid-from-peers; structured startup logging of identity/enforcement |
 | Tooling | `hikma-wallet` offline keygen/signing; propose/sign/submit flow for external validators |
-| Tests | 90 automated tests across consensus, state machine, security, replay, fork choice, slashing, emission, checkpoint fast-sync, leader rotation, token auth, and API flows |
+| Tests | 94 automated tests across consensus, state machine, security, replay, fork choice, slashing, emission (halving + tail), vesting, min-stake, checkpoint fast-sync, leader rotation, token auth, and API flows |
 
 ## 🚧 Remaining before mainnet
 
@@ -53,13 +55,13 @@ external process**, not missing protocol code:
    *cannot* be self-performed — see the step-by-step
    [`docs/external_audit_guide.md`](external_audit_guide.md).
 
-2. **Emission/treasury policy.** A dynamic, congestion-responsive base fee and
-   a **Bitcoin-style halving block reward** (halves every 1,000,000 blocks,
-   trending to zero) now exist and are consensus-verified — the emission curve
-   is implemented, not just planned. What still needs *economic modeling* (not
-   code) before value is attached: calibration of the halving interval and
-   initial reward against target supply, a treasury/burn policy, and fee-market
-   parameters (target block fullness, fee bounds) against expected demand.
+2. **Emission/treasury policy.** ✅ *Calibrated.* The mainnet parameter set is
+   implemented and consensus-verified: 6-decimal HKM, 20B genesis / ~80B mined
+   toward a ~100B supply at tail start, 8M-block halvings, a 50 HKM/block tail
+   emission for the long-run security budget, a 10,000 HKM validator floor,
+   and on-chain vesting for allocations. What remains is *distribution policy*
+   (who receives what from the 20B genesis treasury, published as on-chain
+   vesting schedules at launch) — a business decision, not code.
 
 3. **Production key management.** `VALIDATOR_PRIVATE_KEY` via environment
    variable is fine for testnets; production validators should use an HSM,

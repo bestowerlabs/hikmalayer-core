@@ -69,10 +69,26 @@ validators use `POST /mine/propose` (optionally `?validator=<address>` to plan
 for a specific eligible leader; returns the PoW-mined unsigned block, whose
 `state_root` already reflects execution, plus its hash), sign the hash offline
 (`hikma-wallet sign-block`), and submit to `POST /mine/submit`. Every accepted
-block mints a **halving** reward to its validator: `reward = BLOCK_REWARD >>
-(height / 1_000_000)`, so emission halves every 1,000,000 blocks and trends to
-zero. The reward for each height is consensus-verified — no node can mint more
-than the schedule allows.
+block mints a **halving** reward to its validator: starting at 5,000 HKM, the
+reward halves every 8,000,000 blocks and floors at a 50 HKM/block **tail
+emission** (perpetual security budget). The reward for each height is
+consensus-verified — no node can mint more than the schedule allows.
+
+**Denomination.** HKM has 6 decimals: every `amount` in this API is in base
+units, 1 HKM = 1,000,000 units. Genesis supply is 20B HKM (20,000,000,000,000,000
+units); ~80B more is mined on the halving schedule (~100B at tail start).
+
+**Vesting.** `POST /tokens/vest` queues a signed lockup: `amount` moves into
+the on-chain vesting pool and releases to the recipient on a **cliff + linear**
+schedule (`cliff_blocks`, `duration_blocks`), enforced by consensus at each
+block boundary. Sign offline with `hikma-wallet sign-vest <from> <to> <amount>
+<cliff_blocks> <duration_blocks> <nonce> <key>`; inspect any address's
+schedules and locked total at `GET /vesting/{address}`. Built for team/investor
+lockups that must be provable on-chain.
+
+**Validator minimum.** A Stake transaction must leave the validator holding at
+least **10,000 HKM** (10,000,000,000 units), and a Withdraw must either exit
+fully or stay at/above the floor.
 
 **Slashing.** `POST /slashing/equivocation` is permissionless: submit a
 `{ "block_a": <Block>, "block_b": <Block> }` proof that a validator signed two
@@ -113,6 +129,7 @@ verification is stateless, scope-bound, constant-time, and fail-closed.
 **New/changed endpoints:** `GET /blockchain/state`, `POST /slashing/equivocation`,
 `POST /tokens/faucet` (admin), `GET /tokens/nonce/{account}`, `POST /mine/propose`,
 `POST /mine/submit`, `GET /p2p/chain` (p2p), `GET /checkpoint/bundle` (p2p),
+`POST /tokens/vest`, `GET /vesting/{address}`,
 `POST /certificates/attest` (admin).
 `POST /certificates/verify` is a read-only lookup. `POST /auth/verify` now also
 requires a `public_key` field (native signature).

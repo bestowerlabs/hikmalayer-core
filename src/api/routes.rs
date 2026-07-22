@@ -113,6 +113,19 @@ pub struct TokenTransferRequest {
 }
 
 #[derive(Deserialize)]
+pub struct VestRequest {
+    pub from: String,
+    pub to: String,
+    pub amount: u64,
+    pub cliff_blocks: u64,
+    pub duration_blocks: u64,
+    #[serde(default)]
+    pub nonce: u64,
+    pub public_key: Option<String>,
+    pub signature: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct FaucetRequest {
     pub to: String,
     pub amount: u64,
@@ -568,6 +581,8 @@ pub fn api_routes() -> Router<AppState> {
         .route("/staking/withdraw", post(withdraw_stake))
         .route("/staking/validators", get(list_validators))
         .route("/staking/unbonding/{address}", get(get_unbonding))
+        .route("/tokens/vest", post(vest_tokens))
+        .route("/vesting/{address}", get(get_vesting))
         // P2P routes
         .route("/p2p/peers", get(list_peers))
         .route("/p2p/peers/register", post(register_peer))
@@ -1814,6 +1829,15 @@ pub struct UnbondingResponse {
     pub current_height: u64,
 }
 
+#[derive(Serialize)]
+pub struct VestingResponse {
+    pub address: String,
+    /// Tokens still locked (not yet released) across all schedules.
+    pub total_locked: u64,
+    pub entries: Vec<crate::blockchain::state::VestingEntry>,
+    pub current_height: u64,
+}
+
 async fn get_unbonding(
     State(state): State<AppState>,
     Path(address): Path<String>,
@@ -1827,6 +1851,73 @@ async fn get_unbonding(
             .get(&address)
             .cloned()
             .unwrap_or_default(),
+        current_height: chain.tip_index(),
+        address,
+    })
+}
+
+/// Queue a signed vesting lockup: `amount` moves from the sender into the
+/// vesting pool and releases to `to` on a cliff + linear schedule, enforced
+/// by consensus. Built for team/investor lockups that must be provable
+/// on-chain rather than promised off-chain.
+async fn vest_tokens(
+    State(state): State<AppState>,
+    Json(payload): Json<VestRequest>,
+) -> Json<ApiResponse> {
+    if payload.amount == 0 || payload.to.trim().is_empty() {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: "Vest requires a recipient and a non-zero amount".to_string(),
+        });
+    }
+
+    let mut tx = Transaction::new(
+        Some(payload.from.clone()),
+        payload.to.clone(),
+        payload.amount,
+        TransactionType::Vest,
+    );
+    tx.nonce = payload.nonce;
+    tx.public_key = payload.public_key.clone();
+    tx.signature = payload.signature.clone();
+    tx.vesting_cliff_blocks = Some(payload.cliff_blocks);
+    tx.vesting_duration_blocks = Some(payload.duration_blocks);
+
+    match queue_transaction(&state, tx).await {
+        Ok(()) => Json(ApiResponse {
+            status: "success".to_string(),
+            message: format!(
+                "Vest of {} from {} to {} queued (cliff {} blocks, full vest {} blocks); \
+                 it locks when mined into a block",
+                payload.amount, payload.from, payload.to, payload.cliff_blocks,
+                payload.duration_blocks
+            ),
+        }),
+        Err(message) => Json(ApiResponse {
+            status: "error".to_string(),
+            message,
+        }),
+    }
+}
+
+async fn get_vesting(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Json<VestingResponse> {
+    let chain = state.chain.lock().await;
+    let entries = chain
+        .state
+        .vesting
+        .get(&address)
+        .cloned()
+        .unwrap_or_default();
+    let total_locked = entries
+        .iter()
+        .map(|entry| entry.total - entry.released)
+        .sum();
+    Json(VestingResponse {
+        total_locked,
+        entries,
         current_height: chain.tip_index(),
         address,
     })
@@ -2842,7 +2933,8 @@ mod tests {
     #[tokio::test]
     async fn on_chain_staking_and_withdrawal_flow() {
         let state = test_state(true);
-        let (address, _, private_key) = register_staker(&state, 15, 50).await;
+        let stake = crate::blockchain::state::MIN_VALIDATOR_STAKE;
+        let (address, _, private_key) = register_staker(&state, 15, stake).await;
 
         let validators = list_validators(State(state.clone())).await;
         assert_eq!(validators.0.len(), 2);
@@ -2852,7 +2944,7 @@ mod tests {
             State(state.clone()),
             Json(StakeRequest {
                 address: address.clone(),
-                amount: 50,
+                amount: stake,
                 public_key: None,
                 vrf_public_key: None,
                 nonce: 99,
@@ -2867,13 +2959,13 @@ mod tests {
             .await
             .0
             .next_nonce;
-        let message = Transaction::withdraw_signing_message(&address, 50, nonce);
+        let message = Transaction::withdraw_signing_message(&address, stake, nonce);
         let signature = pos::sign_message(&message, &private_key).unwrap();
         let response = withdraw_stake(
             State(state.clone()),
             Json(StakeRequest {
                 address: address.clone(),
-                amount: 50,
+                amount: stake,
                 public_key: None,
                 vrf_public_key: None,
                 nonce,

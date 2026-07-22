@@ -11,6 +11,7 @@
 //!   hikma-wallet sign-transfer <from> <to> <amount> <nonce> <private_key_hex>
 //!   hikma-wallet sign-stake <address> <amount> <nonce> <private_key_hex>
 //!   hikma-wallet sign-withdraw <address> <amount> <nonce> <private_key_hex>
+//!   hikma-wallet sign-vest <from> <to> <amount> <cliff_blocks> <duration_blocks> <nonce> <private_key_hex>
 //!   hikma-wallet sign-credential <id> <subject> <data_hash> <revoke> <nonce> <private_key_hex>
 
 use hikmalayer::blockchain::transaction::{CredentialAction, Transaction};
@@ -54,7 +55,7 @@ fn sign_and_print(message: &str, private_key: &str) -> Result<(), String> {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "Commands:\n  keygen\n  address <public_key_hex>\n  sign-block <block_hash_hex> <private_key_hex>\n  vrf-prove <slot_input> <private_key_hex>\n  sign-transfer <from> <to> <amount> <nonce> <private_key_hex>\n  sign-stake <address> <amount> <nonce> <private_key_hex>\n  sign-withdraw <address> <amount> <nonce> <private_key_hex>\n  sign-credential <id> <subject> <data_hash> <revoke> <nonce> <private_key_hex>";
+    let usage = "Commands:\n  keygen\n  address <public_key_hex>\n  sign-block <block_hash_hex> <private_key_hex>\n  vrf-prove <slot_input> <private_key_hex>\n  sign-transfer <from> <to> <amount> <nonce> <private_key_hex>\n  sign-stake <address> <amount> <nonce> <private_key_hex>\n  sign-withdraw <address> <amount> <nonce> <private_key_hex>\n  sign-vest <from> <to> <amount> <cliff_blocks> <duration_blocks> <nonce> <private_key_hex>\n  sign-credential <id> <subject> <data_hash> <revoke> <nonce> <private_key_hex>";
 
     match args.first().map(String::as_str) {
         Some("keygen") => keygen(),
@@ -85,6 +86,33 @@ fn run() -> Result<(), String> {
                 .map_err(|_| "nonce must be a number".to_string())?;
             let private_key = args.get(5).ok_or(usage)?;
             let message = Transaction::transfer_signing_message(from, to, amount, nonce);
+            sign_and_print(&message, private_key)
+        }
+        Some("sign-vest") => {
+            let (from, to) = (args.get(1).ok_or(usage)?, args.get(2).ok_or(usage)?);
+            let amount: u64 = args
+                .get(3)
+                .ok_or(usage)?
+                .parse()
+                .map_err(|_| "amount must be a number".to_string())?;
+            let cliff: u64 = args
+                .get(4)
+                .ok_or(usage)?
+                .parse()
+                .map_err(|_| "cliff_blocks must be a number".to_string())?;
+            let duration: u64 = args
+                .get(5)
+                .ok_or(usage)?
+                .parse()
+                .map_err(|_| "duration_blocks must be a number".to_string())?;
+            let nonce: u64 = args
+                .get(6)
+                .ok_or(usage)?
+                .parse()
+                .map_err(|_| "nonce must be a number".to_string())?;
+            let private_key = args.get(7).ok_or(usage)?;
+            let message =
+                Transaction::vest_signing_message(from, to, amount, cliff, duration, nonce);
             sign_and_print(&message, private_key)
         }
         Some("vrf-prove") => {

@@ -12,27 +12,42 @@ use std::collections::BTreeMap;
 use crate::blockchain::transaction::{Transaction, TransactionType};
 use crate::consensus::pos::{self, Staker};
 
+use crate::blockchain::transaction::UNITS_PER_HKM;
+
 /// Internal account holding all staked funds.
 pub const STAKING_POOL_ACCOUNT: &str = "__staking_pool__";
+
+/// Internal account holding all unvested (locked) funds.
+pub const VESTING_POOL_ACCOUNT: &str = "__vesting_pool__";
 
 /// Consensus constant: percentage of stake burned for a proven equivocation.
 pub const SLASH_PERCENT: u64 = 10;
 
-/// Stake registered at genesis for the genesis validator (the treasury).
-pub const GENESIS_VALIDATOR_STAKE: u64 = 1_000;
+/// Stake registered at genesis for the genesis validator (the treasury):
+/// 1,000,000 HKM.
+pub const GENESIS_VALIDATOR_STAKE: u64 = 1_000_000 * UNITS_PER_HKM;
+
+/// Minimum total stake to be (or remain) a validator: 10,000 HKM. A Stake
+/// transaction must leave the validator at or above this floor, and a
+/// Withdraw must leave either zero (full exit via unbonding) or at least
+/// the floor — preventing trivial-stake spam validators from bloating the
+/// leader-election set. (Slashing may push a validator below the floor;
+/// it keeps producing until it exits or tops back up.)
+pub const MIN_VALIDATOR_STAKE: u64 = 10_000 * UNITS_PER_HKM;
 
 /// Minimum (and genesis) base fee charged on value-bearing transactions
-/// (Transfer, Stake, Withdraw). Credited to the block validator. Credential
-/// actions stay free (anti-spam via nonces and mempool caps). The effective
-/// fee is the dynamic `ChainState::base_fee`, which floors at this value.
-pub const TX_FEE: u64 = 1;
+/// (Transfer, Stake, Withdraw, Vest): 0.001 HKM. Credited to the block
+/// validator. Credential actions stay free (anti-spam via nonces and
+/// mempool caps). The effective fee is the dynamic `ChainState::base_fee`,
+/// which floors at this value.
+pub const TX_FEE: u64 = UNITS_PER_HKM / 1_000;
 
 /// Congestion target for the fee market: when a block carries more than this
 /// many fee-paying transactions the base fee rises; fewer and it falls.
 pub const BASE_FEE_TARGET_TXS: u64 = 50;
 
-/// Upper bound on the base fee so it cannot run away.
-pub const BASE_FEE_MAX: u64 = 100_000;
+/// Upper bound on the base fee so it cannot run away: 100 HKM.
+pub const BASE_FEE_MAX: u64 = 100 * UNITS_PER_HKM;
 
 /// Deterministic EIP-1559-style base-fee update: at most a 1/8 (12.5%) step
 /// per block toward relieving or applying congestion, bounded to
@@ -67,6 +82,37 @@ pub const SLASHING_WINDOW_BLOCKS: u64 = 20;
 pub struct UnbondingEntry {
     pub amount: u64,
     pub release_height: u64,
+}
+
+/// Tokens locked for a recipient on a cliff + linear schedule. Nothing
+/// releases before `cliff_height`; from there the amount accrued linearly
+/// since `start_height` releases block by block until `end_height`, when
+/// the full total has been paid out. Funds sit in the vesting pool until
+/// released, so supply accounting stays exact.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct VestingEntry {
+    pub total: u64,
+    pub released: u64,
+    pub start_height: u64,
+    pub cliff_height: u64,
+    pub end_height: u64,
+}
+
+impl VestingEntry {
+    /// Amount vested (cumulative) at `height`. Linear between start and
+    /// end, gated by the cliff; u128 intermediate so `total * elapsed`
+    /// cannot overflow for any legal schedule.
+    pub fn vested_at(&self, height: u64) -> u64 {
+        if height < self.cliff_height {
+            return 0;
+        }
+        if height >= self.end_height {
+            return self.total;
+        }
+        let elapsed = (height - self.start_height) as u128;
+        let span = (self.end_height - self.start_height) as u128;
+        ((self.total as u128 * elapsed) / span) as u64
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -108,6 +154,9 @@ pub struct ChainState {
     /// Stake awaiting release after withdrawal (still slashable).
     #[serde(default)]
     pub unbonding: BTreeMap<String, Vec<UnbondingEntry>>,
+    /// Tokens vesting toward each recipient (team/investor lockups).
+    #[serde(default)]
+    pub vesting: BTreeMap<String, Vec<VestingEntry>>,
     /// Fees collected within the current block; paid to the validator and
     /// zeroed by `end_block`, so it is always 0 at block boundaries.
     #[serde(default)]
@@ -259,6 +308,16 @@ impl ChainState {
                     .vrf_public_key
                     .as_ref()
                     .ok_or_else(|| "Stake missing VRF public key".to_string())?;
+                // Validator floor: the resulting total stake must meet the
+                // minimum (checked before any state mutation).
+                let current = self.stakers.get(from).map(|i| i.stake).unwrap_or(0);
+                let resulting = current.saturating_add(tx.amount);
+                if resulting < MIN_VALIDATOR_STAKE {
+                    return Err(format!(
+                        "Stake below the validator minimum: {} would hold {}, need {}",
+                        from, resulting, MIN_VALIDATOR_STAKE
+                    ));
+                }
                 self.consume_nonce(from, tx.nonce)?;
                 let fee = self.base_fee;
                 self.debit(from, tx.amount + fee)?;
@@ -297,6 +356,17 @@ impl ChainState {
                         from, info.stake, tx.amount
                     ));
                 }
+                // Validator floor: a withdrawal must either exit fully
+                // (remaining stake 0, released through unbonding) or leave
+                // at least the minimum bonded.
+                let remaining = info.stake - tx.amount;
+                if remaining != 0 && remaining < MIN_VALIDATOR_STAKE {
+                    return Err(format!(
+                        "Withdrawal would leave {} below the validator minimum ({}); \
+                         withdraw the full stake to exit",
+                        remaining, MIN_VALIDATOR_STAKE
+                    ));
+                }
 
                 self.consume_nonce(from, tx.nonce)?;
                 // The withdrawal fee comes from liquid balance; the stake
@@ -312,6 +382,37 @@ impl ChainState {
                     .push(UnbondingEntry {
                         amount: tx.amount,
                         release_height: height + UNBONDING_BLOCKS,
+                    });
+                Ok(())
+            }
+            TransactionType::Vest => {
+                let from = tx
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "Vest missing sender".to_string())?;
+                let cliff = tx
+                    .vesting_cliff_blocks
+                    .ok_or_else(|| "Vest missing cliff".to_string())?;
+                let duration = tx
+                    .vesting_duration_blocks
+                    .ok_or_else(|| "Vest missing duration".to_string())?;
+                if duration == 0 || cliff > duration {
+                    return Err("Invalid vesting schedule".to_string());
+                }
+                self.consume_nonce(from, tx.nonce)?;
+                let fee = self.base_fee;
+                self.debit(from, tx.amount + fee)?;
+                self.credit(VESTING_POOL_ACCOUNT, tx.amount);
+                self.fee_pot += fee;
+                self.vesting
+                    .entry(tx.to.clone())
+                    .or_default()
+                    .push(VestingEntry {
+                        total: tx.amount,
+                        released: 0,
+                        start_height: height,
+                        cliff_height: height + cliff,
+                        end_height: height + duration,
                     });
                 Ok(())
             }
@@ -465,6 +566,31 @@ impl ChainState {
             }
         }
 
+        // Release newly vested tokens (pool → recipient balance). Linear
+        // accrual gated by each entry's cliff; deterministic because it is
+        // a pure function of (entry, height). Completed entries drop out.
+        let recipients: Vec<String> = self.vesting.keys().cloned().collect();
+        for recipient in recipients {
+            let mut newly_released = 0u64;
+            if let Some(entries) = self.vesting.get_mut(&recipient) {
+                for entry in entries.iter_mut() {
+                    let vested = entry.vested_at(height);
+                    if vested > entry.released {
+                        newly_released += vested - entry.released;
+                        entry.released = vested;
+                    }
+                }
+                entries.retain(|entry| entry.released < entry.total);
+                if entries.is_empty() {
+                    self.vesting.remove(&recipient);
+                }
+            }
+            if newly_released > 0 {
+                let _ = self.debit(VESTING_POOL_ACCOUNT, newly_released);
+                self.credit(&recipient, newly_released);
+            }
+        }
+
         // Fee market: derive the number of fee-paying transactions in this
         // block from the pot (all paid the same base fee), then set the base
         // fee for the NEXT block. Deterministic — every node computes it.
@@ -489,6 +615,10 @@ mod tests {
     use super::*;
     use crate::blockchain::transaction::BLOCK_REWARD;
 
+    /// Test genesis supply: 100M HKM — comfortably above the genesis
+    /// validator stake and every amount the tests move around.
+    const TEST_SUPPLY: u64 = 100_000_000 * UNITS_PER_HKM;
+
     fn wallet(seed: u8) -> (String, String, String) {
         let private_key = hex::encode([seed; 32]);
         let public_key = pos::derive_public_key(&private_key).unwrap();
@@ -499,7 +629,7 @@ mod tests {
     fn genesis_state() -> (ChainState, String, String, String) {
         let (address, public_key, private_key) = wallet(1);
         let vrf_key = crate::consensus::vrf::derive_vrf_public_key(&private_key).unwrap();
-        let state = ChainState::genesis(&address, Some(&public_key), Some(&vrf_key), 1_000_000);
+        let state = ChainState::genesis(&address, Some(&public_key), Some(&vrf_key), TEST_SUPPLY);
         (state, address, public_key, private_key)
     }
 
@@ -508,14 +638,14 @@ mod tests {
         let (state, treasury, _, _) = genesis_state();
         assert_eq!(
             state.balance_of(&treasury),
-            1_000_000 - GENESIS_VALIDATOR_STAKE
+            TEST_SUPPLY - GENESIS_VALIDATOR_STAKE
         );
         assert_eq!(
             state.balance_of(STAKING_POOL_ACCOUNT),
             GENESIS_VALIDATOR_STAKE
         );
         assert_eq!(state.validator_set().len(), 1);
-        assert_eq!(state.total_supply, 1_000_000);
+        assert_eq!(state.total_supply, TEST_SUPPLY);
     }
 
     #[test]
@@ -564,21 +694,24 @@ mod tests {
         let (mut state, treasury, _, _) = genesis_state();
         let (address, public_key, private_key) = wallet(2);
 
+        let stake_amount = MIN_VALIDATOR_STAKE;
+        let funded = stake_amount + 10 * TX_FEE;
+
         // Fund the new validator from treasury (sender pays the fee).
         let mut fund = Transaction::new(
             Some(treasury.clone()),
             address.clone(),
-            500,
+            funded,
             TransactionType::Transfer,
         );
         fund.nonce = 1;
         state.apply_transaction(&fund, 1).unwrap();
 
-        // Stake 300 (+1 fee).
+        // Stake the validator minimum (+fee).
         let mut stake = Transaction::new(
             Some(address.clone()),
             STAKING_POOL_ACCOUNT.to_string(),
-            300,
+            stake_amount,
             TransactionType::Stake,
         );
         stake.nonce = 1;
@@ -587,36 +720,162 @@ mod tests {
             Some(crate::consensus::vrf::derive_vrf_public_key(&private_key).unwrap());
         state.apply_transaction(&stake, 1).unwrap();
         assert_eq!(state.validator_set().len(), 2);
-        assert_eq!(state.balance_of(&address), 500 - 300 - TX_FEE);
+        assert_eq!(state.balance_of(&address), funded - stake_amount - TX_FEE);
 
-        // Withdraw 300 (+1 fee) at height 2: funds enter UNBONDING, they
-        // are NOT immediately spendable.
+        // Withdraw the full stake (+fee) at height 2: funds enter
+        // UNBONDING, they are NOT immediately spendable.
         let mut withdraw = Transaction::new(
             Some(address.clone()),
             address.clone(),
-            300,
+            stake_amount,
             TransactionType::Withdraw,
         );
         withdraw.nonce = 2;
-        let message = Transaction::withdraw_signing_message(&address, 300, 2);
+        let message = Transaction::withdraw_signing_message(&address, stake_amount, 2);
         withdraw.signature = Some(pos::sign_message(&message, &private_key).unwrap());
         state.apply_transaction(&withdraw, 2).unwrap();
 
-        assert_eq!(state.balance_of(&address), 500 - 300 - 2 * TX_FEE);
-        assert_eq!(state.unbonding_total(&address), 300);
+        assert_eq!(state.balance_of(&address), funded - stake_amount - 2 * TX_FEE);
+        assert_eq!(state.unbonding_total(&address), stake_amount);
         // Exited from the active set, but keys retained while unbonding.
         assert_eq!(state.validator_set().len(), 1);
         assert!(state.stakers.contains_key(&address));
 
         // Not released before maturity.
         state.end_block(2 + UNBONDING_BLOCKS - 1, &treasury);
-        assert_eq!(state.unbonding_total(&address), 300);
+        assert_eq!(state.unbonding_total(&address), stake_amount);
 
         // Released at maturity; the fully exited validator entry is gone.
         state.end_block(2 + UNBONDING_BLOCKS, &treasury);
         assert_eq!(state.unbonding_total(&address), 0);
-        assert_eq!(state.balance_of(&address), 500 - 2 * TX_FEE);
+        assert_eq!(state.balance_of(&address), funded - 2 * TX_FEE);
         assert!(!state.stakers.contains_key(&address));
+    }
+
+    #[test]
+    fn stake_below_the_validator_minimum_is_rejected() {
+        let (mut state, treasury, _, _) = genesis_state();
+        let (address, public_key, private_key) = wallet(2);
+
+        let mut fund = Transaction::new(
+            Some(treasury.clone()),
+            address.clone(),
+            MIN_VALIDATOR_STAKE,
+            TransactionType::Transfer,
+        );
+        fund.nonce = 1;
+        state.apply_transaction(&fund, 1).unwrap();
+
+        let mut stake = Transaction::new(
+            Some(address.clone()),
+            STAKING_POOL_ACCOUNT.to_string(),
+            MIN_VALIDATOR_STAKE - 1,
+            TransactionType::Stake,
+        );
+        stake.nonce = 1;
+        stake.public_key = Some(public_key.clone());
+        stake.vrf_public_key =
+            Some(crate::consensus::vrf::derive_vrf_public_key(&private_key).unwrap());
+        let err = state.apply_transaction(&stake, 1).unwrap_err();
+        assert!(err.contains("validator minimum"), "{err}");
+        assert_eq!(state.validator_set().len(), 1);
+    }
+
+    #[test]
+    fn partial_withdrawal_below_the_minimum_is_rejected() {
+        let (mut state, treasury, _, treasury_key) = genesis_state();
+        let _ = treasury;
+
+        // Treasury holds the genesis stake; withdrawing all but a sliver
+        // would leave a sub-minimum validator — rejected. Full exit is fine.
+        let leave_dust = GENESIS_VALIDATOR_STAKE - MIN_VALIDATOR_STAKE + 1;
+        let (treasury_addr, ..) = wallet(1);
+        let mut withdraw = Transaction::new(
+            Some(treasury_addr.clone()),
+            treasury_addr.clone(),
+            leave_dust,
+            TransactionType::Withdraw,
+        );
+        withdraw.nonce = 1;
+        let message = Transaction::withdraw_signing_message(&treasury_addr, leave_dust, 1);
+        withdraw.signature = Some(pos::sign_message(&message, &treasury_key).unwrap());
+        let err = state.apply_transaction(&withdraw, 1).unwrap_err();
+        assert!(err.contains("validator minimum"), "{err}");
+    }
+
+    #[test]
+    fn vesting_releases_after_cliff_then_linearly() {
+        let (mut state, treasury, _, _) = genesis_state();
+        let recipient = "hkmteammember".to_string();
+        let total = 1_000_000 * UNITS_PER_HKM; // 1M HKM lockup
+
+        // Vest at height 10: cliff 100 blocks, full vest over 400 blocks.
+        let mut vest = Transaction::new(
+            Some(treasury.clone()),
+            recipient.clone(),
+            total,
+            TransactionType::Vest,
+        );
+        vest.nonce = 1;
+        vest.vesting_cliff_blocks = Some(100);
+        vest.vesting_duration_blocks = Some(400);
+        state.apply_transaction(&vest, 10).unwrap();
+
+        // Locked in the pool, not spendable by the recipient.
+        assert_eq!(state.balance_of(VESTING_POOL_ACCOUNT), total);
+        assert_eq!(state.balance_of(&recipient), 0);
+
+        // Before the cliff: nothing releases.
+        state.end_block(10 + 99, &treasury);
+        assert_eq!(state.balance_of(&recipient), 0);
+
+        // At the cliff: everything accrued since start releases at once
+        // (100/400 = 25%).
+        state.end_block(10 + 100, &treasury);
+        assert_eq!(state.balance_of(&recipient), total / 4);
+
+        // Midway: linear accrual (50%).
+        state.end_block(10 + 200, &treasury);
+        assert_eq!(state.balance_of(&recipient), total / 2);
+
+        // At the end: fully vested, pool empty, entry cleaned up.
+        state.end_block(10 + 400, &treasury);
+        assert_eq!(state.balance_of(&recipient), total);
+        assert_eq!(state.balance_of(VESTING_POOL_ACCOUNT), 0);
+        assert!(state.vesting.is_empty());
+
+        // Supply is conserved: vesting moves tokens, it never mints.
+        assert_eq!(state.total_supply, TEST_SUPPLY);
+    }
+
+    #[test]
+    fn vesting_rejects_bad_schedules_and_overdrafts() {
+        let (mut state, treasury, _, _) = genesis_state();
+
+        // Cliff beyond duration: rejected.
+        let mut bad = Transaction::new(
+            Some(treasury.clone()),
+            "hkmsomeone".to_string(),
+            100 * UNITS_PER_HKM,
+            TransactionType::Vest,
+        );
+        bad.nonce = 1;
+        bad.vesting_cliff_blocks = Some(500);
+        bad.vesting_duration_blocks = Some(400);
+        assert!(state.apply_transaction(&bad, 1).is_err());
+
+        // Overdraft: a pauper cannot vest what they do not hold.
+        let (pauper, ..) = wallet(9);
+        let mut broke = Transaction::new(
+            Some(pauper),
+            "hkmsomeone".to_string(),
+            100 * UNITS_PER_HKM,
+            TransactionType::Vest,
+        );
+        broke.nonce = 1;
+        broke.vesting_cliff_blocks = Some(0);
+        broke.vesting_duration_blocks = Some(10);
+        assert!(state.apply_transaction(&broke, 1).is_err());
     }
 
     #[test]
@@ -624,18 +883,19 @@ mod tests {
         let (mut state, treasury, treasury_pub, treasury_key) = genesis_state();
         let _ = treasury_pub;
 
-        // Treasury withdraws 400 of its 1000 genesis stake at height 5.
+        // Treasury withdraws 400k HKM of its 1M HKM genesis stake at height 5.
+        let withdrawn = 400_000 * UNITS_PER_HKM;
         let mut withdraw = Transaction::new(
             Some(treasury.clone()),
             treasury.clone(),
-            400,
+            withdrawn,
             TransactionType::Withdraw,
         );
         withdraw.nonce = 1;
-        let message = Transaction::withdraw_signing_message(&treasury, 400, 1);
+        let message = Transaction::withdraw_signing_message(&treasury, withdrawn, 1);
         withdraw.signature = Some(pos::sign_message(&message, &treasury_key).unwrap());
         state.apply_transaction(&withdraw, 5).unwrap();
-        assert_eq!(state.unbonding_total(&treasury), 400);
+        assert_eq!(state.unbonding_total(&treasury), withdrawn);
 
         // Build a slash tx (proof internals are validated statelessly by
         // verify_for_block; apply checks the stateful parts we exercise by
@@ -667,29 +927,35 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("window"), "{err}");
 
-        // Inside the window: slashes 10% of bonded (600) + unbonding (400).
+        // Inside the window: slashes 10% of bonded (600k) + unbonding (400k)
+        // = 100k HKM.
+        let slashed = 100_000 * UNITS_PER_HKM;
         let pool_before = state.balance_of(STAKING_POOL_ACCOUNT);
         state.apply_transaction(&slash, 8).unwrap();
-        assert_eq!(state.burned, 100);
-        assert_eq!(state.balance_of(STAKING_POOL_ACCOUNT), pool_before - 100);
+        assert_eq!(state.burned, slashed);
+        assert_eq!(
+            state.balance_of(STAKING_POOL_ACCOUNT),
+            pool_before - slashed
+        );
         // Bonded stake absorbs the deduction first.
-        assert_eq!(state.stakers[&treasury].stake, 500);
-        assert_eq!(state.unbonding_total(&treasury), 400);
+        assert_eq!(state.stakers[&treasury].stake, 500_000 * UNITS_PER_HKM);
+        assert_eq!(state.unbonding_total(&treasury), withdrawn);
     }
 
     #[test]
     fn base_fee_rises_with_congestion_and_falls_when_idle() {
+        let mid = 8 * TX_FEE; // comfortably above the floor
         // Above target → rises (bounded to +1/8 per step at minimum +1).
-        let up = next_base_fee(1000, BASE_FEE_TARGET_TXS + BASE_FEE_TARGET_TXS);
-        assert!(up > 1000);
-        assert!(up <= 1000 + 1000 / 8 + 1);
+        let up = next_base_fee(mid, BASE_FEE_TARGET_TXS + BASE_FEE_TARGET_TXS);
+        assert!(up > mid);
+        assert!(up <= mid + mid / 8 + 1);
         // Below target → falls but never past the floor.
-        let down = next_base_fee(1000, 0);
-        assert!(down < 1000 && down >= TX_FEE);
+        let down = next_base_fee(mid, 0);
+        assert!(down < mid && down >= TX_FEE);
         // At the floor, an idle block keeps it at the floor.
         assert_eq!(next_base_fee(TX_FEE, 0), TX_FEE);
         // At target → unchanged.
-        assert_eq!(next_base_fee(500, BASE_FEE_TARGET_TXS), 500);
+        assert_eq!(next_base_fee(mid, BASE_FEE_TARGET_TXS), mid);
         // Never exceeds the ceiling.
         assert!(next_base_fee(BASE_FEE_MAX, 10_000) <= BASE_FEE_MAX);
     }

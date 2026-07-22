@@ -100,6 +100,12 @@ address_of() { "${WALLET}" address "$1" | awk '{print $2}'; }
 echo "Registering validators 2..5 on-chain..."
 VALIDATOR_KEYS=("${VALIDATOR1_KEY}" "${VALIDATOR2_KEY}" "${VALIDATOR3_KEY}" "${VALIDATOR4_KEY}")
 
+# Amounts are in base units (6 decimals: 1 HKM = 1,000,000 units).
+# Each validator stakes the on-chain minimum (10,000 HKM) and is funded
+# with a margin for transaction fees.
+STAKE_UNITS=10000000000      # 10,000 HKM = MIN_VALIDATOR_STAKE
+FUND_UNITS=10100000000       # 10,100 HKM (stake + fee margin)
+
 for sk in "${VALIDATOR_KEYS[@]}"; do
   pub=$(pubkey_of "$sk")
   addr=$(address_of "$pub")
@@ -108,20 +114,20 @@ for sk in "${VALIDATOR_KEYS[@]}"; do
   curl -s -X POST "${BOOT}/tokens/faucet" \
     -H "Content-Type: application/json" \
     -H "x-admin-token: ${ADMIN_TOKEN}" \
-    -d "{\"to\":\"${addr}\",\"amount\":300}" >/dev/null
+    -d "{\"to\":\"${addr}\",\"amount\":${FUND_UNITS}}" >/dev/null
   mine_any
 
   # Sign and submit the on-chain stake (binds the VRF key), then mine it in.
   nonce=$(curl -s "${BOOT}/tokens/nonce/${addr}" | sed 's/.*"next_nonce":\([0-9]*\).*/\1/')
-  stake_out=$("${WALLET}" sign-stake "${addr}" 100 "${nonce}" "${sk}")
+  stake_out=$("${WALLET}" sign-stake "${addr}" "${STAKE_UNITS}" "${nonce}" "${sk}")
   sig=$(echo "${stake_out}" | awk '/signature:/{print $2}')
   vrf_pub=$(echo "${stake_out}" | awk '/vrf_public_key:/{print $2}')
 
   curl -s -X POST "${BOOT}/staking/deposit" \
     -H "Content-Type: application/json" \
-    -d "{\"address\":\"${addr}\",\"amount\":100,\"public_key\":\"${pub}\",\"vrf_public_key\":\"${vrf_pub}\",\"nonce\":${nonce},\"signature\":\"${sig}\"}" >/dev/null
+    -d "{\"address\":\"${addr}\",\"amount\":${STAKE_UNITS},\"public_key\":\"${pub}\",\"vrf_public_key\":\"${vrf_pub}\",\"nonce\":${nonce},\"signature\":\"${sig}\"}" >/dev/null
   mine_any
-  echo "  registered ${addr} (stake 100)"
+  echo "  registered ${addr} (stake ${STAKE_UNITS} units = 10,000 HKM)"
 done
 
 echo "Testnet started. Validator set:"

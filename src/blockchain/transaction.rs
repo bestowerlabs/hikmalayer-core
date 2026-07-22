@@ -5,27 +5,47 @@ use uuid::Uuid;
 use crate::blockchain::block::Block;
 use crate::consensus::pos;
 
-/// Initial block reward (height 1 through the first halving).
-pub const BLOCK_REWARD: u64 = 5;
+/// HKM is denominated with 6 decimal places: all on-chain amounts are in
+/// base units, and 1 HKM = 1,000,000 base units. Chosen so the ~100B HKM
+/// supply (10^17 base units) keeps ~180x headroom under u64::MAX — no
+/// balance or supply aggregate can overflow.
+pub const DECIMALS: u32 = 6;
+pub const UNITS_PER_HKM: u64 = 1_000_000;
+
+/// Initial block reward: 5,000 HKM (height 1 through the first halving).
+pub const BLOCK_REWARD: u64 = 5_000 * UNITS_PER_HKM;
 
 /// Blocks between reward halvings — a Bitcoin-style deterministic emission
-/// schedule. The reward halves every interval until it reaches zero, after
-/// which validators are compensated purely by transaction fees.
-pub const HALVING_INTERVAL: u64 = 1_000_000;
+/// schedule. At the 15s block target, 8,000,000 blocks ≈ 3.8 years per
+/// halving epoch (Bitcoin cadence). Halving-phase emission sums to just
+/// under 80B HKM, which with the 20B HKM genesis allocation gives the
+/// ~100B HKM supply at maturity.
+pub const HALVING_INTERVAL: u64 = 8_000_000;
+
+/// Tail emission floor: 50 HKM per block. Once halvings would push the
+/// reward below this floor (epoch 8, ~29 years in), the reward stays here
+/// forever — a perpetual security budget (~0.1%/year of the 100B supply,
+/// a rate that decays as supply grows) so validators are never left with
+/// fees alone. Monero-style: supply is asymptotically capped in *rate*,
+/// not absolute count.
+pub const TAIL_EMISSION: u64 = 50 * UNITS_PER_HKM;
 
 /// Deterministic block reward for the block at `height`. Genesis (height 0)
-/// pays nothing; every subsequent block pays `BLOCK_REWARD >> halvings`,
-/// where `halvings = (height - 1) / HALVING_INTERVAL`. Every node computes
-/// the identical schedule, so emission is consensus-enforced.
+/// pays nothing; every subsequent block pays `BLOCK_REWARD >> halvings`
+/// (where `halvings = (height - 1) / HALVING_INTERVAL`) floored at
+/// TAIL_EMISSION. Every node computes the identical schedule, so emission
+/// is consensus-enforced.
 pub fn block_reward(height: u64) -> u64 {
     if height == 0 {
         return 0;
     }
     let halvings = (height - 1) / HALVING_INTERVAL;
-    if halvings >= 63 {
-        return 0;
-    }
-    BLOCK_REWARD >> halvings
+    let halved = if halvings >= 63 {
+        0
+    } else {
+        BLOCK_REWARD >> halvings
+    };
+    halved.max(TAIL_EMISSION)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,7 +56,12 @@ pub enum TransactionType {
     Stake,       // Register / increase validator stake (on-chain)
     Withdraw,    // Reduce / exit validator stake (on-chain)
     Slash,       // Punish a proven equivocation (on-chain)
+    Vest,        // Lock tokens for a recipient on a cliff + linear schedule
 }
+
+/// Upper bound on a vesting schedule's duration (~47 years at 15s blocks).
+/// Bounds per-entry arithmetic and prevents nonsense schedules.
+pub const MAX_VESTING_DURATION_BLOCKS: u64 = 100_000_000;
 
 /// Proof that one validator signed two different blocks at the same height.
 /// Both blocks are self-contained: their hashes are recomputable from the
@@ -128,6 +153,13 @@ pub struct Transaction {
     /// Credential registry action (Certificate transactions only).
     #[serde(default)]
     pub credential: Option<CredentialAction>,
+    /// Vest transactions only: blocks after inclusion before ANY tokens
+    /// release (the cliff), and total blocks over which the amount vests
+    /// linearly. cliff <= duration.
+    #[serde(default)]
+    pub vesting_cliff_blocks: Option<u64>,
+    #[serde(default)]
+    pub vesting_duration_blocks: Option<u64>,
 }
 
 /// Issue or revoke an on-chain verifiable credential. Only the hash of the
@@ -161,6 +193,8 @@ impl Transaction {
             slash_proof: None,
             vrf_public_key: None,
             credential: None,
+            vesting_cliff_blocks: None,
+            vesting_duration_blocks: None,
         }
     }
 
@@ -205,6 +239,23 @@ impl Transaction {
     /// Canonical message a validator signs to authorize a stake withdrawal.
     pub fn withdraw_signing_message(address: &str, amount: u64, nonce: u64) -> String {
         format!("hikmalayer-withdraw:{}:{}:{}", address, amount, nonce)
+    }
+
+    /// Canonical message a sender signs to lock tokens into a vesting
+    /// schedule for a recipient. Binds the full schedule so neither the
+    /// cliff nor the duration can be altered in transit.
+    pub fn vest_signing_message(
+        from: &str,
+        to: &str,
+        amount: u64,
+        cliff_blocks: u64,
+        duration_blocks: u64,
+        nonce: u64,
+    ) -> String {
+        format!(
+            "hikmalayer-vest:{}:{}:{}:{}:{}:{}",
+            from, to, amount, cliff_blocks, duration_blocks, nonce
+        )
     }
 
     /// Stateless consensus verification of a transaction inside a block
@@ -288,6 +339,36 @@ impl Transaction {
                 }
                 Ok(())
             }
+            TransactionType::Vest => {
+                let from = self
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "Vest transaction missing sender".to_string())?;
+                if self.amount == 0 {
+                    return Err("Vest amount must be greater than zero".to_string());
+                }
+                if self.to.trim().is_empty() {
+                    return Err("Vest transaction missing recipient".to_string());
+                }
+                let cliff = self
+                    .vesting_cliff_blocks
+                    .ok_or_else(|| "Vest transaction missing cliff".to_string())?;
+                let duration = self
+                    .vesting_duration_blocks
+                    .ok_or_else(|| "Vest transaction missing duration".to_string())?;
+                if duration == 0 || duration > MAX_VESTING_DURATION_BLOCKS {
+                    return Err(format!(
+                        "Vest duration must be 1..={} blocks",
+                        MAX_VESTING_DURATION_BLOCKS
+                    ));
+                }
+                if cliff > duration {
+                    return Err("Vest cliff cannot exceed the duration".to_string());
+                }
+                let message =
+                    Self::vest_signing_message(from, &self.to, self.amount, cliff, duration, self.nonce);
+                self.verify_sender_signature(from, &message)
+            }
             TransactionType::Slash => {
                 if self.from.is_some() || self.amount != 0 {
                     return Err("Slash transaction must carry no sender or value".to_string());
@@ -362,14 +443,35 @@ mod tests {
     }
 
     #[test]
-    fn emission_halves_on_schedule() {
+    #[allow(clippy::assertions_on_constants)] // schedule sanity asserts are the point
+    fn emission_halves_on_schedule_and_floors_at_the_tail() {
         assert_eq!(block_reward(0), 0); // genesis pays nothing
         assert_eq!(block_reward(1), BLOCK_REWARD);
         assert_eq!(block_reward(HALVING_INTERVAL), BLOCK_REWARD);
         assert_eq!(block_reward(HALVING_INTERVAL + 1), BLOCK_REWARD / 2);
         assert_eq!(block_reward(2 * HALVING_INTERVAL + 1), BLOCK_REWARD / 4);
-        // Eventually emission stops; fees carry the chain.
-        assert_eq!(block_reward(100 * HALVING_INTERVAL + 1), 0);
+
+        // The halvings floor at the tail emission and stay there forever —
+        // the perpetual security budget. 5,000 >> 7 = 39 HKM < 50 HKM, so
+        // epoch 8 (halvings = 7) is the first tail epoch.
+        assert!(BLOCK_REWARD >> 7 < TAIL_EMISSION);
+        assert!(BLOCK_REWARD >> 6 > TAIL_EMISSION);
+        assert_eq!(block_reward(7 * HALVING_INTERVAL + 1), TAIL_EMISSION);
+        assert_eq!(block_reward(100 * HALVING_INTERVAL + 1), TAIL_EMISSION);
+        assert_eq!(block_reward(u64::MAX), TAIL_EMISSION);
+
+        // Halving-phase emission + genesis lands just under the 100B cap:
+        // sum over epochs of interval * reward, in whole HKM.
+        let mut mined_hkm: u128 = 0;
+        for epoch in 0..7u32 {
+            let reward = (BLOCK_REWARD >> epoch).max(TAIL_EMISSION);
+            mined_hkm += (HALVING_INTERVAL as u128) * (reward as u128)
+                / (UNITS_PER_HKM as u128);
+        }
+        let genesis_hkm: u128 = 20_000_000_000;
+        let total = genesis_hkm + mined_hkm;
+        assert!(total > 99_000_000_000, "total at tail start: {total}");
+        assert!(total <= 100_000_000_000, "total at tail start: {total}");
     }
 
     #[test]

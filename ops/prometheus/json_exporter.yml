@@ -1,24 +1,9 @@
 modules:
   hikmalayer:
     method: GET
-    headers:
-      Content-Type: application/json
     metrics:
       - name: hikmalayer_blocks_mined
-        path: $.blocks_mined
-        type: gauge
-      - name: hikmalayer_blocks_received
-        path: $.blocks_received
-        type: gauge
-      - name: hikmalayer_gossip_sent
-        path: $.gossip_sent
-        type: gauge
-      - name: hikmalayer_gossip_failed
-        path: $.gossip_failed
-        type: gauge
-      - name: hikmalayer_peers_registered
-        path: $.peers_registered
-        type: gauge
-      - name: hikmalayer_slashes_submitted
-        path: $.slashes_submitted
-        type: gauge
+        type: object
+        path: '{.blocks_mined}'
+        values:
+          value: '{.blocks_mined}'

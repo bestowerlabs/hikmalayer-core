@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "hikmalayer"
+    static_configs:
+      - targets:
+          - "hikmalayer-exporter:8000"   # bootnode (local)
+          - "<validator1-ip>:8000"        # Frankfurt — Account 2
+          - "<validator2-ip>:8000"        # Amsterdam — Account 3
+          - "<validator3-ip>:8000"        # Chicago — Account 4
+          - "<validator4-ip>:8000"        # Singapore — Account 5
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance

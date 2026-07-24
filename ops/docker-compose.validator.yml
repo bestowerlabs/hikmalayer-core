@@ -1,0 +1,43 @@
+services:
+  validator:
+    build: .
+    container_name: hikmalayer-validator
+    environment:
+      NODE_ID: ${NODE_ID}
+      VALIDATOR_PRIVATE_KEY: ${VALIDATOR_PRIVATE_KEY}
+      BOOTNODES: ${BOOTNODES}
+      P2P_TOKEN: ${P2P_TOKEN}
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      P2P_REQUIRE_IDENTITY: "true"
+      RUST_LOG: info
+    ports:
+      - "3001:3000"
+    restart: unless-stopped
+
+  hikmalayer-exporter:
+    image: python:3.11-alpine
+    container_name: hikmalayer-exporter
+    volumes:
+      - ./ops/hikmalayer_exporter.py:/exporter.py:ro
+    command: ["sh", "-c", "python3 /exporter.py"]
+    ports:
+      - "8000:8000"
+    depends_on:
+      - validator
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:latest
+    container_name: hikmalayer-caddy
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./ops/caddy/Caddyfile.validator:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - validator
+    restart: unless-stopped
+
+volumes:
+  caddy_data:

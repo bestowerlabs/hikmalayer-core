@@ -1,0 +1,8 @@
+:443 {
+    tls internal
+    reverse_proxy validator:3000
+}
+
+:80 {
+    redir https://{host}{uri} permanent
+}

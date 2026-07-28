@@ -12,6 +12,9 @@
 //!   hikma-wallet sign-stake <address> <amount> <nonce> <private_key_hex>
 //!   hikma-wallet sign-withdraw <address> <amount> <nonce> <private_key_hex>
 //!   hikma-wallet sign-vest <from> <to> <amount> <cliff_blocks> <duration_blocks> <nonce> <private_key_hex>
+//!   hikma-wallet sign-token-create <symbol> <name> <decimals> <initial_supply> <nonce> <private_key_hex>
+//!   hikma-wallet sign-token-transfer <token_id> <to> <amount> <nonce> <private_key_hex>
+//!   hikma-wallet sign-token-burn <token_id> <amount> <nonce> <private_key_hex>
 //!   hikma-wallet sign-credential <id> <subject> <data_hash> <revoke> <nonce> <private_key_hex>
 
 use hikmalayer::blockchain::transaction::{CredentialAction, Transaction};
@@ -55,7 +58,7 @@ fn sign_and_print(message: &str, private_key: &str) -> Result<(), String> {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "Commands:\n  keygen\n  address <public_key_hex>\n  sign-block <block_hash_hex> <private_key_hex>\n  vrf-prove <slot_input> <private_key_hex>\n  sign-transfer <from> <to> <amount> <nonce> <private_key_hex>\n  sign-stake <address> <amount> <nonce> <private_key_hex>\n  sign-withdraw <address> <amount> <nonce> <private_key_hex>\n  sign-vest <from> <to> <amount> <cliff_blocks> <duration_blocks> <nonce> <private_key_hex>\n  sign-credential <id> <subject> <data_hash> <revoke> <nonce> <private_key_hex>";
+    let usage = "Commands:\n  keygen\n  address <public_key_hex>\n  sign-block <block_hash_hex> <private_key_hex>\n  vrf-prove <slot_input> <private_key_hex>\n  sign-transfer <from> <to> <amount> <nonce> <private_key_hex>\n  sign-stake <address> <amount> <nonce> <private_key_hex>\n  sign-withdraw <address> <amount> <nonce> <private_key_hex>\n  sign-vest <from> <to> <amount> <cliff_blocks> <duration_blocks> <nonce> <private_key_hex>\n  sign-token-create <symbol> <name> <decimals> <initial_supply> <nonce> <private_key_hex>\n  sign-token-transfer <token_id> <to> <amount> <nonce> <private_key_hex>\n  sign-token-burn <token_id> <amount> <nonce> <private_key_hex>\n  sign-credential <id> <subject> <data_hash> <revoke> <nonce> <private_key_hex>";
 
     match args.first().map(String::as_str) {
         Some("keygen") => keygen(),
@@ -113,6 +116,67 @@ fn run() -> Result<(), String> {
             let private_key = args.get(7).ok_or(usage)?;
             let message =
                 Transaction::vest_signing_message(from, to, amount, cliff, duration, nonce);
+            sign_and_print(&message, private_key)
+        }
+        Some("sign-token-create") => {
+            let symbol = args.get(1).ok_or(usage)?;
+            let name = args.get(2).ok_or(usage)?;
+            let decimals: u32 = args
+                .get(3)
+                .ok_or(usage)?
+                .parse()
+                .map_err(|_| "decimals must be a number".to_string())?;
+            let initial_supply: u64 = args
+                .get(4)
+                .ok_or(usage)?
+                .parse()
+                .map_err(|_| "initial_supply must be a number".to_string())?;
+            let nonce: u64 = args
+                .get(5)
+                .ok_or(usage)?
+                .parse()
+                .map_err(|_| "nonce must be a number".to_string())?;
+            let private_key = args.get(6).ok_or(usage)?;
+            let message = Transaction::token_create_signing_message(
+                symbol,
+                name,
+                decimals,
+                initial_supply,
+                nonce,
+            );
+            sign_and_print(&message, private_key)
+        }
+        Some("sign-token-transfer") => {
+            let (token_id, to) = (args.get(1).ok_or(usage)?, args.get(2).ok_or(usage)?);
+            let amount: u64 = args
+                .get(3)
+                .ok_or(usage)?
+                .parse()
+                .map_err(|_| "amount must be a number".to_string())?;
+            let nonce: u64 = args
+                .get(4)
+                .ok_or(usage)?
+                .parse()
+                .map_err(|_| "nonce must be a number".to_string())?;
+            let private_key = args.get(5).ok_or(usage)?;
+            let message =
+                Transaction::token_transfer_signing_message(token_id, to, amount, nonce);
+            sign_and_print(&message, private_key)
+        }
+        Some("sign-token-burn") => {
+            let token_id = args.get(1).ok_or(usage)?;
+            let amount: u64 = args
+                .get(2)
+                .ok_or(usage)?
+                .parse()
+                .map_err(|_| "amount must be a number".to_string())?;
+            let nonce: u64 = args
+                .get(3)
+                .ok_or(usage)?
+                .parse()
+                .map_err(|_| "nonce must be a number".to_string())?;
+            let private_key = args.get(4).ok_or(usage)?;
+            let message = Transaction::token_burn_signing_message(token_id, amount, nonce);
             sign_and_print(&message, private_key)
         }
         Some("vrf-prove") => {

@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 pub const MAX_TIMESTAMP_SKEW_SECONDS: i64 = 120;
 
 /// Default initial supply for networks that do not configure one:
-/// 20,000,000,000 HKM (the 20% genesis allocation of the ~100B HKM supply;
-/// the remaining ~80B is mined via the halving schedule with tail).
+/// 30,000,000,000 HKM (the 30% genesis allocation of the ~100B HKM supply;
+/// the remaining ~70B is mined via the halving schedule with tail).
 pub const DEFAULT_GENESIS_SUPPLY: u64 =
-    20_000_000_000 * crate::blockchain::transaction::UNITS_PER_HKM;
+    30_000_000_000 * crate::blockchain::transaction::UNITS_PER_HKM;
 
 /// Target seconds between blocks for difficulty retargeting.
 pub const TARGET_BLOCK_SECONDS: i64 = 15;

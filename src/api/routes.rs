@@ -126,6 +126,51 @@ pub struct VestRequest {
 }
 
 #[derive(Deserialize)]
+pub struct TokenCreateRequest {
+    pub creator: String,
+    pub symbol: String,
+    #[serde(default)]
+    pub name: String,
+    pub decimals: u32,
+    /// Initial supply in the token's own base units (all minted to creator).
+    pub initial_supply: u64,
+    #[serde(default)]
+    pub nonce: u64,
+    pub public_key: Option<String>,
+    pub signature: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct TokenSendRequest {
+    pub token_id: String,
+    pub from: String,
+    pub to: String,
+    pub amount: u64,
+    #[serde(default)]
+    pub nonce: u64,
+    pub public_key: Option<String>,
+    pub signature: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct TokenBurnRequest {
+    pub token_id: String,
+    pub from: String,
+    pub amount: u64,
+    #[serde(default)]
+    pub nonce: u64,
+    pub public_key: Option<String>,
+    pub signature: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct TokenBalanceResponse {
+    pub token_id: String,
+    pub account: String,
+    pub balance: u64,
+}
+
+#[derive(Deserialize)]
 pub struct FaucetRequest {
     pub to: String,
     pub amount: u64,
@@ -551,6 +596,13 @@ pub fn api_routes() -> Router<AppState> {
         .route("/tokens/faucet", post(faucet_tokens))
         .route("/tokens/balance/{account}", get(get_token_balance))
         .route("/tokens/nonce/{account}", get(get_account_nonce))
+        // Native token standard (HTS): ecosystem assets for the DEX.
+        .route("/assets/create", post(create_token))
+        .route("/assets/transfer", post(send_token))
+        .route("/assets/burn", post(burn_token))
+        .route("/assets", get(list_tokens))
+        .route("/assets/{token_id}", get(get_token))
+        .route("/assets/{token_id}/balance/{account}", get(get_token_holding))
         .route("/fees", get(get_fees))
         // Blockchain routes
         .route("/blocks", get(get_blocks))
@@ -1920,6 +1972,170 @@ async fn get_vesting(
         entries,
         current_height: chain.tip_index(),
         address,
+    })
+}
+
+// ===== NATIVE TOKEN STANDARD (HTS) — ecosystem assets for the DEX =====
+
+/// Issue a new native fungible token. The full initial supply is minted to
+/// the creator; supply is fixed thereafter (only reducible by burning). The
+/// token id is derived deterministically from (creator, symbol, nonce), so
+/// the caller can precompute it.
+async fn create_token(
+    State(state): State<AppState>,
+    Json(payload): Json<TokenCreateRequest>,
+) -> Json<ApiResponse> {
+    if payload.symbol.trim().is_empty() || payload.initial_supply == 0 {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: "Token requires a symbol and a non-zero initial supply".to_string(),
+        });
+    }
+
+    let mut tx = Transaction::new(
+        Some(payload.creator.clone()),
+        String::new(),
+        payload.initial_supply,
+        TransactionType::TokenCreate,
+    );
+    tx.nonce = payload.nonce;
+    tx.public_key = payload.public_key.clone();
+    tx.signature = payload.signature.clone();
+    tx.token = Some(crate::blockchain::transaction::TokenAction {
+        token_id: String::new(),
+        symbol: payload.symbol.clone(),
+        name: payload.name.clone(),
+        decimals: payload.decimals,
+    });
+
+    let token_id = crate::blockchain::transaction::derive_token_id(
+        &payload.creator,
+        &payload.symbol,
+        payload.nonce,
+    );
+
+    match queue_transaction(&state, tx).await {
+        Ok(()) => Json(ApiResponse {
+            status: "success".to_string(),
+            message: format!(
+                "Token {} ({}) with supply {} queued; it is created when mined. token_id={}",
+                payload.symbol, payload.name, payload.initial_supply, token_id
+            ),
+        }),
+        Err(message) => Json(ApiResponse {
+            status: "error".to_string(),
+            message,
+        }),
+    }
+}
+
+/// Transfer native-token units between accounts.
+async fn send_token(
+    State(state): State<AppState>,
+    Json(payload): Json<TokenSendRequest>,
+) -> Json<ApiResponse> {
+    if payload.amount == 0 || payload.to.trim().is_empty() || payload.token_id.trim().is_empty() {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: "Token transfer requires token_id, recipient, and a non-zero amount"
+                .to_string(),
+        });
+    }
+
+    let mut tx = Transaction::new(
+        Some(payload.from.clone()),
+        payload.to.clone(),
+        payload.amount,
+        TransactionType::TokenTransfer,
+    );
+    tx.nonce = payload.nonce;
+    tx.public_key = payload.public_key.clone();
+    tx.signature = payload.signature.clone();
+    tx.token = Some(crate::blockchain::transaction::TokenAction {
+        token_id: payload.token_id.clone(),
+        ..Default::default()
+    });
+
+    match queue_transaction(&state, tx).await {
+        Ok(()) => Json(ApiResponse {
+            status: "success".to_string(),
+            message: format!(
+                "Transfer of {} {} from {} to {} queued",
+                payload.amount, payload.token_id, payload.from, payload.to
+            ),
+        }),
+        Err(message) => Json(ApiResponse {
+            status: "error".to_string(),
+            message,
+        }),
+    }
+}
+
+/// Burn native-token units held by the sender, reducing the token's supply.
+async fn burn_token(
+    State(state): State<AppState>,
+    Json(payload): Json<TokenBurnRequest>,
+) -> Json<ApiResponse> {
+    if payload.amount == 0 || payload.token_id.trim().is_empty() {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: "Token burn requires token_id and a non-zero amount".to_string(),
+        });
+    }
+
+    let mut tx = Transaction::new(
+        Some(payload.from.clone()),
+        String::new(),
+        payload.amount,
+        TransactionType::TokenBurn,
+    );
+    tx.nonce = payload.nonce;
+    tx.public_key = payload.public_key.clone();
+    tx.signature = payload.signature.clone();
+    tx.token = Some(crate::blockchain::transaction::TokenAction {
+        token_id: payload.token_id.clone(),
+        ..Default::default()
+    });
+
+    match queue_transaction(&state, tx).await {
+        Ok(()) => Json(ApiResponse {
+            status: "success".to_string(),
+            message: format!(
+                "Burn of {} {} by {} queued",
+                payload.amount, payload.token_id, payload.from
+            ),
+        }),
+        Err(message) => Json(ApiResponse {
+            status: "error".to_string(),
+            message,
+        }),
+    }
+}
+
+async fn list_tokens(
+    State(state): State<AppState>,
+) -> Json<Vec<crate::blockchain::state::TokenInfo>> {
+    let chain = state.chain.lock().await;
+    Json(chain.state.tokens.values().cloned().collect())
+}
+
+async fn get_token(
+    State(state): State<AppState>,
+    Path(token_id): Path<String>,
+) -> Json<Option<crate::blockchain::state::TokenInfo>> {
+    let chain = state.chain.lock().await;
+    Json(chain.state.tokens.get(&token_id).cloned())
+}
+
+async fn get_token_holding(
+    State(state): State<AppState>,
+    Path((token_id, account)): Path<(String, String)>,
+) -> Json<TokenBalanceResponse> {
+    let chain = state.chain.lock().await;
+    Json(TokenBalanceResponse {
+        balance: chain.state.token_balance_of(&token_id, &account),
+        token_id,
+        account,
     })
 }
 

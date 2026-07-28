@@ -125,6 +125,20 @@ pub struct StakeInfo {
     pub vrf_public_key: String,
 }
 
+/// A native fungible token (HTS — Hikmalayer Token Standard): the ecosystem
+/// asset primitive a DEX and dapps build on. Supply is fixed at creation
+/// (only reducible by burning), so no issuer can silently inflate a token.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TokenInfo {
+    pub token_id: String,
+    pub symbol: String,
+    pub name: String,
+    pub decimals: u32,
+    pub total_supply: u64,
+    pub creator: String,
+    pub created_at_height: u64,
+}
+
 /// An on-chain verifiable credential: the issuer anchors a hash of the
 /// credential document (the document itself stays private/off-chain) bound
 /// to a subject. Revocation is a first-class on-chain operation by the
@@ -157,6 +171,13 @@ pub struct ChainState {
     /// Tokens vesting toward each recipient (team/investor lockups).
     #[serde(default)]
     pub vesting: BTreeMap<String, Vec<VestingEntry>>,
+    /// Native token registry (HTS): token_id → immutable token metadata.
+    #[serde(default)]
+    pub tokens: BTreeMap<String, TokenInfo>,
+    /// Native token balances: token_id → (holder address → units). Nested
+    /// BTreeMaps keep the state-root serialization canonical.
+    #[serde(default)]
+    pub token_balances: BTreeMap<String, BTreeMap<String, u64>>,
     /// Genesis-configured validator allowlist. When NON-EMPTY, only listed
     /// addresses may register a NEW stake (existing validators may top up);
     /// empty means permissionless staking. Set once at genesis and part of
@@ -236,6 +257,44 @@ impl ChainState {
 
     pub fn nonce_of(&self, account: &str) -> u64 {
         self.nonces.get(account).copied().unwrap_or(0)
+    }
+
+    /// Native-token balance of `account` for `token_id`.
+    pub fn token_balance_of(&self, token_id: &str, account: &str) -> u64 {
+        self.token_balances
+            .get(token_id)
+            .and_then(|holders| holders.get(account))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn credit_token(&mut self, token_id: &str, account: &str, amount: u64) {
+        *self
+            .token_balances
+            .entry(token_id.to_string())
+            .or_default()
+            .entry(account.to_string())
+            .or_insert(0) += amount;
+    }
+
+    fn debit_token(&mut self, token_id: &str, account: &str, amount: u64) -> Result<(), String> {
+        let balance = self.token_balance_of(token_id, account);
+        if balance < amount {
+            return Err(format!(
+                "Insufficient token balance for {} in {}: has {}, needs {}",
+                account, token_id, balance, amount
+            ));
+        }
+        let holders = self
+            .token_balances
+            .get_mut(token_id)
+            .ok_or_else(|| format!("Unknown token {}", token_id))?;
+        let entry = holders.get_mut(account).unwrap();
+        *entry -= amount;
+        if *entry == 0 {
+            holders.remove(account);
+        }
+        Ok(())
     }
 
     /// Total stake currently unbonding for an account.
@@ -442,6 +501,85 @@ impl ChainState {
             TransactionType::Reward => {
                 self.credit(&tx.to, tx.amount);
                 self.total_supply += tx.amount;
+                Ok(())
+            }
+            TransactionType::TokenCreate => {
+                let from = tx
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "TokenCreate missing creator".to_string())?;
+                let action = tx
+                    .token
+                    .as_ref()
+                    .ok_or_else(|| "TokenCreate missing token action".to_string())?;
+                let token_id =
+                    crate::blockchain::transaction::derive_token_id(from, &action.symbol, tx.nonce);
+                if self.tokens.contains_key(&token_id) {
+                    return Err(format!("Token {} already exists", token_id));
+                }
+                // Fee is charged in HKM (ties token issuance to HKM demand
+                // and gates spam); the token's own supply is separate.
+                self.consume_nonce(from, tx.nonce)?;
+                let fee = self.base_fee;
+                self.debit(from, fee)?;
+                self.fee_pot += fee;
+
+                self.tokens.insert(
+                    token_id.clone(),
+                    TokenInfo {
+                        token_id: token_id.clone(),
+                        symbol: action.symbol.clone(),
+                        name: action.name.clone(),
+                        decimals: action.decimals,
+                        total_supply: tx.amount,
+                        creator: from.clone(),
+                        created_at_height: height,
+                    },
+                );
+                self.credit_token(&token_id, from, tx.amount);
+                Ok(())
+            }
+            TransactionType::TokenTransfer => {
+                let from = tx
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "TokenTransfer missing sender".to_string())?;
+                let action = tx
+                    .token
+                    .as_ref()
+                    .ok_or_else(|| "TokenTransfer missing token action".to_string())?;
+                if !self.tokens.contains_key(&action.token_id) {
+                    return Err(format!("Unknown token {}", action.token_id));
+                }
+                self.consume_nonce(from, tx.nonce)?;
+                let fee = self.base_fee;
+                self.debit(from, fee)?; // HKM fee
+                self.fee_pot += fee;
+                self.debit_token(&action.token_id, from, tx.amount)?;
+                self.credit_token(&action.token_id, &tx.to, tx.amount);
+                Ok(())
+            }
+            TransactionType::TokenBurn => {
+                let from = tx
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "TokenBurn missing sender".to_string())?;
+                let action = tx
+                    .token
+                    .as_ref()
+                    .ok_or_else(|| "TokenBurn missing token action".to_string())?;
+                if !self.tokens.contains_key(&action.token_id) {
+                    return Err(format!("Unknown token {}", action.token_id));
+                }
+                self.consume_nonce(from, tx.nonce)?;
+                let fee = self.base_fee;
+                self.debit(from, fee)?; // HKM fee
+                self.fee_pot += fee;
+                self.debit_token(&action.token_id, from, tx.amount)?;
+                // Reduce the token's recorded supply to match.
+                if let Some(info) = self.tokens.get_mut(&action.token_id) {
+                    info.total_supply = info.total_supply.saturating_sub(tx.amount);
+                }
                 Ok(())
             }
             TransactionType::Certificate => {
@@ -942,6 +1080,127 @@ mod tests {
 
         // Supply is conserved: vesting moves tokens, it never mints.
         assert_eq!(state.total_supply, TEST_SUPPLY);
+    }
+
+    #[test]
+    fn native_token_create_transfer_burn_lifecycle() {
+        use crate::blockchain::transaction::{derive_token_id, TokenAction};
+        let (mut state, treasury, _, _) = genesis_state();
+        let (holder, ..) = wallet(4);
+
+        // Create a token: 1,000,000 units (8 decimals) minted to the creator.
+        let supply = 1_000_000u64;
+        let mut create = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            supply,
+            TransactionType::TokenCreate,
+        );
+        create.nonce = 1;
+        create.token = Some(TokenAction {
+            token_id: String::new(),
+            symbol: "HTEST".to_string(),
+            name: "Hik Test".to_string(),
+            decimals: 8,
+        });
+        let hkm_before = state.balance_of(&treasury);
+        state.apply_transaction(&create, 1).unwrap();
+
+        let token_id = derive_token_id(&treasury, "HTEST", 1);
+        assert!(state.tokens.contains_key(&token_id));
+        assert_eq!(state.tokens[&token_id].total_supply, supply);
+        assert_eq!(state.tokens[&token_id].decimals, 8);
+        assert_eq!(state.token_balance_of(&token_id, &treasury), supply);
+        // Creation charged an HKM base fee (no token minted to anyone else).
+        assert_eq!(state.balance_of(&treasury), hkm_before - state.base_fee);
+
+        // Transfer 250,000 units to a holder.
+        let mut send = Transaction::new(
+            Some(treasury.clone()),
+            holder.clone(),
+            250_000,
+            TransactionType::TokenTransfer,
+        );
+        send.nonce = 2;
+        send.token = Some(TokenAction {
+            token_id: token_id.clone(),
+            ..Default::default()
+        });
+        state.apply_transaction(&send, 1).unwrap();
+        assert_eq!(state.token_balance_of(&token_id, &holder), 250_000);
+        assert_eq!(state.token_balance_of(&token_id, &treasury), 750_000);
+        // Token supply is unchanged by transfers.
+        assert_eq!(state.tokens[&token_id].total_supply, supply);
+
+        // Burn 100,000 units from the treasury: supply drops accordingly.
+        let mut burn = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            100_000,
+            TransactionType::TokenBurn,
+        );
+        burn.nonce = 3;
+        burn.token = Some(TokenAction {
+            token_id: token_id.clone(),
+            ..Default::default()
+        });
+        state.apply_transaction(&burn, 1).unwrap();
+        assert_eq!(state.token_balance_of(&token_id, &treasury), 650_000);
+        assert_eq!(state.tokens[&token_id].total_supply, supply - 100_000);
+
+        // HKM supply is untouched by any native-token operation.
+        assert_eq!(state.total_supply, TEST_SUPPLY);
+    }
+
+    #[test]
+    fn native_token_rejects_overdraft_and_unknown_token() {
+        use crate::blockchain::transaction::TokenAction;
+        let (mut state, treasury, _, _) = genesis_state();
+
+        // Transfer against a token that does not exist.
+        let mut send = Transaction::new(
+            Some(treasury.clone()),
+            "hkmsomeone".to_string(),
+            1,
+            TransactionType::TokenTransfer,
+        );
+        send.nonce = 1;
+        send.token = Some(TokenAction {
+            token_id: "hktdeadbeef".to_string(),
+            ..Default::default()
+        });
+        assert!(state.apply_transaction(&send, 1).is_err());
+
+        // Create a small token, then try to transfer more than held.
+        let mut create = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            100,
+            TransactionType::TokenCreate,
+        );
+        create.nonce = 1;
+        create.token = Some(TokenAction {
+            token_id: String::new(),
+            symbol: "SMALL".to_string(),
+            name: String::new(),
+            decimals: 0,
+        });
+        state.apply_transaction(&create, 1).unwrap();
+        let token_id = crate::blockchain::transaction::derive_token_id(&treasury, "SMALL", 1);
+
+        let mut overspend = Transaction::new(
+            Some(treasury.clone()),
+            "hkmsomeone".to_string(),
+            101,
+            TransactionType::TokenTransfer,
+        );
+        overspend.nonce = 2;
+        overspend.token = Some(TokenAction {
+            token_id: token_id.clone(),
+            ..Default::default()
+        });
+        let err = state.apply_transaction(&overspend, 1).unwrap_err();
+        assert!(err.contains("Insufficient token balance"), "{err}");
     }
 
     #[test]

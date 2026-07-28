@@ -72,13 +72,21 @@ signing conventions. It provides:
   bearer tokens; verification is stateless, constant-time, and fail-closed.
 - **100B HKM tokenomics with halving + security tail.** HKM has 6 decimals
   (1 HKM = 1,000,000 base units; all on-chain amounts are base units, safely inside
-  u64 with ~180× headroom). Genesis allocates **20B HKM** to the treasury; the
-  remaining **~80B is mined**: the block reward starts at **5,000 HKM** and halves
-  every **8,000,000 blocks** (~3.8 years at 15s blocks — Bitcoin cadence), flooring
-  at a **50 HKM/block tail emission** (~0.1%/year, decaying as supply grows) so
-  validators always have a security budget beyond fees. Supply reaches ~100B at
-  tail start (~29 years); every reward is consensus-verified per height, so no
-  node can mint outside the schedule.
+  u64 with ~180× headroom). Genesis allocates **30B HKM** to the treasury; the
+  remaining **~70B is mined** (a 30/70 premine/mined split): the block reward starts
+  at **3,700 HKM** and halves every **9,500,000 blocks** (~4.5 years at 15s blocks),
+  so the bulk of emission spans ~18 years, flooring at a **50 HKM/block tail
+  emission** (~0.1%/year, decaying as supply grows) so validators always have a
+  security budget beyond fees. Supply approaches ~100B; every reward is
+  consensus-verified per height, so no node can mint outside the schedule.
+- **Native token standard (HTS) — the ecosystem/DEX foundation.** First-class
+  fungible tokens as consensus objects: `TokenCreate` mints a fixed initial supply
+  to the issuer (symbol, name, up to 18 decimals; deterministic `hkt…` id),
+  `TokenTransfer` moves units, `TokenBurn` reduces supply. Balances and a token
+  registry live in the state root — every node agrees on every token's supply and
+  holders. Token operations pay their fee in HKM (tying ecosystem activity to HKM
+  demand). This is the asset primitive a DEX and dapps build on. Sign offline with
+  `hikma-wallet sign-token-*`; API under `/assets/*`.
 - **On-chain vesting (team/investor lockups).** A `Vest` transaction locks tokens
   for a recipient under a **cliff + linear release** schedule enforced by
   consensus: funds sit in a vesting pool, release block-by-block after the cliff,
@@ -188,7 +196,8 @@ Hikmalayer Core is developed in phases:
 - **Phase 9**: Signed P2P identity, peer scoring/banning, snapshots/checkpoints, observability.
 - **Phase 10**: Bitcoin-style halving emission + checkpoint fast-sync/pruning (boundary-anchored, self-verifying).
 - **Phase 11**: Liveness-guaranteed leader rotation (slot-timeout fallback), timestamp monotonicity, R-05 signed self-expiring tokens, atomic persistence.
-- **Phase 12**: Mainnet tokenomics — 6 decimals, 100B supply (20B genesis / ~80B mined), halving + 50 HKM tail emission, on-chain vesting, minimum validator stake.
+- **Phase 12**: Mainnet tokenomics — 6 decimals, 100B supply (30B genesis / ~70B mined), halving + 50 HKM tail emission, on-chain vesting, minimum validator stake.
+- **Phase 13**: Sovereign-finality fork choice, genesis validator allowlist (permissioned-hybrid launch), and the native token standard (HTS) — ecosystem/DEX foundation.
 - **Mainnet (pending)**: External audit + adversarial testnet, ops hardening.
 
 
@@ -507,7 +516,8 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 | Phase 9 | ✅ Signed P2P identity, peer scoring/banning, allow-list, snapshots/checkpoints, observability |
 | Phase 10 | ✅ Bitcoin-style halving emission + boundary-anchored checkpoint fast-sync/pruning (self-verifying, byte-identical convergence) |
 | Phase 11 | ✅ Slot-timeout leader rotation (offline leader can never stall the chain — live-verified), timestamp monotonicity, R-05 signed tokens, atomic persistence |
-| Phase 12 | ✅ Mainnet tokenomics: 6 decimals, 100B HKM (20B genesis / ~80B mined), halving every 8M blocks + 50 HKM security tail, on-chain cliff+linear vesting (live-verified), 10,000 HKM validator minimum |
+| Phase 12 | ✅ Mainnet tokenomics: 6 decimals, 100B HKM (30B genesis / ~70B mined), halving every 9.5M blocks (~4.5y) + 50 HKM security tail, on-chain cliff+linear vesting (live-verified), 10,000 HKM validator minimum |
+| Phase 13 | ✅ Sovereign-finality fork choice + genesis validator allowlist (permissioned-hybrid launch) + native token standard (HTS: create/transfer/burn, live-verified) — ecosystem/DEX foundation |
 | Mainnet | 🚧 External audit + adversarial testnet, ops hardening (see `docs/mainnet_readiness.md`) |
 
 

@@ -25,7 +25,8 @@ is a launch blocker until closed.
 | Slashing | Permissionless equivocation proofs burn the offender's stake on-chain; double-slash prevented |
 | Authorization | Deny-by-default admin and P2P tokens |
 | Resource bounds | Difficulty clamped 1–5; input length limits |
-| Rewards & fees | **Calibrated mainnet emission**: 6-decimal HKM, 20B genesis + ~80B mined, 5,000 HKM initial reward halving every 8,000,000 blocks (~3.8y), **50 HKM/block tail emission** as a perpetual security budget — all consensus-verified per height. Plus a **dynamic base fee** (EIP-1559-style, floor 0.001 HKM, cap 100 HKM) paid to the block validator; the base fee lives in the state root and is recomputed identically by every node |
+| Rewards & fees | **Calibrated mainnet emission**: 6-decimal HKM, 30B genesis + ~70B mined (30/70 split), 3,700 HKM initial reward halving every 9,500,000 blocks (~4.5y — bulk over ~18y), **50 HKM/block tail emission** as a perpetual security budget — all consensus-verified per height. Plus a **dynamic base fee** (EIP-1559-style, floor 0.001 HKM, cap 100 HKM) paid to the block validator; the base fee lives in the state root and is recomputed identically by every node |
+| Native token standard (HTS) | Consensus-level fungible tokens (the ecosystem/DEX asset primitive): `TokenCreate` (fixed supply minted to issuer, deterministic `hkt…` id, ≤18 decimals), `TokenTransfer`, `TokenBurn`; registry + per-token balances in the state root; fees paid in HKM. Live-verified create→transfer→burn with HKM supply provably untouched |
 | Vesting (lockups) | **On-chain cliff + linear vesting**: `Vest` transactions lock funds in a consensus-managed pool that releases block-by-block after the cliff; schedules are inspectable at `GET /vesting/{address}` — team/investor lockups are protocol guarantees, live-verified end-to-end |
 | Validator floor | **10,000 HKM minimum stake** to join (or remain in, on withdrawal) the validator set — no trivial-stake spam validators |
 | Sovereign finality | Fork choice is **validator-progress-first**: finalized blocks are irreversible, a fork must carry MORE validator-sealed blocks to displace the local chain, cumulative PoW only breaks exact ties, and fork tips future-dated beyond the clock-skew bound are rejected outright. Hashrate without stake produces nothing and reorgs nothing |
@@ -44,7 +45,7 @@ is a launch blocker until closed.
 | Checkpoint fast-sync / pruning | `GET /checkpoint/bundle` (p2p) serves a self-verifying bundle (retarget-boundary anchor + state + forward blocks); `HIKMALAYER_CHECKPOINT=<bundle.json>` boots a fresh node from the anchor without full genesis replay and reconstructs a byte-identical state root, randomness beacon, and difficulty; anchor pinned to a retarget boundary, state-root-bound, forward blocks re-validated; a persisted local chain always takes precedence |
 | Observability | Metrics include blocks mined/received/rejected, reorgs, gossip, txs, slashes, peers banned, invalid-from-peers; structured startup logging of identity/enforcement |
 | Tooling | `hikma-wallet` offline keygen/signing; propose/sign/submit flow for external validators |
-| Tests | 97 automated tests across consensus, state machine, security, replay, fork choice (sovereign finality), slashing, emission (halving + tail), vesting, min-stake, validator allowlist, checkpoint fast-sync, leader rotation, token auth, and API flows |
+| Tests | 99 automated tests across consensus, state machine, security, replay, fork choice (sovereign finality), slashing, emission (halving + tail), vesting, min-stake, validator allowlist, native token standard, checkpoint fast-sync, leader rotation, token auth, and API flows |
 
 ## 🚧 Remaining before mainnet
 

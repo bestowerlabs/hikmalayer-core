@@ -61,6 +61,9 @@ pub enum TransactionType {
     TokenCreate,  // Issue a new native fungible token (ecosystem asset)
     TokenTransfer, // Move units of a native token between accounts
     TokenBurn,    // Destroy units of a native token from the sender
+    AddLiquidity, // Deposit HKM + a token into an AMM pool for LP shares
+    RemoveLiquidity, // Burn LP shares, withdraw the underlying HKM + token
+    Swap,         // Swap HKM<->token against an AMM pool (constant product)
 }
 
 /// Upper bound on a vesting schedule's duration (~47 years at 15s blocks).
@@ -100,6 +103,39 @@ pub fn derive_token_id(creator: &str, symbol: &str, nonce: u64) -> String {
     let seed = format!("{}:{}:{}", creator, symbol, nonce);
     let digest = Sha256::digest(seed.as_bytes());
     format!("hkt{}", hex::encode(&digest[..20]))
+}
+
+/// AMM swap fee in basis points (0.30%), kept in the pool reserves and thus
+/// accruing to liquidity providers — the same fee level as Uniswap v2.
+pub const SWAP_FEE_BPS: u64 = 30;
+pub const AMM_FEE_DENOM: u64 = 10_000;
+
+/// Parameters for the AMM transaction types. Which fields matter depends on
+/// the transaction type (mirrors TokenAction): AddLiquidity uses
+/// amount_hkm/amount_token/min_shares; RemoveLiquidity uses
+/// shares/min_hkm/min_token; Swap uses amount_in/hkm_to_token/min_out. Every
+/// pool pairs an HTS token with HKM, so `token_id` identifies the pool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AmmAction {
+    pub token_id: String,
+    #[serde(default)]
+    pub amount_hkm: u64,
+    #[serde(default)]
+    pub amount_token: u64,
+    #[serde(default)]
+    pub shares: u64,
+    #[serde(default)]
+    pub amount_in: u64,
+    #[serde(default)]
+    pub hkm_to_token: bool,
+    #[serde(default)]
+    pub min_shares: u64,
+    #[serde(default)]
+    pub min_hkm: u64,
+    #[serde(default)]
+    pub min_token: u64,
+    #[serde(default)]
+    pub min_out: u64,
 }
 
 /// Proof that one validator signed two different blocks at the same height.
@@ -202,6 +238,9 @@ pub struct Transaction {
     /// Native-token action (TokenCreate / TokenTransfer / TokenBurn only).
     #[serde(default)]
     pub token: Option<TokenAction>,
+    /// AMM action (AddLiquidity / RemoveLiquidity / Swap only).
+    #[serde(default)]
+    pub amm: Option<AmmAction>,
 }
 
 /// Issue or revoke an on-chain verifiable credential. Only the hash of the
@@ -238,6 +277,7 @@ impl Transaction {
             vesting_cliff_blocks: None,
             vesting_duration_blocks: None,
             token: None,
+            amm: None,
         }
     }
 
@@ -315,6 +355,48 @@ impl Transaction {
     /// Canonical message a holder signs to burn native-token units.
     pub fn token_burn_signing_message(token_id: &str, amount: u64, nonce: u64) -> String {
         format!("hikmalayer-token-burn:{}:{}:{}", token_id, amount, nonce)
+    }
+
+    /// Canonical message signed to add liquidity to a pool.
+    pub fn amm_add_signing_message(
+        token_id: &str,
+        amount_hkm: u64,
+        amount_token: u64,
+        min_shares: u64,
+        nonce: u64,
+    ) -> String {
+        format!(
+            "hikmalayer-amm-add:{}:{}:{}:{}:{}",
+            token_id, amount_hkm, amount_token, min_shares, nonce
+        )
+    }
+
+    /// Canonical message signed to remove liquidity from a pool.
+    pub fn amm_remove_signing_message(
+        token_id: &str,
+        shares: u64,
+        min_hkm: u64,
+        min_token: u64,
+        nonce: u64,
+    ) -> String {
+        format!(
+            "hikmalayer-amm-remove:{}:{}:{}:{}:{}",
+            token_id, shares, min_hkm, min_token, nonce
+        )
+    }
+
+    /// Canonical message signed to swap against a pool.
+    pub fn amm_swap_signing_message(
+        token_id: &str,
+        hkm_to_token: bool,
+        amount_in: u64,
+        min_out: u64,
+        nonce: u64,
+    ) -> String {
+        format!(
+            "hikmalayer-amm-swap:{}:{}:{}:{}:{}",
+            token_id, hkm_to_token, amount_in, min_out, nonce
+        )
     }
 
     /// Canonical message a sender signs to lock tokens into a vesting
@@ -542,6 +624,78 @@ impl Transaction {
                 }
                 let message =
                     Self::token_burn_signing_message(&action.token_id, self.amount, self.nonce);
+                self.verify_sender_signature(from, &message)
+            }
+            TransactionType::AddLiquidity => {
+                let from = self
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "AddLiquidity missing sender".to_string())?;
+                let action = self
+                    .amm
+                    .as_ref()
+                    .ok_or_else(|| "AddLiquidity missing amm action".to_string())?;
+                if action.token_id.trim().is_empty() {
+                    return Err("AddLiquidity missing token id".to_string());
+                }
+                if action.amount_hkm == 0 || action.amount_token == 0 {
+                    return Err("AddLiquidity requires non-zero HKM and token amounts".to_string());
+                }
+                let message = Self::amm_add_signing_message(
+                    &action.token_id,
+                    action.amount_hkm,
+                    action.amount_token,
+                    action.min_shares,
+                    self.nonce,
+                );
+                self.verify_sender_signature(from, &message)
+            }
+            TransactionType::RemoveLiquidity => {
+                let from = self
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "RemoveLiquidity missing sender".to_string())?;
+                let action = self
+                    .amm
+                    .as_ref()
+                    .ok_or_else(|| "RemoveLiquidity missing amm action".to_string())?;
+                if action.token_id.trim().is_empty() {
+                    return Err("RemoveLiquidity missing token id".to_string());
+                }
+                if action.shares == 0 {
+                    return Err("RemoveLiquidity requires a non-zero share amount".to_string());
+                }
+                let message = Self::amm_remove_signing_message(
+                    &action.token_id,
+                    action.shares,
+                    action.min_hkm,
+                    action.min_token,
+                    self.nonce,
+                );
+                self.verify_sender_signature(from, &message)
+            }
+            TransactionType::Swap => {
+                let from = self
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "Swap missing sender".to_string())?;
+                let action = self
+                    .amm
+                    .as_ref()
+                    .ok_or_else(|| "Swap missing amm action".to_string())?;
+                if action.token_id.trim().is_empty() {
+                    return Err("Swap missing token id".to_string());
+                }
+                if action.amount_in == 0 {
+                    return Err("Swap requires a non-zero input amount".to_string());
+                }
+                let message = Self::amm_swap_signing_message(
+                    &action.token_id,
+                    action.hkm_to_token,
+                    action.amount_in,
+                    action.min_out,
+                    self.nonce,
+                );
                 self.verify_sender_signature(from, &message)
             }
         }

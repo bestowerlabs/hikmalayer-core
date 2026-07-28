@@ -87,6 +87,18 @@ signing conventions. It provides:
   holders. Token operations pay their fee in HKM (tying ecosystem activity to HKM
   demand). This is the asset primitive a DEX and dapps build on. Sign offline with
   `hikma-wallet sign-token-*`; API under `/assets/*`.
+- **Native AMM DEX — on-chain constant-product exchange.** Uniswap-v2-style
+  liquidity pools pairing every native token with **HKM** as the base asset:
+  `AddLiquidity` mints LP shares (`sqrt(hkm·token)`, with a locked
+  `MINIMUM_LIQUIDITY` guarding the first-depositor attack), `Swap` trades along
+  `x·y=k` with a **0.30% fee** that stays in the pool and accrues to LPs, and
+  `RemoveLiquidity` redeems shares for the underlying reserves. All math is
+  consensus-executed with u128 checked arithmetic and per-operation slippage
+  bounds; a read-only `GET /dex/quote/...` returns the exact output so a UI can
+  set `min_out`. Token↔token trades route through HKM. API under `/dex/*`; sign
+  offline with `hikma-wallet sign-amm-*`. This is the exchange layer of the
+  Hikmalayer ecosystem (for HKM and native tokens — not a bridge to external
+  chains).
 - **On-chain vesting (team/investor lockups).** A `Vest` transaction locks tokens
   for a recipient under a **cliff + linear release** schedule enforced by
   consensus: funds sit in a vesting pool, release block-by-block after the cliff,
@@ -198,6 +210,7 @@ Hikmalayer Core is developed in phases:
 - **Phase 11**: Liveness-guaranteed leader rotation (slot-timeout fallback), timestamp monotonicity, R-05 signed self-expiring tokens, atomic persistence.
 - **Phase 12**: Mainnet tokenomics — 6 decimals, 100B supply (30B genesis / ~70B mined), halving + 50 HKM tail emission, on-chain vesting, minimum validator stake.
 - **Phase 13**: Sovereign-finality fork choice, genesis validator allowlist (permissioned-hybrid launch), and the native token standard (HTS) — ecosystem/DEX foundation.
+- **Phase 14**: Native AMM DEX — constant-product HKM↔token pools, LP shares, 0.3% swap fee, slippage-bounded swaps.
 - **Mainnet (pending)**: External audit + adversarial testnet, ops hardening.
 
 
@@ -518,6 +531,7 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 | Phase 11 | ✅ Slot-timeout leader rotation (offline leader can never stall the chain — live-verified), timestamp monotonicity, R-05 signed tokens, atomic persistence |
 | Phase 12 | ✅ Mainnet tokenomics: 6 decimals, 100B HKM (30B genesis / ~70B mined), halving every 9.5M blocks (~4.5y) + 50 HKM security tail, on-chain cliff+linear vesting (live-verified), 10,000 HKM validator minimum |
 | Phase 13 | ✅ Sovereign-finality fork choice + genesis validator allowlist (permissioned-hybrid launch) + native token standard (HTS: create/transfer/burn, live-verified) — ecosystem/DEX foundation |
+| Phase 14 | ✅ Native AMM DEX: constant-product HKM↔token pools, LP shares (sqrt + MINIMUM_LIQUIDITY lock), 0.3% fee to LPs, slippage-bounded swaps, read-only quotes — live-verified add→swap→remove |
 | Mainnet | 🚧 External audit + adversarial testnet, ops hardening (see `docs/mainnet_readiness.md`) |
 
 

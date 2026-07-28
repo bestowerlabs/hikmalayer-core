@@ -20,6 +20,31 @@ pub const STAKING_POOL_ACCOUNT: &str = "__staking_pool__";
 /// Internal account holding all unvested (locked) funds.
 pub const VESTING_POOL_ACCOUNT: &str = "__vesting_pool__";
 
+/// Internal account custodying all AMM pool reserves (HKM and tokens). The
+/// per-pool split lives in `ChainState::pools`; this account holds the
+/// aggregate so HKM/token supply stays conserved.
+pub const AMM_POOL_ACCOUNT: &str = "__amm_pool__";
+
+/// LP shares permanently locked on first liquidity provision, preventing the
+/// first-depositor share-inflation attack (Uniswap-v2's MINIMUM_LIQUIDITY).
+pub const MINIMUM_LIQUIDITY: u64 = 1_000;
+
+/// Integer square root (floor) for u128 — used to size initial LP shares as
+/// sqrt(hkm * token), keeping the first provider's shares independent of the
+/// pool's price.
+fn isqrt_u128(n: u128) -> u128 {
+    if n < 2 {
+        return n;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
+}
+
 /// Consensus constant: percentage of stake burned for a proven equivocation.
 pub const SLASH_PERCENT: u64 = 10;
 
@@ -139,6 +164,18 @@ pub struct TokenInfo {
     pub created_at_height: u64,
 }
 
+/// A constant-product AMM liquidity pool pairing a native token with HKM.
+/// `reserve_hkm * reserve_token` is the invariant a swap preserves (net of
+/// the fee, which stays in the reserves and accrues to LPs). `total_shares`
+/// includes the permanently-locked MINIMUM_LIQUIDITY minted on creation.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct Pool {
+    pub token_id: String,
+    pub reserve_hkm: u64,
+    pub reserve_token: u64,
+    pub total_shares: u64,
+}
+
 /// An on-chain verifiable credential: the issuer anchors a hash of the
 /// credential document (the document itself stays private/off-chain) bound
 /// to a subject. Revocation is a first-class on-chain operation by the
@@ -178,6 +215,12 @@ pub struct ChainState {
     /// BTreeMaps keep the state-root serialization canonical.
     #[serde(default)]
     pub token_balances: BTreeMap<String, BTreeMap<String, u64>>,
+    /// AMM liquidity pools, keyed by the token they pair with HKM.
+    #[serde(default)]
+    pub pools: BTreeMap<String, Pool>,
+    /// LP share balances: token_id → (provider address → shares).
+    #[serde(default)]
+    pub lp_shares: BTreeMap<String, BTreeMap<String, u64>>,
     /// Genesis-configured validator allowlist. When NON-EMPTY, only listed
     /// addresses may register a NEW stake (existing validators may top up);
     /// empty means permissionless staking. Set once at genesis and part of
@@ -275,6 +318,15 @@ impl ChainState {
             .or_default()
             .entry(account.to_string())
             .or_insert(0) += amount;
+    }
+
+    /// LP shares held by `account` in the pool for `token_id`.
+    pub fn lp_shares_of(&self, token_id: &str, account: &str) -> u64 {
+        self.lp_shares
+            .get(token_id)
+            .and_then(|holders| holders.get(account))
+            .copied()
+            .unwrap_or(0)
     }
 
     fn debit_token(&mut self, token_id: &str, account: &str, amount: u64) -> Result<(), String> {
@@ -579,6 +631,214 @@ impl ChainState {
                 // Reduce the token's recorded supply to match.
                 if let Some(info) = self.tokens.get_mut(&action.token_id) {
                     info.total_supply = info.total_supply.saturating_sub(tx.amount);
+                }
+                Ok(())
+            }
+            TransactionType::AddLiquidity => {
+                let from = tx
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "AddLiquidity missing sender".to_string())?;
+                let action = tx
+                    .amm
+                    .as_ref()
+                    .ok_or_else(|| "AddLiquidity missing amm action".to_string())?;
+                if !self.tokens.contains_key(&action.token_id) {
+                    return Err(format!("Unknown token {}", action.token_id));
+                }
+                let existing = self.pools.get(&action.token_id).cloned().unwrap_or_default();
+
+                // Determine the amounts actually used and the shares minted.
+                let (use_hkm, use_token, minted, first) = if existing.total_shares == 0 {
+                    // First provider sets the price and mints sqrt(hkm*token).
+                    let product =
+                        (action.amount_hkm as u128).saturating_mul(action.amount_token as u128);
+                    let shares0 = isqrt_u128(product);
+                    if shares0 <= MINIMUM_LIQUIDITY as u128 {
+                        return Err("Initial liquidity is below the minimum".to_string());
+                    }
+                    let minted = (shares0 - MINIMUM_LIQUIDITY as u128) as u64;
+                    (action.amount_hkm, action.amount_token, minted, true)
+                } else {
+                    // Preserve the pool ratio; use whichever side binds.
+                    let rh = existing.reserve_hkm as u128;
+                    let rt = existing.reserve_token as u128;
+                    let token_optimal =
+                        ((action.amount_hkm as u128) * rt / rh) as u64;
+                    let (use_hkm, use_token) = if token_optimal <= action.amount_token {
+                        (action.amount_hkm, token_optimal)
+                    } else {
+                        let hkm_optimal = ((action.amount_token as u128) * rh / rt) as u64;
+                        (hkm_optimal, action.amount_token)
+                    };
+                    if use_hkm == 0 || use_token == 0 {
+                        return Err("AddLiquidity amounts round to zero".to_string());
+                    }
+                    let ts = existing.total_shares as u128;
+                    let shares_hkm = (use_hkm as u128) * ts / rh;
+                    let shares_token = (use_token as u128) * ts / rt;
+                    (use_hkm, use_token, shares_hkm.min(shares_token) as u64, false)
+                };
+
+                if minted == 0 || minted < action.min_shares {
+                    return Err(format!(
+                        "AddLiquidity slippage: {} shares minted, {} required",
+                        minted, action.min_shares
+                    ));
+                }
+
+                self.consume_nonce(from, tx.nonce)?;
+                let fee = self.base_fee;
+                self.debit(from, use_hkm + fee)?;
+                self.fee_pot += fee;
+                self.credit(AMM_POOL_ACCOUNT, use_hkm);
+                self.debit_token(&action.token_id, from, use_token)?;
+                self.credit_token(&action.token_id, AMM_POOL_ACCOUNT, use_token);
+
+                let pool = self.pools.entry(action.token_id.clone()).or_insert(Pool {
+                    token_id: action.token_id.clone(),
+                    ..Default::default()
+                });
+                pool.reserve_hkm += use_hkm;
+                pool.reserve_token += use_token;
+                pool.total_shares += if first {
+                    minted + MINIMUM_LIQUIDITY
+                } else {
+                    minted
+                };
+                *self
+                    .lp_shares
+                    .entry(action.token_id.clone())
+                    .or_default()
+                    .entry(from.clone())
+                    .or_insert(0) += minted;
+                Ok(())
+            }
+            TransactionType::RemoveLiquidity => {
+                let from = tx
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "RemoveLiquidity missing sender".to_string())?;
+                let action = tx
+                    .amm
+                    .as_ref()
+                    .ok_or_else(|| "RemoveLiquidity missing amm action".to_string())?;
+                let pool = self
+                    .pools
+                    .get(&action.token_id)
+                    .cloned()
+                    .ok_or_else(|| format!("No pool for {}", action.token_id))?;
+                let held = self.lp_shares_of(&action.token_id, from);
+                if held < action.shares {
+                    return Err(format!(
+                        "Insufficient LP shares: has {}, needs {}",
+                        held, action.shares
+                    ));
+                }
+                let ts = pool.total_shares as u128;
+                let amount_hkm = ((action.shares as u128) * pool.reserve_hkm as u128 / ts) as u64;
+                let amount_token =
+                    ((action.shares as u128) * pool.reserve_token as u128 / ts) as u64;
+                if amount_hkm == 0 || amount_token == 0 {
+                    return Err("RemoveLiquidity amounts round to zero".to_string());
+                }
+                if amount_hkm < action.min_hkm || amount_token < action.min_token {
+                    return Err("RemoveLiquidity slippage bound not met".to_string());
+                }
+
+                self.consume_nonce(from, tx.nonce)?;
+                let fee = self.base_fee;
+                self.debit(from, fee)?; // fee from liquid HKM
+                self.fee_pot += fee;
+
+                // Burn shares, return the underlying assets.
+                let holders = self.lp_shares.get_mut(&action.token_id).unwrap();
+                let entry = holders.get_mut(from).unwrap();
+                *entry -= action.shares;
+                if *entry == 0 {
+                    holders.remove(from);
+                }
+                self.debit(AMM_POOL_ACCOUNT, amount_hkm)?;
+                self.credit(from, amount_hkm);
+                self.debit_token(&action.token_id, AMM_POOL_ACCOUNT, amount_token)?;
+                self.credit_token(&action.token_id, from, amount_token);
+
+                let pool = self.pools.get_mut(&action.token_id).unwrap();
+                pool.reserve_hkm -= amount_hkm;
+                pool.reserve_token -= amount_token;
+                pool.total_shares -= action.shares;
+                Ok(())
+            }
+            TransactionType::Swap => {
+                let from = tx
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "Swap missing sender".to_string())?;
+                let action = tx
+                    .amm
+                    .as_ref()
+                    .ok_or_else(|| "Swap missing amm action".to_string())?;
+                let pool = self
+                    .pools
+                    .get(&action.token_id)
+                    .cloned()
+                    .ok_or_else(|| format!("No pool for {}", action.token_id))?;
+                if pool.reserve_hkm == 0 || pool.reserve_token == 0 {
+                    return Err("Pool has no liquidity".to_string());
+                }
+                let (reserve_in, reserve_out) = if action.hkm_to_token {
+                    (pool.reserve_hkm, pool.reserve_token)
+                } else {
+                    (pool.reserve_token, pool.reserve_hkm)
+                };
+                // Constant-product with a 0.3% fee kept in the pool. u128
+                // intermediates, checked so a pathologically large swap is
+                // rejected rather than overflowing.
+                let fee_num = crate::blockchain::transaction::AMM_FEE_DENOM
+                    - crate::blockchain::transaction::SWAP_FEE_BPS;
+                let amount_in_with_fee = (action.amount_in as u128)
+                    .checked_mul(fee_num as u128)
+                    .ok_or_else(|| "Swap amount too large".to_string())?;
+                let numerator = amount_in_with_fee
+                    .checked_mul(reserve_out as u128)
+                    .ok_or_else(|| "Swap amount too large".to_string())?;
+                let denominator = (reserve_in as u128)
+                    .checked_mul(crate::blockchain::transaction::AMM_FEE_DENOM as u128)
+                    .ok_or_else(|| "Pool reserve too large".to_string())?
+                    + amount_in_with_fee;
+                let amount_out = (numerator / denominator) as u64;
+                if amount_out == 0 || amount_out >= reserve_out {
+                    return Err("Swap produces no output or drains the pool".to_string());
+                }
+                if amount_out < action.min_out {
+                    return Err(format!(
+                        "Swap slippage: {} out, {} required",
+                        amount_out, action.min_out
+                    ));
+                }
+
+                self.consume_nonce(from, tx.nonce)?;
+                let fee = self.base_fee;
+
+                if action.hkm_to_token {
+                    self.debit(from, action.amount_in + fee)?;
+                    self.fee_pot += fee;
+                    self.credit(AMM_POOL_ACCOUNT, action.amount_in);
+                    self.debit_token(&action.token_id, AMM_POOL_ACCOUNT, amount_out)?;
+                    self.credit_token(&action.token_id, from, amount_out);
+                    let pool = self.pools.get_mut(&action.token_id).unwrap();
+                    pool.reserve_hkm += action.amount_in;
+                    pool.reserve_token -= amount_out;
+                } else {
+                    self.debit(from, fee)?; // HKM fee only
+                    self.fee_pot += fee;
+                    self.debit_token(&action.token_id, from, action.amount_in)?;
+                    self.credit_token(&action.token_id, AMM_POOL_ACCOUNT, action.amount_in);
+                    self.debit(AMM_POOL_ACCOUNT, amount_out)?;
+                    self.credit(from, amount_out);
+                    let pool = self.pools.get_mut(&action.token_id).unwrap();
+                    pool.reserve_token += action.amount_in;
+                    pool.reserve_hkm -= amount_out;
                 }
                 Ok(())
             }
@@ -977,7 +1237,7 @@ mod tests {
             Some(&t_pub),
             Some(&t_vrf),
             TEST_SUPPLY,
-            &[allowed_addr.clone()],
+            std::slice::from_ref(&allowed_addr),
         );
 
         // Fund both candidates.
@@ -1150,6 +1410,178 @@ mod tests {
 
         // HKM supply is untouched by any native-token operation.
         assert_eq!(state.total_supply, TEST_SUPPLY);
+    }
+
+    /// Helper: create a token owned by `owner` and return its id.
+    fn make_token(state: &mut ChainState, owner: &str, symbol: &str, supply: u64, nonce: u64) -> String {
+        use crate::blockchain::transaction::TokenAction;
+        let mut create = Transaction::new(
+            Some(owner.to_string()),
+            String::new(),
+            supply,
+            TransactionType::TokenCreate,
+        );
+        create.nonce = nonce;
+        create.token = Some(TokenAction {
+            symbol: symbol.to_string(),
+            ..Default::default()
+        });
+        state.apply_transaction(&create, 1).unwrap();
+        crate::blockchain::transaction::derive_token_id(owner, symbol, nonce)
+    }
+
+    #[test]
+    fn amm_add_swap_remove_lifecycle_conserves_supply() {
+        use crate::blockchain::transaction::AmmAction;
+        let (mut state, treasury, _, _) = genesis_state();
+        let hkm_supply_before = state.total_supply;
+
+        // Create a token and a HKM<->token pool.
+        let token_id = make_token(&mut state, &treasury, "LPTOK", 10_000_000, 1);
+
+        // Seed the pool: 1,000,000 HKM units + 1,000,000 token units.
+        let mut add = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            0,
+            TransactionType::AddLiquidity,
+        );
+        add.nonce = 2;
+        add.amm = Some(AmmAction {
+            token_id: token_id.clone(),
+            amount_hkm: 1_000_000,
+            amount_token: 1_000_000,
+            min_shares: 1,
+            ..Default::default()
+        });
+        state.apply_transaction(&add, 1).unwrap();
+
+        let pool = state.pools[&token_id].clone();
+        assert_eq!(pool.reserve_hkm, 1_000_000);
+        assert_eq!(pool.reserve_token, 1_000_000);
+        // Provider shares = sqrt(1e6*1e6) - MINIMUM_LIQUIDITY.
+        let provider_shares = state.lp_shares_of(&token_id, &treasury);
+        assert_eq!(provider_shares, 1_000_000 - MINIMUM_LIQUIDITY);
+        assert_eq!(pool.total_shares, 1_000_000);
+        // The pool custody account holds the reserves.
+        assert_eq!(state.balance_of(AMM_POOL_ACCOUNT), 1_000_000);
+        assert_eq!(state.token_balance_of(&token_id, AMM_POOL_ACCOUNT), 1_000_000);
+
+        // Swap 100,000 HKM for the token. Constant-product with 0.3% fee:
+        // out = 997*100000*1e6 / (1e6*1000 + 997*100000) ≈ 90,661.
+        let k_before = pool.reserve_hkm as u128 * pool.reserve_token as u128;
+        let mut swap = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            0,
+            TransactionType::Swap,
+        );
+        swap.nonce = 3;
+        swap.amm = Some(AmmAction {
+            token_id: token_id.clone(),
+            amount_in: 100_000,
+            hkm_to_token: true,
+            min_out: 1,
+            ..Default::default()
+        });
+        let token_before = state.token_balance_of(&token_id, &treasury);
+        state.apply_transaction(&swap, 1).unwrap();
+        let received = state.token_balance_of(&token_id, &treasury) - token_before;
+        assert_eq!(received, 90_661, "constant-product output");
+
+        // The pool moved: more HKM, less token, and k grew (fee accrual).
+        let pool2 = state.pools[&token_id].clone();
+        assert_eq!(pool2.reserve_hkm, 1_100_000);
+        assert_eq!(pool2.reserve_token, 1_000_000 - 90_661);
+        let k_after = pool2.reserve_hkm as u128 * pool2.reserve_token as u128;
+        assert!(k_after > k_before, "fee grows the invariant for LPs");
+
+        // Remove all of the provider's liquidity; they get back reserves pro
+        // rata (now HKM-heavier and token-lighter from the swap + the fee).
+        let mut remove = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            0,
+            TransactionType::RemoveLiquidity,
+        );
+        remove.nonce = 4;
+        remove.amm = Some(AmmAction {
+            token_id: token_id.clone(),
+            shares: provider_shares,
+            min_hkm: 1,
+            min_token: 1,
+            ..Default::default()
+        });
+        state.apply_transaction(&remove, 1).unwrap();
+        assert_eq!(state.lp_shares_of(&token_id, &treasury), 0);
+        // Only the locked MINIMUM_LIQUIDITY worth of reserves remains.
+        let pool3 = state.pools[&token_id].clone();
+        assert_eq!(pool3.total_shares, MINIMUM_LIQUIDITY);
+        assert!(pool3.reserve_hkm > 0 && pool3.reserve_token > 0);
+
+        // HKM total supply is conserved across every AMM operation (fees to
+        // the validator stay in circulation; the pool never mints or burns).
+        // Account for fees paid to the (unset) validator: they sit in fee_pot
+        // until end_block, so total_supply is unchanged throughout.
+        assert_eq!(state.total_supply, hkm_supply_before);
+    }
+
+    #[test]
+    fn amm_enforces_slippage_and_liquidity_bounds() {
+        use crate::blockchain::transaction::AmmAction;
+        let (mut state, treasury, _, _) = genesis_state();
+        let token_id = make_token(&mut state, &treasury, "SLIP", 10_000_000, 1);
+
+        let mut add = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            0,
+            TransactionType::AddLiquidity,
+        );
+        add.nonce = 2;
+        add.amm = Some(AmmAction {
+            token_id: token_id.clone(),
+            amount_hkm: 1_000_000,
+            amount_token: 1_000_000,
+            min_shares: 1,
+            ..Default::default()
+        });
+        state.apply_transaction(&add, 1).unwrap();
+
+        // Swap with an unsatisfiable min_out is rejected.
+        let mut swap = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            0,
+            TransactionType::Swap,
+        );
+        swap.nonce = 3;
+        swap.amm = Some(AmmAction {
+            token_id: token_id.clone(),
+            amount_in: 100_000,
+            hkm_to_token: true,
+            min_out: 99_999_999, // absurd
+            ..Default::default()
+        });
+        let err = state.apply_transaction(&swap, 1).unwrap_err();
+        assert!(err.contains("slippage"), "{err}");
+
+        // Swap against a pool that does not exist is rejected.
+        let mut ghost = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            0,
+            TransactionType::Swap,
+        );
+        ghost.nonce = 3;
+        ghost.amm = Some(AmmAction {
+            token_id: "hktnope".to_string(),
+            amount_in: 1,
+            hkm_to_token: true,
+            min_out: 0,
+            ..Default::default()
+        });
+        assert!(state.apply_transaction(&ghost, 1).is_err());
     }
 
     #[test]

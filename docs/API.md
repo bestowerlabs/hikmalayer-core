@@ -92,6 +92,25 @@ Read models: `GET /assets` (registry), `GET /assets/{token_id}` (metadata),
 base units; each operation pays its fee in HKM. Sign offline with
 `hikma-wallet sign-token-create|sign-token-transfer|sign-token-burn`.
 
+**Native AMM DEX (`/dex/*`).** Constant-product (Uniswap-v2-style) pools, each
+pairing a native token with **HKM**. `POST /dex/add`
+(`{token_id, provider, amount_hkm, amount_token, min_shares, …}`) creates the
+pool on first provision and mints LP shares (`sqrt(hkm·token)` initially, with a
+locked `MINIMUM_LIQUIDITY`); subsequent deposits must match the pool ratio and
+mint shares pro rata. `POST /dex/swap`
+(`{token_id, trader, hkm_to_token, amount_in, min_out, …}`) trades along
+`x·y=k`, taking a **0.30% fee** that stays in the pool (accruing to LPs);
+`min_out` bounds slippage. `POST /dex/remove`
+(`{token_id, provider, shares, min_hkm, min_token, …}`) redeems LP shares for the
+underlying reserves. Read models: `GET /dex/pools`, `GET /dex/pool/{token_id}`
+(reserves + total shares), `GET /dex/position/{token_id}/{account}` (LP shares),
+and `GET /dex/quote/{token_id}/{direction}/{amount_in}` — a read-only quote
+(`direction` = `hkm_to_token` or `token_to_hkm`) returning the exact output the
+same math would produce, for setting `min_out`. All amounts are base units;
+each op also pays the HKM base fee. Sign offline with
+`hikma-wallet sign-amm-add|sign-amm-remove|sign-amm-swap`. Pools are for HKM and
+native tokens only — this is not a bridge to external chains.
+
 **Vesting.** `POST /tokens/vest` queues a signed lockup: `amount` moves into
 the on-chain vesting pool and releases to the recipient on a **cliff + linear**
 schedule (`cliff_blocks`, `duration_blocks`), enforced by consensus at each
@@ -146,6 +165,9 @@ verification is stateless, scope-bound, constant-time, and fail-closed.
 `POST /tokens/vest`, `GET /vesting/{address}`,
 `POST /assets/create`, `POST /assets/transfer`, `POST /assets/burn`,
 `GET /assets`, `GET /assets/{token_id}`, `GET /assets/{token_id}/balance/{account}`,
+`POST /dex/add`, `POST /dex/remove`, `POST /dex/swap`, `GET /dex/pools`,
+`GET /dex/pool/{token_id}`, `GET /dex/position/{token_id}/{account}`,
+`GET /dex/quote/{token_id}/{direction}/{amount_in}`,
 `POST /certificates/attest` (admin).
 `POST /certificates/verify` is a read-only lookup. `POST /auth/verify` now also
 requires a `public_key` field (native signature).

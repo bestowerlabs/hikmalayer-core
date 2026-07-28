@@ -46,8 +46,9 @@ const StatsCard = ({ title, value, icon, color, subtitle, index }) => (
         <p
           className={`text-3xl font-bold ${color} transition-all duration-300 group-hover:scale-110`}
         >
-          <AnimatedCounter value={typeof value === "number" ? value : 0} />
-          {typeof value === "string" && value}
+          {/* Only numbers animate; textual statuses (e.g. "Valid") render
+              as-is — animating them printed a stray leading 0. */}
+          {typeof value === "number" ? <AnimatedCounter value={value} /> : value}
         </p>
         {subtitle && (
           <p className="text-xs text-gray-400 mt-2 opacity-70 group-hover:opacity-100 transition-opacity duration-300">

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { getSwapQuote, listAssets, listPools, submitSwap, getAccountNonce } from "../api";
 import { useWallet } from "../hooks/useWallet";
+import { useSigner } from "../hooks/useSigner";
 import OfflineSigner from "./OfflineSigner";
 import {
   HKM_DECIMALS,
@@ -18,6 +19,7 @@ import {
 /// consensus will apply, so the preview matches execution exactly.
 const DexSwap = ({ refreshTrigger, onUpdate }) => {
   const { account } = useWallet();
+  const { unlocked, sign, publicKey: signerPublicKey } = useSigner();
   const [pools, setPools] = useState([]);
   const [assets, setAssets] = useState([]);
   const [tokenId, setTokenId] = useState("");
@@ -126,14 +128,20 @@ const DexSwap = ({ refreshTrigger, onUpdate }) => {
     nonce: nonce ?? 0,
   };
 
+  // With an unlocked wallet the signature is produced at submit time; a
+  // locked wallet falls back to the offline (cold-key) paste flow.
   const ready =
-    account && tokenId && amountIn && quote && nonce !== null && publicKey && signature;
+    account && tokenId && amountIn && quote && nonce !== null &&
+    (unlocked || (publicKey && signature));
 
   const handleSwap = async () => {
     if (!ready) return;
     setBusy(true);
     setMessage(null);
     try {
+      const signedBy = unlocked
+        ? { public_key: signerPublicKey, signature: sign(signingMessages.swap(signParams)) }
+        : { public_key: publicKey.trim(), signature: signature.trim() };
       const res = await submitSwap({
         token_id: tokenId,
         trader: account,
@@ -141,8 +149,7 @@ const DexSwap = ({ refreshTrigger, onUpdate }) => {
         amount_in: Number(amountIn),
         min_out: Number(minOut),
         nonce,
-        public_key: publicKey.trim(),
-        signature: signature.trim(),
+        ...signedBy,
       });
       const ok = res.data?.status === "success";
       setMessage({ type: ok ? "success" : "error", text: res.data?.message });
@@ -274,7 +281,7 @@ const DexSwap = ({ refreshTrigger, onUpdate }) => {
               </p>
             )}
 
-            {account && amountIn && quote && (
+            {account && amountIn && quote && !unlocked && (
               <OfflineSigner
                 command={signingCommands.swap(signParams)}
                 message={signingMessages.swap(signParams)}
@@ -292,7 +299,7 @@ const DexSwap = ({ refreshTrigger, onUpdate }) => {
               disabled={!ready || busy}
               className="w-full mt-3 px-4 py-2.5 rounded-xl bg-gradient-to-r from-teal-500 to-blue-500 text-white font-semibold text-sm disabled:opacity-40 disabled:cursor-not-allowed hover:from-teal-400 hover:to-blue-400 transition"
             >
-              {busy ? "Submitting…" : "Swap"}
+              {busy ? "Submitting…" : unlocked ? "Sign & swap" : "Swap"}
             </button>
 
             {message && (

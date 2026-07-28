@@ -8,6 +8,7 @@ import {
   removeLiquidity,
 } from "../api";
 import { useWallet } from "../hooks/useWallet";
+import { useSigner } from "../hooks/useSigner";
 import OfflineSigner from "./OfflineSigner";
 import {
   HKM_DECIMALS,
@@ -24,6 +25,7 @@ import {
 /// the pool ratio (the chain uses whichever side binds).
 const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
   const { account } = useWallet();
+  const { unlocked, sign, publicKey: signerPublicKey } = useSigner();
   const [pools, setPools] = useState([]);
   const [assets, setAssets] = useState([]);
   const [mode, setMode] = useState("add");
@@ -114,16 +116,24 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
     nonce: nonce ?? 0,
   };
 
+  // Unlocked wallet signs at submit time; otherwise the offline paste flow.
+  const signedOk = unlocked || (publicKey && signature);
   const readyAdd =
-    account && tokenId && parsed.hkm > 0n && parsed.token > 0n && nonce !== null &&
-    publicKey && signature;
+    account && tokenId && parsed.hkm > 0n && parsed.token > 0n && nonce !== null && signedOk;
   const readyRemove =
-    account && tokenId && parsed.shares > 0n && nonce !== null && publicKey && signature;
+    account && tokenId && parsed.shares > 0n && nonce !== null && signedOk;
 
   const submit = async () => {
     setBusy(true);
     setMessage(null);
     try {
+      const canonical =
+        mode === "add"
+          ? signingMessages.addLiquidity(addParams)
+          : signingMessages.removeLiquidity(removeParams);
+      const signedBy = unlocked
+        ? { public_key: signerPublicKey, signature: sign(canonical) }
+        : { public_key: publicKey.trim(), signature: signature.trim() };
       const res =
         mode === "add"
           ? await addLiquidity({
@@ -133,8 +143,7 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
               amount_token: Number(parsed.token),
               min_shares: 1,
               nonce,
-              public_key: publicKey.trim(),
-              signature: signature.trim(),
+              ...signedBy,
             })
           : await removeLiquidity({
               token_id: tokenId,
@@ -143,8 +152,7 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
               min_hkm: 1,
               min_token: 1,
               nonce,
-              public_key: publicKey.trim(),
-              signature: signature.trim(),
+              ...signedBy,
             });
       const ok = res.data?.status === "success";
       setMessage({ type: ok ? "success" : "error", text: res.data?.message });
@@ -305,7 +313,8 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
           </p>
         )}
 
-        {account && tokenId && (mode === "add" ? parsed.hkm > 0n : parsed.shares > 0n) && (
+        {account && tokenId && !unlocked &&
+          (mode === "add" ? parsed.hkm > 0n : parsed.shares > 0n) && (
           <OfflineSigner
             command={
               mode === "add"
@@ -331,7 +340,9 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
           disabled={busy || (mode === "add" ? !readyAdd : !readyRemove)}
           className="w-full mt-3 px-4 py-2.5 rounded-xl bg-gradient-to-r from-purple-500 to-pink-500 text-white font-semibold text-sm disabled:opacity-40 disabled:cursor-not-allowed hover:from-purple-400 hover:to-pink-400 transition"
         >
-          {busy ? "Submitting…" : mode === "add" ? "Add liquidity" : "Remove liquidity"}
+          {busy
+            ? "Submitting…"
+            : `${unlocked ? "Sign & " : ""}${mode === "add" ? "add liquidity" : "remove liquidity"}`}
         </button>
 
         {message && (

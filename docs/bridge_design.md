@@ -1,8 +1,18 @@
 # Brick 3 — Cross-Chain Bridge: Scope and Security Design
 
-**Status: DESIGN ONLY. Nothing in this document is implemented.**
-No bridge code exists in this repository, and none should be written until
-the decisions and gates below are settled.
+**Status: NOT PURSUED — decision taken. Design retained for reference only.**
+
+The project has decided **not to build a cross-chain bridge**. No bridge code
+exists in this repository and none is planned. Hikmalayer's DEX trades HKM
+and Hikmalayer-issued (HTS) tokens only.
+
+This document is kept because the reasoning stays useful: it records *why*
+the decision is sound, and what would have to be true before anyone revisits
+it. Nothing here should be read as work in progress.
+
+**Consequence for all public materials:** external assets (BTC, ETH, USDT,
+SOL, …) are never to be shown as tradeable, bridgeable, or wrapped on
+Hikmalayer. See §8.
 
 This document exists because "list the top 100 coins on the Hikmalayer DEX"
 is a reasonable business goal with an unreasonable naive implementation. It
@@ -192,16 +202,23 @@ Until a bridge exists and is audited:
 
 ---
 
-## Decision required
+## Decision taken: not pursuing a bridge
 
-Before any implementation work begins, the project must answer, in writing:
+The project has chosen **not** to build a bridge. This avoids, in one stroke:
+custody of other people's assets, the single largest attack surface in the
+industry, a dedicated audit budget, 24/7 signer operations, and the legal
+exposure of custodying regulated assets.
+
+**Strategy instead:** grow ecosystem value on Bricks 1–2 (native tokens + the
+AMM DEX), where Hikmalayer's own consensus is the only thing a user must
+trust, and use the non-bridge on-ramps in §7 (exchange listing, OTC) if
+external liquidity is ever needed.
+
+Should anyone propose revisiting this, these five questions must be answered
+in writing first — and a "no" to any of them ends the discussion:
 
 1. Do we accept a **custodial** bridge for v1? (If no, budget for Option C.)
 2. Which **single** asset first, and what **hard cap**?
 3. Who are the **operators**, and what is the key-management standard?
 4. Who **pays for the audit**, and when is it scheduled?
 5. Have we taken **legal advice** on custodying that asset?
-
-Until these have answers, the correct engineering decision is to keep
-building ecosystem value on Bricks 1–2, where Hikmalayer's own consensus is
-the only thing users have to trust.

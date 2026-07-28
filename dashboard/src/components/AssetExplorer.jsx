@@ -7,6 +7,7 @@ import {
   transferAsset,
 } from "../api";
 import { useWallet } from "../hooks/useWallet";
+import { useSigner } from "../hooks/useSigner";
 import OfflineSigner from "./OfflineSigner";
 import { formatUnits, parseUnits, shortId, signingCommands, signingMessages } from "../lib/hts";
 
@@ -15,6 +16,7 @@ import { formatUnits, parseUnits, shortId, signingCommands, signingMessages } fr
 /// registry reports is the real, consensus-enforced supply.
 const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
   const { account } = useWallet();
+  const { unlocked, sign, publicKey: signerPublicKey } = useSigner();
   const [assets, setAssets] = useState([]);
   const [mode, setMode] = useState("browse");
   const [nonce, setNonce] = useState(null);
@@ -113,6 +115,9 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
     setBusy(true);
     setMessage(null);
     try {
+      const signedBy = unlocked
+        ? { public_key: signerPublicKey, signature: sign(signingMessages.createAsset(createParams)) }
+        : { public_key: publicKey.trim(), signature: signature.trim() };
       const res = await createAsset({
         creator: account,
         symbol,
@@ -120,8 +125,7 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
         decimals: Number(decimals),
         initial_supply: Number(supplyUnits),
         nonce,
-        public_key: publicKey.trim(),
-        signature: signature.trim(),
+        ...signedBy,
       });
       const ok = res.data?.status === "success";
       setMessage({ type: ok ? "success" : "error", text: res.data?.message });
@@ -143,14 +147,16 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
     setBusy(true);
     setMessage(null);
     try {
+      const signedBy = unlocked
+        ? { public_key: signerPublicKey, signature: sign(signingMessages.transferAsset(transferParams)) }
+        : { public_key: publicKey.trim(), signature: signature.trim() };
       const res = await transferAsset({
         token_id: sendToken,
         from: account,
         to: sendTo.trim(),
         amount: Number(sendUnits),
         nonce,
-        public_key: publicKey.trim(),
-        signature: signature.trim(),
+        ...signedBy,
       });
       const ok = res.data?.status === "success";
       setMessage({ type: ok ? "success" : "error", text: res.data?.message });
@@ -166,11 +172,11 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
     }
   };
 
+  const signedOk = unlocked || (publicKey && signature);
   const readyCreate =
-    account && symbol.trim() && supplyUnits > 0n && nonce !== null && publicKey && signature;
+    account && symbol.trim() && supplyUnits > 0n && nonce !== null && signedOk;
   const readySend =
-    account && sendToken && sendTo.trim() && sendUnits > 0n && nonce !== null &&
-    publicKey && signature;
+    account && sendToken && sendTo.trim() && sendUnits > 0n && nonce !== null && signedOk;
 
   return (
     <div className="group relative overflow-hidden rounded-2xl backdrop-blur-xl bg-white/10 border border-white/20 p-6">
@@ -278,7 +284,7 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
               className="w-full px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-amber-500/50"
             />
 
-            {account && symbol && supplyUnits > 0n && (
+            {account && symbol && supplyUnits > 0n && !unlocked && (
               <OfflineSigner
                 command={signingCommands.createAsset(createParams)}
                 message={signingMessages.createAsset(createParams)}
@@ -296,7 +302,7 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
               disabled={!readyCreate || busy}
               className="w-full mt-3 px-4 py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 text-white font-semibold text-sm disabled:opacity-40 disabled:cursor-not-allowed hover:from-amber-400 hover:to-orange-400 transition"
             >
-              {busy ? "Submitting…" : "Issue token"}
+              {busy ? "Submitting…" : unlocked ? "Sign & issue token" : "Issue token"}
             </button>
           </>
         )}
@@ -330,7 +336,7 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
               className="w-full px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-amber-500/50"
             />
 
-            {account && sendToken && sendUnits > 0n && sendTo && (
+            {account && sendToken && sendUnits > 0n && sendTo && !unlocked && (
               <OfflineSigner
                 command={signingCommands.transferAsset(transferParams)}
                 message={signingMessages.transferAsset(transferParams)}
@@ -348,7 +354,7 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
               disabled={!readySend || busy}
               className="w-full mt-3 px-4 py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 text-white font-semibold text-sm disabled:opacity-40 disabled:cursor-not-allowed hover:from-amber-400 hover:to-orange-400 transition"
             >
-              {busy ? "Submitting…" : "Send tokens"}
+              {busy ? "Submitting…" : unlocked ? "Sign & send tokens" : "Send tokens"}
             </button>
           </>
         )}

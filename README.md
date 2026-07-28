@@ -128,15 +128,26 @@ signing conventions. It provides:
 - An offline wallet/validator signing CLI (`hikma-wallet`) — private keys never touch
   the node or the network.
 - Persistence to disk (chain only; balances/stakes/nonces are replayed on startup).
+- **The Hikmalayer Wallet (in-browser, encrypted).** Create or import a key in the
+  dashboard and sign transactions with one click. The key is generated in the
+  browser, stored **only as AES-256-GCM ciphertext** under a password stretched with
+  PBKDF2-SHA256 (310,000 iterations), held in memory only while unlocked, and wiped
+  on lock, on a 15-minute idle timeout, and when the tab closes. It is **never sent
+  to the node, never logged, and never leaves the device**; only the public key and
+  signature go on the wire. Exporting the key requires the password again. The
+  wallet reproduces the chain's native scheme exactly — its signatures are
+  byte-for-byte identical to `hikma-wallet`'s (verified against the Rust
+  implementation, including UTF-8 digest length handling).
 - **A React DEX dashboard.** Swap (live on-chain quotes, slippage → `min_out`,
   price impact), liquidity provision (pool reserves, spot price, LP position and
   share percentage), and an asset explorer (token registry, issuance, transfers,
   your holdings) — alongside the existing mining/certificate/explorer panels.
-  Every state-changing action uses the **offline-signing flow**: the UI shows the
-  exact `hikma-wallet` command and the canonical message being authorized, and you
-  paste back only the public key and signature. **No private key ever enters the
-  browser or the node.** Allowed browser origins are configurable via
-  `CORS_ALLOWED_ORIGINS` (defaults cover the Vite dev and preview servers).
+  With the wallet unlocked, actions are signed in-browser; otherwise the UI falls
+  back to the **offline-signing flow** (it shows the exact `hikma-wallet` command
+  and the canonical message, and you paste back the public key and signature) —
+  the right choice for cold keys and large amounts. Allowed browser origins are
+  configurable via `CORS_ALLOWED_ORIGINS` (defaults cover the Vite dev and preview
+  servers).
 
 Hikmalayer is developed by Muhammad Ayan Rao, Founder and Director of Bestower Labs Limited.
 
@@ -220,9 +231,11 @@ Hikmalayer Core is developed in phases:
 - **Phase 13**: Sovereign-finality fork choice, genesis validator allowlist (permissioned-hybrid launch), and the native token standard (HTS) — ecosystem/DEX foundation.
 - **Phase 14**: Native AMM DEX — constant-product HKM↔token pools, LP shares, 0.3% swap fee, slippage-bounded swaps.
 - **Phase 15**: DEX front-end (swap / liquidity / asset explorer, offline-signing flow) + configurable CORS.
+- **Phase 16**: Hikmalayer Wallet — in-browser encrypted key vault with one-click signing across the DEX.
 - **Mainnet (pending)**: External audit + adversarial testnet, ops hardening.
-- **Bridge (Brick 3, not started)**: wrapped external assets — scoped in
-  [`docs/bridge_design.md`](docs/bridge_design.md), gated on decisions + an external audit.
+- **Bridge (Brick 3): not pursued.** Hikmalayer will not custody external assets;
+  the DEX trades HKM and Hikmalayer-issued tokens only. Reasoning retained in
+  [`docs/bridge_design.md`](docs/bridge_design.md).
 
 
 ## 🔄 How it works — consensus workflow
@@ -544,8 +557,9 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 | Phase 13 | ✅ Sovereign-finality fork choice + genesis validator allowlist (permissioned-hybrid launch) + native token standard (HTS: create/transfer/burn, live-verified) — ecosystem/DEX foundation |
 | Phase 14 | ✅ Native AMM DEX: constant-product HKM↔token pools, LP shares (sqrt + MINIMUM_LIQUIDITY lock), 0.3% fee to LPs, slippage-bounded swaps, read-only quotes — live-verified add→swap→remove |
 | Phase 15 | ✅ DEX front-end (swap / liquidity / assets) with offline-signing flow, live quotes and price impact; configurable CORS — verified against a live node and rendered end-to-end |
+| Phase 16 | ✅ Hikmalayer Wallet: in-browser key generation, AES-256-GCM vault (PBKDF2 310k), auto-lock, one-click signing across the DEX — signatures byte-identical to the Rust signer, live-verified transfer/issuance/liquidity/swap, and forgeries rejected |
 | Mainnet | 🚧 External audit + adversarial testnet, ops hardening (see `docs/mainnet_readiness.md`) |
-| Bridge (Brick 3) | ⛔ Not started — design and gates in `docs/bridge_design.md`. No wrapped external assets exist; the DEX trades HKM and native tokens only |
+| Bridge (Brick 3) | ⛔ **Not pursued (decided)** — Hikmalayer does not custody external assets. No wrapped assets exist; the DEX trades HKM and native tokens only. Reasoning in `docs/bridge_design.md` |
 
 
 

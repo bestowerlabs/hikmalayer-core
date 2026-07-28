@@ -128,16 +128,32 @@ signing conventions. It provides:
 - An offline wallet/validator signing CLI (`hikma-wallet`) — private keys never touch
   the node or the network.
 - Persistence to disk (chain only; balances/stakes/nonces are replayed on startup).
-- **The Hikmalayer Wallet (in-browser, encrypted).** Create or import a key in the
-  dashboard and sign transactions with one click. The key is generated in the
-  browser, stored **only as AES-256-GCM ciphertext** under a password stretched with
-  PBKDF2-SHA256 (310,000 iterations), held in memory only while unlocked, and wiped
-  on lock, on a 15-minute idle timeout, and when the tab closes. It is **never sent
-  to the node, never logged, and never leaves the device**; only the public key and
-  signature go on the wire. Exporting the key requires the password again. The
-  wallet reproduces the chain's native scheme exactly — its signatures are
-  byte-for-byte identical to `hikma-wallet`'s (verified against the Rust
-  implementation, including UTF-8 digest length handling).
+- **The Hikmalayer Wallet (in-browser, encrypted, XSS-hardened).** Create or import
+  a key in the dashboard and sign transactions with one click. The key is generated
+  in the browser, stored **only as AES-256-GCM ciphertext** under a password
+  stretched with PBKDF2-SHA256 (310,000 iterations), and **never sent to the node,
+  never logged, never leaves the device** — only the public key and signature go on
+  the wire. Exporting requires the password again. Signatures are byte-for-byte
+  identical to `hikma-wallet`'s (verified against the Rust implementation,
+  including UTF-8 digest length handling). Defence in depth against a compromised
+  page:
+  - **Strict CSP** — `script-src 'self'` stops injected inline/remote scripts from
+    executing, and `connect-src` pins network access to the node, so a stolen key
+    cannot be exfiltrated. Verified in a real browser against simulated payloads.
+  - **No long-lived key in memory** — while unlocked the key is held encrypted
+    under a **non-extractable** AES-GCM session key, decrypted to a buffer only for
+    the instant of signing (signing runs on raw bytes, so no key *string* is ever
+    created), then zeroized. Auto-locks after 15 minutes idle and on tab close.
+  - **No silent signing** — every signature raises a confirmation showing the exact
+    canonical message; rejection means nothing is signed.
+  - **Anti-spoofing** — token names/symbols come from the chain and are
+    attacker-chosen, so they are stripped of invisible and text-reordering
+    (bidi) characters, length-bounded, and flagged when they imitate HKM.
+
+  **Residual risk, stated plainly:** script running inside the page can still *ask*
+  the wallet to sign (the confirmation makes that visible, not impossible). For
+  treasury, validator, and other high-value keys, use the offline `hikma-wallet`
+  CLI — see `docs/wallet_security.md`.
 - **A React DEX dashboard.** Swap (live on-chain quotes, slippage → `min_out`,
   price impact), liquidity provision (pool reserves, spot price, LP position and
   share percentage), and an asset explorer (token registry, issuance, transfers,
@@ -232,6 +248,7 @@ Hikmalayer Core is developed in phases:
 - **Phase 14**: Native AMM DEX — constant-product HKM↔token pools, LP shares, 0.3% swap fee, slippage-bounded swaps.
 - **Phase 15**: DEX front-end (swap / liquidity / asset explorer, offline-signing flow) + configurable CORS.
 - **Phase 16**: Hikmalayer Wallet — in-browser encrypted key vault with one-click signing across the DEX.
+- **Phase 17**: Wallet XSS hardening — CSP, non-extractable session key protection, mandatory signing confirmation, anti-spoofing (`docs/wallet_security.md`).
 - **Mainnet (pending)**: External audit + adversarial testnet, ops hardening.
 - **Bridge (Brick 3): not pursued.** Hikmalayer will not custody external assets;
   the DEX trades HKM and Hikmalayer-issued tokens only. Reasoning retained in
@@ -558,6 +575,7 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 | Phase 14 | ✅ Native AMM DEX: constant-product HKM↔token pools, LP shares (sqrt + MINIMUM_LIQUIDITY lock), 0.3% fee to LPs, slippage-bounded swaps, read-only quotes — live-verified add→swap→remove |
 | Phase 15 | ✅ DEX front-end (swap / liquidity / assets) with offline-signing flow, live quotes and price impact; configurable CORS — verified against a live node and rendered end-to-end |
 | Phase 16 | ✅ Hikmalayer Wallet: in-browser key generation, AES-256-GCM vault (PBKDF2 310k), auto-lock, one-click signing across the DEX — signatures byte-identical to the Rust signer, live-verified transfer/issuance/liquidity/swap, and forgeries rejected |
+| Phase 17 | ✅ Wallet XSS hardening: strict CSP (browser-verified to block script injection + exfiltration), non-extractable session-key protection with byte-only signing and zeroization, mandatory signing confirmation (rejection proven to sign nothing), and anti-spoofing for attacker-chosen token names — residual risk documented in `docs/wallet_security.md` |
 | Mainnet | 🚧 External audit + adversarial testnet, ops hardening (see `docs/mainnet_readiness.md`) |
 | Bridge (Brick 3) | ⛔ **Not pursued (decided)** — Hikmalayer does not custody external assets. No wrapped assets exist; the DEX trades HKM and native tokens only. Reasoning in `docs/bridge_design.md` |
 

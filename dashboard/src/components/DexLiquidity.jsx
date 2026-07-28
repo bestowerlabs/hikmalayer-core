@@ -9,6 +9,7 @@ import {
 } from "../api";
 import { useWallet } from "../hooks/useWallet";
 import { useSigner } from "../hooks/useSigner";
+import { safeText } from "../lib/sanitize";
 import OfflineSigner from "./OfflineSigner";
 import {
   HKM_DECIMALS,
@@ -132,7 +133,7 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
           ? signingMessages.addLiquidity(addParams)
           : signingMessages.removeLiquidity(removeParams);
       const signedBy = unlocked
-        ? { public_key: signerPublicKey, signature: sign(canonical) }
+        ? { public_key: signerPublicKey, signature: await sign(canonical) }
         : { public_key: publicKey.trim(), signature: signature.trim() };
       const res =
         mode === "add"
@@ -209,7 +210,8 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
           {assets.length === 0 && <option value="">No assets issued yet</option>}
           {assets.map((a) => (
             <option key={a.token_id} value={a.token_id} className="bg-slate-800">
-              HKM / {a.symbol} {pools.some((p) => p.token_id === a.token_id) ? "" : "(new pool)"}
+              HKM / {safeText(a.symbol, 12)}{" "}
+              {pools.some((p) => p.token_id === a.token_id) ? "" : "(new pool)"}
             </option>
           ))}
         </select>
@@ -220,7 +222,7 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
               <span>Reserves</span>
               <span className="text-white">
                 {formatUnits(pool.reserve_hkm, HKM_DECIMALS)} HKM /{" "}
-                {formatUnits(pool.reserve_token, tokenDecimals)} {asset?.symbol}
+                {formatUnits(pool.reserve_token, tokenDecimals)} {safeText(asset?.symbol, 12)}
               </span>
             </div>
             {price !== null && (
@@ -228,7 +230,7 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
                 <span>Spot price</span>
                 <span className="text-white">
                   1 HKM ≈ {price.toLocaleString(undefined, { maximumFractionDigits: 8 })}{" "}
-                  {asset?.symbol}
+                  {safeText(asset?.symbol, 12)}
                 </span>
               </div>
             )}
@@ -255,7 +257,7 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
               className="w-full px-3 py-2 mb-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500/50"
             />
             <label className="block text-xs text-gray-400 mb-1">
-              {asset?.symbol || "Token"} amount
+              {safeText(asset?.symbol, 12) || "Token"} amount
               {suggestedToken !== null && (
                 <button
                   type="button"
@@ -371,7 +373,7 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
                     className="w-full text-left px-2 py-1.5 rounded-lg hover:bg-white/10 transition text-xs flex justify-between"
                   >
                     <span className="text-white">
-                      HKM / {meta?.symbol || shortId(p.token_id)}
+                      HKM / {safeText(meta?.symbol, 12) || shortId(p.token_id)}
                     </span>
                     <span className="text-gray-400">
                       {formatUnits(p.reserve_hkm, HKM_DECIMALS)} HKM

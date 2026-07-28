@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { getSwapQuote, listAssets, listPools, submitSwap, getAccountNonce } from "../api";
 import { useWallet } from "../hooks/useWallet";
 import { useSigner } from "../hooks/useSigner";
+import { safeText } from "../lib/sanitize";
 import OfflineSigner from "./OfflineSigner";
 import {
   HKM_DECIMALS,
@@ -140,7 +141,7 @@ const DexSwap = ({ refreshTrigger, onUpdate }) => {
     setMessage(null);
     try {
       const signedBy = unlocked
-        ? { public_key: signerPublicKey, signature: sign(signingMessages.swap(signParams)) }
+        ? { public_key: signerPublicKey, signature: await sign(signingMessages.swap(signParams)) }
         : { public_key: publicKey.trim(), signature: signature.trim() };
       const res = await submitSwap({
         token_id: tokenId,
@@ -192,7 +193,7 @@ const DexSwap = ({ refreshTrigger, onUpdate }) => {
                 const meta = assets.find((a) => a.token_id === p.token_id);
                 return (
                   <option key={p.token_id} value={p.token_id} className="bg-slate-800">
-                    HKM / {meta?.symbol || shortId(p.token_id)}
+                    HKM / {safeText(meta?.symbol, 12) || shortId(p.token_id)}
                   </option>
                 );
               })}
@@ -201,7 +202,7 @@ const DexSwap = ({ refreshTrigger, onUpdate }) => {
             <div className="flex items-center gap-2 mb-3">
               <div className="flex-1">
                 <label className="block text-xs text-gray-400 mb-1">
-                  You pay ({hkmToToken ? "HKM" : asset?.symbol || "token"})
+                  You pay ({hkmToToken ? "HKM" : safeText(asset?.symbol, 12) || "token"})
                 </label>
                 <input
                   type="text"
@@ -221,7 +222,7 @@ const DexSwap = ({ refreshTrigger, onUpdate }) => {
               </button>
               <div className="flex-1">
                 <label className="block text-xs text-gray-400 mb-1">
-                  You receive ({hkmToToken ? asset?.symbol || "token" : "HKM"})
+                  You receive ({hkmToToken ? safeText(asset?.symbol, 12) || "token" : "HKM"})
                 </label>
                 <div className="w-full px-3 py-2 rounded-lg bg-black/30 border border-white/10 text-teal-200 text-sm">
                   {quote ? formatUnits(quote.amount_out, outDecimals) : "—"}
@@ -255,7 +256,7 @@ const DexSwap = ({ refreshTrigger, onUpdate }) => {
                   <span>Minimum received</span>
                   <span className="text-white">
                     {formatUnits(minOut, outDecimals)}{" "}
-                    {hkmToToken ? asset?.symbol || "token" : "HKM"}
+                    {hkmToToken ? safeText(asset?.symbol, 12) || "token" : "HKM"}
                   </span>
                 </div>
                 <div className="flex justify-between text-gray-300">
@@ -269,7 +270,7 @@ const DexSwap = ({ refreshTrigger, onUpdate }) => {
                   <span className="text-white">
                     {formatUnits(quote.reserve_hkm, HKM_DECIMALS)} HKM /{" "}
                     {formatUnits(quote.reserve_token, tokenDecimals)}{" "}
-                    {asset?.symbol || ""}
+                    {safeText(asset?.symbol, 12)}
                   </span>
                 </div>
               </div>

@@ -4,7 +4,39 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Vite + React</title>
+
+    <!--
+      Content Security Policy — the primary containment for a wallet-bearing
+      page. Even if a script injection ever occurs (a dependency compromise, a
+      future regression), this policy denies the two things an attacker needs:
+
+        script-src 'self'   → injected inline/remote scripts do not execute
+        connect-src (list)  → a stolen key cannot be POSTed to an attacker host
+        object/base/form    → no plugins, no <base> hijack, no form exfiltration
+
+      'unsafe-inline' is required in style-src only because React sets inline
+      style attributes (animation delays); it does NOT permit script execution.
+
+      Adjust connect-src to your node's public origin when deploying, and
+      prefer serving the same policy as a real HTTP header (a header also
+      enforces frame-ancestors, which is ignored in a meta tag).
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self';
+               script-src 'self';
+               style-src 'self' 'unsafe-inline';
+               img-src 'self' data:;
+               font-src 'self' data:;
+               connect-src 'self' http://127.0.0.1:3000 http://localhost:3000;
+               object-src 'none';
+               base-uri 'none';
+               form-action 'none';
+               frame-ancestors 'none'"
+    />
+    <meta name="referrer" content="no-referrer" />
+
+    <title>Hikmalayer Dashboard</title>
   </head>
   <body>
     <div id="root"></div>

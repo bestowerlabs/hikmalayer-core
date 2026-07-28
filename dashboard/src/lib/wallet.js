@@ -86,6 +86,67 @@ export function signMessage(message, privateKeyHex) {
   return signature.toCompactHex();
 }
 
+/// Sign directly from raw key BYTES. Preferred at runtime: no private-key
+/// string is ever materialized (JS strings are immutable and cannot be
+/// wiped), so the only copy is a buffer the caller zeroizes immediately.
+export function signMessageFromBytes(message, privateKeyBytes) {
+  return secp256k1.sign(messageDigest(message), privateKeyBytes).toCompactHex();
+}
+
+/// Overwrite a byte buffer in place. Not a guarantee against a determined
+/// attacker (the JS engine may still hold copies), but it removes the
+/// obvious long-lived one.
+export function wipe(bytes) {
+  if (bytes && typeof bytes.fill === "function") bytes.fill(0);
+}
+
+// ===== Session protection for the unlocked key =====
+//
+// While unlocked, the key is NOT kept as a plain string. It is held encrypted
+// under a per-session AES-GCM key that is generated non-extractable: even
+// script running in this page cannot read that key out of WebCrypto. The
+// private key is decrypted to a short-lived buffer only for the instant of
+// signing, and wiped straight after.
+//
+// Honest limit: script executing in the page can still *call* the signer.
+// This narrows the window and defeats passive scraping of memory/state — it
+// is not a substitute for the CSP, and not equal to a hardware signer.
+
+export async function createSessionKey() {
+  return subtle().generateKey({ name: "AES-GCM", length: 256 }, false, [
+    "encrypt",
+    "decrypt",
+  ]);
+}
+
+export async function protectKey(sessionKey, privateKeyHex) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const raw = hexToBytes(normalizeHex(privateKeyHex));
+  try {
+    const ciphertext = await subtle().encrypt({ name: "AES-GCM", iv }, sessionKey, raw);
+    return { iv, ciphertext };
+  } finally {
+    wipe(raw);
+  }
+}
+
+/// Decrypt the protected key, hand the raw bytes to `consumer`, then wipe
+/// them. The bytes never escape this function.
+export async function withProtectedKey(sessionKey, protectedKey, consumer) {
+  const plaintext = new Uint8Array(
+    await subtle().decrypt(
+      { name: "AES-GCM", iv: protectedKey.iv },
+      sessionKey,
+      protectedKey.ciphertext
+    )
+  );
+  try {
+    return consumer(plaintext);
+  } finally {
+    wipe(plaintext);
+  }
+}
+
 export function verifyMessage(message, publicKeyHex, signatureHex) {
   try {
     return secp256k1.verify(

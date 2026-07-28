@@ -10,6 +10,7 @@ import { useWallet } from "../hooks/useWallet";
 import { useSigner } from "../hooks/useSigner";
 import OfflineSigner from "./OfflineSigner";
 import { formatUnits, parseUnits, shortId, signingCommands, signingMessages } from "../lib/hts";
+import { describeAsset, safeText } from "../lib/sanitize";
 
 /// Browse the native token registry, issue a new token, and send tokens.
 /// Supply is fixed at issuance (reducible only by burning), so what the
@@ -116,7 +117,10 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
     setMessage(null);
     try {
       const signedBy = unlocked
-        ? { public_key: signerPublicKey, signature: sign(signingMessages.createAsset(createParams)) }
+        ? {
+            public_key: signerPublicKey,
+            signature: await sign(signingMessages.createAsset(createParams)),
+          }
         : { public_key: publicKey.trim(), signature: signature.trim() };
       const res = await createAsset({
         creator: account,
@@ -148,7 +152,10 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
     setMessage(null);
     try {
       const signedBy = unlocked
-        ? { public_key: signerPublicKey, signature: sign(signingMessages.transferAsset(transferParams)) }
+        ? {
+            public_key: signerPublicKey,
+            signature: await sign(signingMessages.transferAsset(transferParams)),
+          }
         : { public_key: publicKey.trim(), signature: signature.trim() };
       const res = await transferAsset({
         token_id: sendToken,
@@ -213,15 +220,21 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
                 No tokens issued yet.
               </p>
             )}
-            {assets.map((a) => (
+            {assets.map((a) => {
+              const meta = describeAsset(a);
+              return (
               <div
                 key={a.token_id}
-                className="rounded-lg bg-black/20 border border-white/10 p-3"
+                className={`rounded-lg border p-3 ${
+                  meta.suspicious
+                    ? "bg-red-500/10 border-red-400/40"
+                    : "bg-black/20 border-white/10"
+                }`}
               >
                 <div className="flex justify-between items-baseline">
                   <span className="text-white font-semibold text-sm">
-                    {a.symbol}
-                    <span className="text-gray-400 font-normal ml-2">{a.name}</span>
+                    {meta.symbol}
+                    <span className="text-gray-400 font-normal ml-2">{meta.name}</span>
                   </span>
                   <span className="text-xs text-gray-400">{a.decimals} dp</span>
                 </div>
@@ -244,8 +257,12 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
                     </span>
                   )}
                 </div>
+                {meta.warning && (
+                  <p className="mt-2 text-[11px] text-red-200">⚠️ {meta.warning}</p>
+                )}
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
@@ -317,7 +334,7 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
               {assets.length === 0 && <option value="">No assets issued yet</option>}
               {assets.map((a) => (
                 <option key={a.token_id} value={a.token_id} className="bg-slate-800">
-                  {a.symbol} — {shortId(a.token_id)}
+                  {safeText(a.symbol, 12)} — {shortId(a.token_id)}
                 </option>
               ))}
             </select>
@@ -332,7 +349,7 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
               type="text"
               value={sendAmount}
               onChange={(e) => setSendAmount(e.target.value)}
-              placeholder={`Amount${sendAsset ? ` (${sendAsset.symbol})` : ""}`}
+              placeholder={`Amount${sendAsset ? ` (${safeText(sendAsset.symbol, 12)})` : ""}`}
               className="w-full px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-amber-500/50"
             />
 

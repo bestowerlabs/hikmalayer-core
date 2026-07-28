@@ -128,7 +128,15 @@ signing conventions. It provides:
 - An offline wallet/validator signing CLI (`hikma-wallet`) — private keys never touch
   the node or the network.
 - Persistence to disk (chain only; balances/stakes/nonces are replayed on startup).
-- A React dashboard for local interaction and testing workflows.
+- **A React DEX dashboard.** Swap (live on-chain quotes, slippage → `min_out`,
+  price impact), liquidity provision (pool reserves, spot price, LP position and
+  share percentage), and an asset explorer (token registry, issuance, transfers,
+  your holdings) — alongside the existing mining/certificate/explorer panels.
+  Every state-changing action uses the **offline-signing flow**: the UI shows the
+  exact `hikma-wallet` command and the canonical message being authorized, and you
+  paste back only the public key and signature. **No private key ever enters the
+  browser or the node.** Allowed browser origins are configurable via
+  `CORS_ALLOWED_ORIGINS` (defaults cover the Vite dev and preview servers).
 
 Hikmalayer is developed by Muhammad Ayan Rao, Founder and Director of Bestower Labs Limited.
 
@@ -211,7 +219,10 @@ Hikmalayer Core is developed in phases:
 - **Phase 12**: Mainnet tokenomics — 6 decimals, 100B supply (30B genesis / ~70B mined), halving + 50 HKM tail emission, on-chain vesting, minimum validator stake.
 - **Phase 13**: Sovereign-finality fork choice, genesis validator allowlist (permissioned-hybrid launch), and the native token standard (HTS) — ecosystem/DEX foundation.
 - **Phase 14**: Native AMM DEX — constant-product HKM↔token pools, LP shares, 0.3% swap fee, slippage-bounded swaps.
+- **Phase 15**: DEX front-end (swap / liquidity / asset explorer, offline-signing flow) + configurable CORS.
 - **Mainnet (pending)**: External audit + adversarial testnet, ops hardening.
+- **Bridge (Brick 3, not started)**: wrapped external assets — scoped in
+  [`docs/bridge_design.md`](docs/bridge_design.md), gated on decisions + an external audit.
 
 
 ## 🔄 How it works — consensus workflow
@@ -532,7 +543,9 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 | Phase 12 | ✅ Mainnet tokenomics: 6 decimals, 100B HKM (30B genesis / ~70B mined), halving every 9.5M blocks (~4.5y) + 50 HKM security tail, on-chain cliff+linear vesting (live-verified), 10,000 HKM validator minimum |
 | Phase 13 | ✅ Sovereign-finality fork choice + genesis validator allowlist (permissioned-hybrid launch) + native token standard (HTS: create/transfer/burn, live-verified) — ecosystem/DEX foundation |
 | Phase 14 | ✅ Native AMM DEX: constant-product HKM↔token pools, LP shares (sqrt + MINIMUM_LIQUIDITY lock), 0.3% fee to LPs, slippage-bounded swaps, read-only quotes — live-verified add→swap→remove |
+| Phase 15 | ✅ DEX front-end (swap / liquidity / assets) with offline-signing flow, live quotes and price impact; configurable CORS — verified against a live node and rendered end-to-end |
 | Mainnet | 🚧 External audit + adversarial testnet, ops hardening (see `docs/mainnet_readiness.md`) |
+| Bridge (Brick 3) | ⛔ Not started — design and gates in `docs/bridge_design.md`. No wrapped external assets exist; the DEX trades HKM and native tokens only |
 
 
 

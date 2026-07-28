@@ -8,6 +8,9 @@ import MiningActions from "./components/MiningActions";
 import BlockchainViewer from "./components/BlockchainViewer";
 import WalletAuth from "./components/WalletAuth";
 import ProtectedAction from "./components/ProtectedAction";
+import DexSwap from "./components/DexSwap";
+import DexLiquidity from "./components/DexLiquidity";
+import AssetExplorer from "./components/AssetExplorer";
 
 const AppContent = () => {
   const [stats, setStats] = useState({
@@ -168,6 +171,30 @@ const AppContent = () => {
             >
               <MiningActions onUpdate={handleUpdate} />
             </ProtectedAction>
+          </div>
+
+          {/* Ecosystem: native assets + the on-chain AMM DEX. Read-only
+              browsing needs no wallet; actions are authorized by offline
+              signatures, so no auth gate is required here. */}
+          <div>
+            <div className="mb-4">
+              <h2 className="text-2xl font-bold text-white">
+                Ecosystem{" "}
+                <span className="bg-gradient-to-r from-teal-400 to-purple-400 bg-clip-text text-transparent">
+                  DEX
+                </span>
+              </h2>
+              <p className="text-gray-400 text-sm">
+                Native assets and constant-product HKM pools. Trades HKM and
+                Hikmalayer-issued tokens only — this is not a bridge to other
+                chains.
+              </p>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
+              <DexSwap refreshTrigger={refreshTrigger} onUpdate={handleUpdate} />
+              <DexLiquidity refreshTrigger={refreshTrigger} onUpdate={handleUpdate} />
+              <AssetExplorer refreshTrigger={refreshTrigger} onUpdate={handleUpdate} />
+            </div>
           </div>
 
           {/* Blockchain Viewer - No auth required (read-only) */}

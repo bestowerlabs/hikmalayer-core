@@ -328,13 +328,51 @@ async fn main() {
         treasury_key,
     };
 
-    // Configure CORS to allow React app on localhost:5173
+    // Browser origins allowed to call this node. Defaults cover the Vite dev
+    // server (5173) and the production-preview server (4173) on both
+    // loopback spellings; set CORS_ALLOWED_ORIGINS (comma-separated) to serve
+    // a deployed dashboard from anywhere else. Kept as an explicit allowlist
+    // — never a wildcard — so a hostile page cannot drive a node from a
+    // user's browser.
+    let cors_origins: Vec<axum::http::HeaderValue> =
+        std::env::var("CORS_ALLOWED_ORIGINS")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|origin| origin.trim().to_string())
+                    .filter(|origin| !origin.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    "http://localhost:5173".to_string(),
+                    "http://127.0.0.1:5173".to_string(),
+                    "http://localhost:4173".to_string(),
+                    "http://127.0.0.1:4173".to_string(),
+                ]
+            })
+            .into_iter()
+            .filter_map(|origin| match origin.parse::<axum::http::HeaderValue>() {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    eprintln!("⚠️  Ignoring malformed CORS origin: {}", origin);
+                    None
+                }
+            })
+            .collect();
+    println!(
+        "🌐 CORS origins allowed: {}",
+        cors_origins
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
     let cors = CorsLayer::new()
-        .allow_origin(
-            "http://localhost:5173"
-                .parse::<axum::http::HeaderValue>()
-                .unwrap(),
-        )
+        .allow_origin(cors_origins)
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -359,7 +397,6 @@ async fn main() {
         .unwrap_or(3000);
 
     println!("🚀 Hikmalayer REST API running on http://127.0.0.1:{}", port);
-    println!("🌐 CORS enabled for React app on http://localhost:5173");
     println!("📋 Available endpoints:");
     println!("  🔐 AUTHENTICATION:");
     println!("      🎫 POST /auth/nonce");

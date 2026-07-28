@@ -27,6 +27,7 @@ is a launch blocker until closed.
 | Resource bounds | Difficulty clamped 1–5; input length limits |
 | Rewards & fees | **Calibrated mainnet emission**: 6-decimal HKM, 30B genesis + ~70B mined (30/70 split), 3,700 HKM initial reward halving every 9,500,000 blocks (~4.5y — bulk over ~18y), **50 HKM/block tail emission** as a perpetual security budget — all consensus-verified per height. Plus a **dynamic base fee** (EIP-1559-style, floor 0.001 HKM, cap 100 HKM) paid to the block validator; the base fee lives in the state root and is recomputed identically by every node |
 | Native token standard (HTS) | Consensus-level fungible tokens (the ecosystem/DEX asset primitive): `TokenCreate` (fixed supply minted to issuer, deterministic `hkt…` id, ≤18 decimals), `TokenTransfer`, `TokenBurn`; registry + per-token balances in the state root; fees paid in HKM. Live-verified create→transfer→burn with HKM supply provably untouched |
+| DEX front-end | React dashboard panels for swap (live on-chain quotes, slippage→`min_out`, price impact), liquidity (reserves, spot price, LP position), and assets (registry, issuance, transfers). All state-changing actions use the offline-signing flow — the UI displays the exact `hikma-wallet` command and canonical message, and never touches a private key. Verified end-to-end against a live node using the shipped helper module; browser origins configurable via `CORS_ALLOWED_ORIGINS` |
 | Native AMM DEX | Constant-product HKM↔token pools (`AddLiquidity`/`RemoveLiquidity`/`Swap`) with LP shares, a 0.3% fee accruing to LPs, `MINIMUM_LIQUIDITY` lock against the first-depositor attack, u128 checked math, and per-op slippage bounds; reserves custodied in a pool account so HKM/token supply stays conserved. Read-only `/dex/quote` matches on-chain execution exactly. Live-verified add→swap→remove |
 | Vesting (lockups) | **On-chain cliff + linear vesting**: `Vest` transactions lock funds in a consensus-managed pool that releases block-by-block after the cliff; schedules are inspectable at `GET /vesting/{address}` — team/investor lockups are protocol guarantees, live-verified end-to-end |
 | Validator floor | **10,000 HKM minimum stake** to join (or remain in, on withdrawal) the validator set — no trivial-stake spam validators |
@@ -82,7 +83,17 @@ external process**, not missing protocol code:
    long-lived deployments. What remains is operational: publishing and pinning
    community-agreed checkpoint anchors.
 
+5. **Cross-chain bridge (Brick 3).** ⛔ *Not started, and deliberately so.*
+   No wrapped external assets exist; the DEX trades HKM and Hikmalayer-issued
+   tokens only. Bridges are the most-attacked component in crypto (Ronin
+   $600M, Wormhole $320M, Nomad $190M), so this is gated on explicit
+   decisions, a phased rollout with caps, and a dedicated external audit —
+   see [`docs/bridge_design.md`](bridge_design.md). Until then, no material
+   may advertise external assets as tradeable on Hikmalayer.
+
 ## Suggested order of work
 
 `economic modeling` → `deploy adversarial testnet` → `external audit + fixes`
 → `mainnet genesis`. Scaling (checkpoint fast-sync / pruning) is now built.
+Ecosystem (native tokens + AMM DEX + front-end) is built. A bridge, if ever
+pursued, follows its own gated track in `docs/bridge_design.md`.

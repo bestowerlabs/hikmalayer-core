@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { getSwapQuote, listAssets, listPools, submitSwap, getAccountNonce } from "../api";
 import { useWallet } from "../hooks/useWallet";
-import { useSigner } from "../hooks/useSigner";
+import { useActiveSigner } from "../hooks/useActiveSigner";
 import { safeText } from "../lib/sanitize";
 import OfflineSigner from "./OfflineSigner";
 import {
@@ -20,7 +20,7 @@ import {
 /// consensus will apply, so the preview matches execution exactly.
 const DexSwap = ({ refreshTrigger, onUpdate }) => {
   const { account } = useWallet();
-  const { unlocked, sign, publicKey: signerPublicKey } = useSigner();
+  const { canSign: unlocked, sign, publicKey: signerPublicKey } = useActiveSigner();
   const [pools, setPools] = useState([]);
   const [assets, setAssets] = useState([]);
   const [tokenId, setTokenId] = useState("");

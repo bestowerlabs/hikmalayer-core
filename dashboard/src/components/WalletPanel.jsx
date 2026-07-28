@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { useSigner } from "../hooks/useSigner";
+import { useExtension } from "../hooks/useExtension";
+import { useWallet } from "../hooks/useWallet";
 import { getTokenBalance } from "../api";
 import { formatUnits, HKM_DECIMALS } from "../lib/hts";
 
@@ -7,6 +9,15 @@ import { formatUnits, HKM_DECIMALS } from "../lib/hts";
 /// and sign transactions in-browser. The key is stored only as AES-GCM
 /// ciphertext and is never sent anywhere.
 const WalletPanel = ({ refreshTrigger }) => {
+  const extension = useExtension();
+  const { connectWallet } = useWallet();
+
+  // Connecting the extension also makes it the dashboard's active identity,
+  // so the DEX panels address transactions from it.
+  const connectExtension = async () => {
+    const account = await extension.connect();
+    if (account) connectWallet(account);
+  };
   const {
     hasWallet,
     unlocked,
@@ -37,6 +48,11 @@ const WalletPanel = ({ refreshTrigger }) => {
   useEffect(() => {
     setView(hasWallet ? "unlock" : "create");
   }, [hasWallet]);
+
+  // A previously connected extension becomes the active identity on load.
+  useEffect(() => {
+    if (extension.connected && extension.account) connectWallet(extension.account);
+  }, [extension.connected, extension.account, connectWallet]);
 
   useEffect(() => {
     if (!address) return;
@@ -127,6 +143,41 @@ const WalletPanel = ({ refreshTrigger }) => {
         <p className="text-xs text-gray-400 mb-4">
           Keys are encrypted on this device and never sent to the node.
         </p>
+
+        {/* The extension is the safer signer: its key lives outside this page,
+            so an XSS here cannot reach it. Prefer it whenever it is present. */}
+        {extension.available && (
+          <div className="rounded-lg border border-emerald-400/30 bg-emerald-500/10 p-3 mb-3">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs font-semibold text-emerald-100">
+                🧩 Hikmalayer Wallet extension detected
+              </span>
+              <span className="text-[11px] text-emerald-200">
+                {extension.connected ? "Connected" : "Not connected"}
+              </span>
+            </div>
+            <p className="text-[11px] text-emerald-100/80 mb-2">
+              Recommended — your key stays in the extension and every signature
+              is approved there, out of reach of this page.
+            </p>
+            {extension.connected ? (
+              <code className="block break-all text-[11px] text-emerald-200">
+                {extension.account}
+              </code>
+            ) : (
+              <button
+                type="button"
+                onClick={connectExtension}
+                className="w-full px-3 py-2 rounded-lg bg-emerald-500/30 hover:bg-emerald-500/40 border border-emerald-400/40 text-white text-sm transition"
+              >
+                Connect extension
+              </button>
+            )}
+            {extension.error && (
+              <p className="mt-2 text-[11px] text-red-300">{extension.error}</p>
+            )}
+          </div>
+        )}
 
         {!secureContext && (
           <p className="text-xs text-red-300 mb-3">

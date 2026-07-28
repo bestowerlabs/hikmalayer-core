@@ -39,11 +39,32 @@ UTF-8 case that exercises byte-length (not character-length) digests.
 | Compromised device (malware, keylogger) | Out of scope for any software wallet | **Residual** |
 | Malicious/compromised dependency in the build | Pinned deps; CSP limits blast radius; audit before release | **Partly residual** |
 
+## 2b. The browser EXTENSION removes the main residual risk
+
+The row marked **Residual** above — "active script asks the wallet to sign" —
+is the reason the extension in [`extension/`](../extension/README.md) exists.
+There, the key lives in the extension's own context:
+
+| Property | In-page wallet | **Extension** |
+|---|---|---|
+| Key readable by page script | While unlocked, yes | **No — different context entirely** |
+| Approval UI drawable by the page | It is *in* the page | **No — extension window** |
+| Site permissions | n/a | **Per-origin connect, browser-supplied origin** |
+| Page can call privileged methods | n/a | **No — method allowlist in the relay** |
+
+Verified in a real browser: the page cannot reach `chrome.storage`, cannot
+invoke `wallet:export`, cannot approve its own request, and sees no accounts
+until connected — yet an approved signature is accepted by a live node.
+
+**Recommendation:** install the extension and use it as the signer. The
+dashboard detects it automatically and prefers it; the in-page wallet remains
+for users who have not installed it.
+
 ## 3. Which key goes where
 
 | Key | Where it belongs |
 |---|---|
-| Everyday spending / DEX trading | Browser wallet — convenience matches the value at risk |
+| Everyday spending / DEX trading | **Extension wallet** (preferred), or the in-page wallet |
 | Treasury, genesis, large holdings | **Offline `hikma-wallet` CLI only.** Sign on a machine that does not browse the web; the dashboard's offline paste flow submits the signature |
 | Validator block-signing key | Node environment (`VALIDATOR_PRIVATE_KEY`), ideally an HSM or remote signer — see `docs/key_management.md` |
 

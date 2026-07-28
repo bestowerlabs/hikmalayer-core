@@ -128,7 +128,19 @@ signing conventions. It provides:
 - An offline wallet/validator signing CLI (`hikma-wallet`) — private keys never touch
   the node or the network.
 - Persistence to disk (chain only; balances/stakes/nonces are replayed on startup).
-- **The Hikmalayer Wallet (in-browser, encrypted, XSS-hardened).** Create or import
+- **Hikmalayer Wallet browser extension (MetaMask-style, recommended).** A real
+  extension wallet in [`extension/`](extension/): the private key lives in the
+  extension's own context, so **a website — or an XSS in a website — cannot read
+  it**. Sites use `window.hikmalayer` to request a connection and request
+  signatures; each one is approved in extension UI the page cannot draw over or
+  click. Per-origin permissions (the origin comes from the browser, not the page),
+  a method allowlist in the isolated relay, a frozen provider that can't be swapped
+  for a phishing lookalike, and the same AES-256-GCM vault + non-extractable
+  session-key protection as the in-page wallet. The dashboard detects and prefers
+  it automatically. Verified in a real browser: the page cannot reach
+  `chrome.storage`, cannot invoke privileged methods, cannot self-approve, and sees
+  no accounts until connected — while an approved signature is accepted on-chain.
+- **The in-page wallet (fallback, encrypted, XSS-hardened).** Create or import
   a key in the dashboard and sign transactions with one click. The key is generated
   in the browser, stored **only as AES-256-GCM ciphertext** under a password
   stretched with PBKDF2-SHA256 (310,000 iterations), and **never sent to the node,
@@ -151,9 +163,10 @@ signing conventions. It provides:
     (bidi) characters, length-bounded, and flagged when they imitate HKM.
 
   **Residual risk, stated plainly:** script running inside the page can still *ask*
-  the wallet to sign (the confirmation makes that visible, not impossible). For
-  treasury, validator, and other high-value keys, use the offline `hikma-wallet`
-  CLI — see `docs/wallet_security.md`.
+  the in-page wallet to sign (the confirmation makes that visible, not impossible)
+  — which is exactly why the extension above exists and is preferred. For treasury,
+  validator, and other high-value keys, use the offline `hikma-wallet` CLI — see
+  `docs/wallet_security.md`.
 - **A React DEX dashboard.** Swap (live on-chain quotes, slippage → `min_out`,
   price impact), liquidity provision (pool reserves, spot price, LP position and
   share percentage), and an asset explorer (token registry, issuance, transfers,
@@ -249,6 +262,7 @@ Hikmalayer Core is developed in phases:
 - **Phase 15**: DEX front-end (swap / liquidity / asset explorer, offline-signing flow) + configurable CORS.
 - **Phase 16**: Hikmalayer Wallet — in-browser encrypted key vault with one-click signing across the DEX.
 - **Phase 17**: Wallet XSS hardening — CSP, non-extractable session key protection, mandatory signing confirmation, anti-spoofing (`docs/wallet_security.md`).
+- **Phase 18**: Hikmalayer Wallet browser extension (MV3) — keys out of the page entirely, per-origin permissions, extension-side approvals (`extension/`).
 - **Mainnet (pending)**: External audit + adversarial testnet, ops hardening.
 - **Bridge (Brick 3): not pursued.** Hikmalayer will not custody external assets;
   the DEX trades HKM and Hikmalayer-issued tokens only. Reasoning retained in
@@ -576,6 +590,7 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 | Phase 15 | ✅ DEX front-end (swap / liquidity / assets) with offline-signing flow, live quotes and price impact; configurable CORS — verified against a live node and rendered end-to-end |
 | Phase 16 | ✅ Hikmalayer Wallet: in-browser key generation, AES-256-GCM vault (PBKDF2 310k), auto-lock, one-click signing across the DEX — signatures byte-identical to the Rust signer, live-verified transfer/issuance/liquidity/swap, and forgeries rejected |
 | Phase 17 | ✅ Wallet XSS hardening: strict CSP (browser-verified to block script injection + exfiltration), non-extractable session-key protection with byte-only signing and zeroization, mandatory signing confirmation (rejection proven to sign nothing), and anti-spoofing for attacker-chosen token names — residual risk documented in `docs/wallet_security.md` |
+| Phase 18 | ✅ Browser extension wallet (MV3): key held outside the page, `window.hikmalayer` provider, per-origin connect permissions, extension-side approvals, dashboard auto-detects and prefers it — 23 browser checks incl. page cannot reach storage / privileged methods / self-approval, plus an on-chain transfer and DEX issuance signed by the extension |
 | Mainnet | 🚧 External audit + adversarial testnet, ops hardening (see `docs/mainnet_readiness.md`) |
 | Bridge (Brick 3) | ⛔ **Not pursued (decided)** — Hikmalayer does not custody external assets. No wrapped assets exist; the DEX trades HKM and native tokens only. Reasoning in `docs/bridge_design.md` |
 

@@ -7,7 +7,7 @@ import {
   transferAsset,
 } from "../api";
 import { useWallet } from "../hooks/useWallet";
-import { useSigner } from "../hooks/useSigner";
+import { useActiveSigner } from "../hooks/useActiveSigner";
 import OfflineSigner from "./OfflineSigner";
 import { formatUnits, parseUnits, shortId, signingCommands, signingMessages } from "../lib/hts";
 import { describeAsset, safeText } from "../lib/sanitize";
@@ -17,7 +17,7 @@ import { describeAsset, safeText } from "../lib/sanitize";
 /// registry reports is the real, consensus-enforced supply.
 const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
   const { account } = useWallet();
-  const { unlocked, sign, publicKey: signerPublicKey } = useSigner();
+  const { canSign: unlocked, sign, publicKey: signerPublicKey } = useActiveSigner();
   const [assets, setAssets] = useState([]);
   const [mode, setMode] = useState("browse");
   const [nonce, setNonce] = useState(null);

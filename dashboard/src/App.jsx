@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { WalletProvider, useWallet } from "./hooks/useWallet";
 import { SignerProvider } from "./hooks/useSigner";
+import { ExtensionProvider } from "./hooks/useExtension";
 import { getBlockchainStats } from "./api";
 import StatsGrid from "./components/StatsGrid";
 import CertificateManager from "./components/CertificateManager";
@@ -181,6 +182,7 @@ const AppContent = () => {
               signatures, so no auth gate is required here. */}
           {/* Unlocking the wallet also sets the active address for the
               address-based panels, so there is one identity on screen. */}
+          <ExtensionProvider>
           <SignerProvider onUnlock={connectWallet}>
             <div className="mb-4">
               <h2 className="text-2xl font-bold text-white">
@@ -202,6 +204,7 @@ const AppContent = () => {
               <AssetExplorer refreshTrigger={refreshTrigger} onUpdate={handleUpdate} />
             </div>
           </SignerProvider>
+          </ExtensionProvider>
 
           {/* Blockchain Viewer - No auth required (read-only) */}
           <BlockchainViewer refreshTrigger={refreshTrigger} />

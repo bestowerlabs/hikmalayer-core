@@ -72,13 +72,33 @@ signing conventions. It provides:
   bearer tokens; verification is stateless, constant-time, and fail-closed.
 - **100B HKM tokenomics with halving + security tail.** HKM has 6 decimals
   (1 HKM = 1,000,000 base units; all on-chain amounts are base units, safely inside
-  u64 with ~180× headroom). Genesis allocates **20B HKM** to the treasury; the
-  remaining **~80B is mined**: the block reward starts at **5,000 HKM** and halves
-  every **8,000,000 blocks** (~3.8 years at 15s blocks — Bitcoin cadence), flooring
-  at a **50 HKM/block tail emission** (~0.1%/year, decaying as supply grows) so
-  validators always have a security budget beyond fees. Supply reaches ~100B at
-  tail start (~29 years); every reward is consensus-verified per height, so no
-  node can mint outside the schedule.
+  u64 with ~180× headroom). Genesis allocates **30B HKM** to the treasury; the
+  remaining **~70B is mined** (a 30/70 premine/mined split): the block reward starts
+  at **3,700 HKM** and halves every **9,500,000 blocks** (~4.5 years at 15s blocks),
+  so the bulk of emission spans ~18 years, flooring at a **50 HKM/block tail
+  emission** (~0.1%/year, decaying as supply grows) so validators always have a
+  security budget beyond fees. Supply approaches ~100B; every reward is
+  consensus-verified per height, so no node can mint outside the schedule.
+- **Native token standard (HTS) — the ecosystem/DEX foundation.** First-class
+  fungible tokens as consensus objects: `TokenCreate` mints a fixed initial supply
+  to the issuer (symbol, name, up to 18 decimals; deterministic `hkt…` id),
+  `TokenTransfer` moves units, `TokenBurn` reduces supply. Balances and a token
+  registry live in the state root — every node agrees on every token's supply and
+  holders. Token operations pay their fee in HKM (tying ecosystem activity to HKM
+  demand). This is the asset primitive a DEX and dapps build on. Sign offline with
+  `hikma-wallet sign-token-*`; API under `/assets/*`.
+- **Native AMM DEX — on-chain constant-product exchange.** Uniswap-v2-style
+  liquidity pools pairing every native token with **HKM** as the base asset:
+  `AddLiquidity` mints LP shares (`sqrt(hkm·token)`, with a locked
+  `MINIMUM_LIQUIDITY` guarding the first-depositor attack), `Swap` trades along
+  `x·y=k` with a **0.30% fee** that stays in the pool and accrues to LPs, and
+  `RemoveLiquidity` redeems shares for the underlying reserves. All math is
+  consensus-executed with u128 checked arithmetic and per-operation slippage
+  bounds; a read-only `GET /dex/quote/...` returns the exact output so a UI can
+  set `min_out`. Token↔token trades route through HKM. API under `/dex/*`; sign
+  offline with `hikma-wallet sign-amm-*`. This is the exchange layer of the
+  Hikmalayer ecosystem (for HKM and native tokens — not a bridge to external
+  chains).
 - **On-chain vesting (team/investor lockups).** A `Vest` transaction locks tokens
   for a recipient under a **cliff + linear release** schedule enforced by
   consensus: funds sit in a vesting pool, release block-by-block after the cliff,
@@ -88,10 +108,75 @@ signing conventions. It provides:
 - **Minimum validator stake (10,000 HKM).** A stake must reach the floor to join
   the validator set, and a withdrawal must exit fully or stay at/above it —
   preventing trivial-stake spam validators from bloating leader election.
+- **Sovereign finality — hashrate cannot rewrite history.** Fork choice is
+  validator-progress-first: finalized blocks can never be reorged, a competing
+  fork must carry MORE validator-sealed blocks to displace the local chain, and
+  cumulative PoW only breaks exact height ties. Every block of any fork must
+  still be produced by a PoS-selected, stake-bonded, VRF-proven leader, so a
+  stranger with fast mining hardware — however fast — can produce nothing and
+  reorg nothing. PoW in Hikmalayer is a per-block finalization stamp mined by
+  the selected validator itself (difficulty consensus-derived and capped), not
+  an open mining race.
+- **Permissioned-hybrid launch posture (honest and explicit).** Set
+  `GENESIS_VALIDATOR_ALLOWLIST` at genesis to bake a validator allowlist into
+  the genesis state root: only listed addresses can register stakes (existing
+  validators may top up). Combined with the treasury holding the initial supply
+  and the 10,000 HKM floor, the launch network is **permissioned by design and
+  documented as such** — the allowlist is opened later via a scheduled network
+  upgrade when independent validators are worth having. An empty allowlist
+  means permissionless staking.
 - An offline wallet/validator signing CLI (`hikma-wallet`) — private keys never touch
   the node or the network.
 - Persistence to disk (chain only; balances/stakes/nonces are replayed on startup).
-- A React dashboard for local interaction and testing workflows.
+- **Hikmalayer Wallet browser extension (MetaMask-style, recommended).** A real
+  extension wallet in [`extension/`](extension/): the private key lives in the
+  extension's own context, so **a website — or an XSS in a website — cannot read
+  it**. Sites use `window.hikmalayer` to request a connection and request
+  signatures; each one is approved in extension UI the page cannot draw over or
+  click. Per-origin permissions (the origin comes from the browser, not the page),
+  a method allowlist in the isolated relay, a frozen provider that can't be swapped
+  for a phishing lookalike, and the same AES-256-GCM vault + non-extractable
+  session-key protection as the in-page wallet. The dashboard detects and prefers
+  it automatically. Verified in a real browser: the page cannot reach
+  `chrome.storage`, cannot invoke privileged methods, cannot self-approve, and sees
+  no accounts until connected — while an approved signature is accepted on-chain.
+- **The in-page wallet (fallback, encrypted, XSS-hardened).** Create or import
+  a key in the dashboard and sign transactions with one click. The key is generated
+  in the browser, stored **only as AES-256-GCM ciphertext** under a password
+  stretched with PBKDF2-SHA256 (310,000 iterations), and **never sent to the node,
+  never logged, never leaves the device** — only the public key and signature go on
+  the wire. Exporting requires the password again. Signatures are byte-for-byte
+  identical to `hikma-wallet`'s (verified against the Rust implementation,
+  including UTF-8 digest length handling). Defence in depth against a compromised
+  page:
+  - **Strict CSP** — `script-src 'self'` stops injected inline/remote scripts from
+    executing, and `connect-src` pins network access to the node, so a stolen key
+    cannot be exfiltrated. Verified in a real browser against simulated payloads.
+  - **No long-lived key in memory** — while unlocked the key is held encrypted
+    under a **non-extractable** AES-GCM session key, decrypted to a buffer only for
+    the instant of signing (signing runs on raw bytes, so no key *string* is ever
+    created), then zeroized. Auto-locks after 15 minutes idle and on tab close.
+  - **No silent signing** — every signature raises a confirmation showing the exact
+    canonical message; rejection means nothing is signed.
+  - **Anti-spoofing** — token names/symbols come from the chain and are
+    attacker-chosen, so they are stripped of invisible and text-reordering
+    (bidi) characters, length-bounded, and flagged when they imitate HKM.
+
+  **Residual risk, stated plainly:** script running inside the page can still *ask*
+  the in-page wallet to sign (the confirmation makes that visible, not impossible)
+  — which is exactly why the extension above exists and is preferred. For treasury,
+  validator, and other high-value keys, use the offline `hikma-wallet` CLI — see
+  `docs/wallet_security.md`.
+- **A React DEX dashboard.** Swap (live on-chain quotes, slippage → `min_out`,
+  price impact), liquidity provision (pool reserves, spot price, LP position and
+  share percentage), and an asset explorer (token registry, issuance, transfers,
+  your holdings) — alongside the existing mining/certificate/explorer panels.
+  With the wallet unlocked, actions are signed in-browser; otherwise the UI falls
+  back to the **offline-signing flow** (it shows the exact `hikma-wallet` command
+  and the canonical message, and you paste back the public key and signature) —
+  the right choice for cold keys and large amounts. Allowed browser origins are
+  configurable via `CORS_ALLOWED_ORIGINS` (defaults cover the Vite dev and preview
+  servers).
 
 Hikmalayer is developed by Muhammad Ayan Rao, Founder and Director of Bestower Labs Limited.
 
@@ -171,8 +256,17 @@ Hikmalayer Core is developed in phases:
 - **Phase 9**: Signed P2P identity, peer scoring/banning, snapshots/checkpoints, observability.
 - **Phase 10**: Bitcoin-style halving emission + checkpoint fast-sync/pruning (boundary-anchored, self-verifying).
 - **Phase 11**: Liveness-guaranteed leader rotation (slot-timeout fallback), timestamp monotonicity, R-05 signed self-expiring tokens, atomic persistence.
-- **Phase 12**: Mainnet tokenomics — 6 decimals, 100B supply (20B genesis / ~80B mined), halving + 50 HKM tail emission, on-chain vesting, minimum validator stake.
+- **Phase 12**: Mainnet tokenomics — 6 decimals, 100B supply (30B genesis / ~70B mined), halving + 50 HKM tail emission, on-chain vesting, minimum validator stake.
+- **Phase 13**: Sovereign-finality fork choice, genesis validator allowlist (permissioned-hybrid launch), and the native token standard (HTS) — ecosystem/DEX foundation.
+- **Phase 14**: Native AMM DEX — constant-product HKM↔token pools, LP shares, 0.3% swap fee, slippage-bounded swaps.
+- **Phase 15**: DEX front-end (swap / liquidity / asset explorer, offline-signing flow) + configurable CORS.
+- **Phase 16**: Hikmalayer Wallet — in-browser encrypted key vault with one-click signing across the DEX.
+- **Phase 17**: Wallet XSS hardening — CSP, non-extractable session key protection, mandatory signing confirmation, anti-spoofing (`docs/wallet_security.md`).
+- **Phase 18**: Hikmalayer Wallet browser extension (MV3) — keys out of the page entirely, per-origin permissions, extension-side approvals (`extension/`).
 - **Mainnet (pending)**: External audit + adversarial testnet, ops hardening.
+- **Bridge (Brick 3): not pursued.** Hikmalayer will not custody external assets;
+  the DEX trades HKM and Hikmalayer-issued tokens only. Reasoning retained in
+  [`docs/bridge_design.md`](docs/bridge_design.md).
 
 
 ## 🔄 How it works — consensus workflow
@@ -490,8 +584,15 @@ Phase-4 benchmarks demonstrate a stable execution foundation suitable for distri
 | Phase 9 | ✅ Signed P2P identity, peer scoring/banning, allow-list, snapshots/checkpoints, observability |
 | Phase 10 | ✅ Bitcoin-style halving emission + boundary-anchored checkpoint fast-sync/pruning (self-verifying, byte-identical convergence) |
 | Phase 11 | ✅ Slot-timeout leader rotation (offline leader can never stall the chain — live-verified), timestamp monotonicity, R-05 signed tokens, atomic persistence |
-| Phase 12 | ✅ Mainnet tokenomics: 6 decimals, 100B HKM (20B genesis / ~80B mined), halving every 8M blocks + 50 HKM security tail, on-chain cliff+linear vesting (live-verified), 10,000 HKM validator minimum |
+| Phase 12 | ✅ Mainnet tokenomics: 6 decimals, 100B HKM (30B genesis / ~70B mined), halving every 9.5M blocks (~4.5y) + 50 HKM security tail, on-chain cliff+linear vesting (live-verified), 10,000 HKM validator minimum |
+| Phase 13 | ✅ Sovereign-finality fork choice + genesis validator allowlist (permissioned-hybrid launch) + native token standard (HTS: create/transfer/burn, live-verified) — ecosystem/DEX foundation |
+| Phase 14 | ✅ Native AMM DEX: constant-product HKM↔token pools, LP shares (sqrt + MINIMUM_LIQUIDITY lock), 0.3% fee to LPs, slippage-bounded swaps, read-only quotes — live-verified add→swap→remove |
+| Phase 15 | ✅ DEX front-end (swap / liquidity / assets) with offline-signing flow, live quotes and price impact; configurable CORS — verified against a live node and rendered end-to-end |
+| Phase 16 | ✅ Hikmalayer Wallet: in-browser key generation, AES-256-GCM vault (PBKDF2 310k), auto-lock, one-click signing across the DEX — signatures byte-identical to the Rust signer, live-verified transfer/issuance/liquidity/swap, and forgeries rejected |
+| Phase 17 | ✅ Wallet XSS hardening: strict CSP (browser-verified to block script injection + exfiltration), non-extractable session-key protection with byte-only signing and zeroization, mandatory signing confirmation (rejection proven to sign nothing), and anti-spoofing for attacker-chosen token names — residual risk documented in `docs/wallet_security.md` |
+| Phase 18 | ✅ Browser extension wallet (MV3): key held outside the page, `window.hikmalayer` provider, per-origin connect permissions, extension-side approvals, dashboard auto-detects and prefers it — 23 browser checks incl. page cannot reach storage / privileged methods / self-approval, plus an on-chain transfer and DEX issuance signed by the extension |
 | Mainnet | 🚧 External audit + adversarial testnet, ops hardening (see `docs/mainnet_readiness.md`) |
+| Bridge (Brick 3) | ⛔ **Not pursued (decided)** — Hikmalayer does not custody external assets. No wrapped assets exist; the DEX trades HKM and native tokens only. Reasoning in `docs/bridge_design.md` |
 
 
 

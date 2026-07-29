@@ -1,0 +1,17 @@
+{
+  "name": "hikmalayer-wallet-extension",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Hikmalayer Wallet — browser extension. Keys live in the extension, never in the page.",
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.7.0",
+    "@noble/hashes": "^1.6.1"
+  },
+  "devDependencies": {
+    "vite": "^7.0.4"
+  }
+}

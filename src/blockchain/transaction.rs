@@ -12,18 +12,19 @@ use crate::consensus::pos;
 pub const DECIMALS: u32 = 6;
 pub const UNITS_PER_HKM: u64 = 1_000_000;
 
-/// Initial block reward: 5,000 HKM (height 1 through the first halving).
-pub const BLOCK_REWARD: u64 = 5_000 * UNITS_PER_HKM;
+/// Initial block reward: 3,700 HKM (height 1 through the first halving).
+pub const BLOCK_REWARD: u64 = 3_700 * UNITS_PER_HKM;
 
 /// Blocks between reward halvings — a Bitcoin-style deterministic emission
-/// schedule. At the 15s block target, 8,000,000 blocks ≈ 3.8 years per
-/// halving epoch (Bitcoin cadence). Halving-phase emission sums to just
-/// under 80B HKM, which with the 20B HKM genesis allocation gives the
-/// ~100B HKM supply at maturity.
-pub const HALVING_INTERVAL: u64 = 8_000_000;
+/// schedule. At the 15s block target, 9,500,000 blocks ≈ 4.5 years per
+/// halving epoch, so the four largest epochs (the bulk of emission) span
+/// ~18 years. Halving-phase emission sums to ~70B HKM, which with the 30B
+/// HKM genesis allocation gives the ~100B HKM supply at maturity (30/70
+/// premine/mined split).
+pub const HALVING_INTERVAL: u64 = 9_500_000;
 
 /// Tail emission floor: 50 HKM per block. Once halvings would push the
-/// reward below this floor (epoch 8, ~29 years in), the reward stays here
+/// reward below this floor (epoch 8, ~32 years in), the reward stays here
 /// forever — a perpetual security budget (~0.1%/year of the 100B supply,
 /// a rate that decays as supply grows) so validators are never left with
 /// fees alone. Monero-style: supply is asymptotically capped in *rate*,
@@ -50,18 +51,92 @@ pub fn block_reward(height: u64) -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TransactionType {
-    Transfer,    // Transfer tokens
-    Reward,      // Block production reward
-    Certificate, // Anchor a certificate issuance
-    Stake,       // Register / increase validator stake (on-chain)
-    Withdraw,    // Reduce / exit validator stake (on-chain)
-    Slash,       // Punish a proven equivocation (on-chain)
-    Vest,        // Lock tokens for a recipient on a cliff + linear schedule
+    Transfer,     // Transfer tokens
+    Reward,       // Block production reward
+    Certificate,  // Anchor a certificate issuance
+    Stake,        // Register / increase validator stake (on-chain)
+    Withdraw,     // Reduce / exit validator stake (on-chain)
+    Slash,        // Punish a proven equivocation (on-chain)
+    Vest,         // Lock tokens for a recipient on a cliff + linear schedule
+    TokenCreate,  // Issue a new native fungible token (ecosystem asset)
+    TokenTransfer, // Move units of a native token between accounts
+    TokenBurn,    // Destroy units of a native token from the sender
+    AddLiquidity, // Deposit HKM + a token into an AMM pool for LP shares
+    RemoveLiquidity, // Burn LP shares, withdraw the underlying HKM + token
+    Swap,         // Swap HKM<->token against an AMM pool (constant product)
 }
 
 /// Upper bound on a vesting schedule's duration (~47 years at 15s blocks).
 /// Bounds per-entry arithmetic and prevents nonsense schedules.
 pub const MAX_VESTING_DURATION_BLOCKS: u64 = 100_000_000;
+
+/// Native token (HTS — Hikmalayer Token Standard) limits. Symbols and names
+/// are bounded so state stays compact; decimals cap mirrors ERC-20/EVM norms
+/// so ecosystem tooling and a future DEX can display any token safely.
+pub const MAX_TOKEN_SYMBOL_LEN: usize = 12;
+pub const MAX_TOKEN_NAME_LEN: usize = 64;
+pub const MAX_TOKEN_DECIMALS: u32 = 18;
+
+/// Extra fields carried by the native-token transaction types. Which fields
+/// are meaningful depends on the transaction type (mirrors how the amount
+/// and recipient are reused across Stake/Withdraw): Create uses
+/// symbol/name/decimals (+ tx.amount = initial supply); Transfer uses
+/// token_id (+ tx.to = recipient, tx.amount = units); Burn uses token_id
+/// (+ tx.amount = units).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TokenAction {
+    #[serde(default)]
+    pub token_id: String,
+    #[serde(default)]
+    pub symbol: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub decimals: u32,
+}
+
+/// Deterministic token id: "hkt" + hex(SHA-256(creator:symbol:nonce)[..20]).
+/// (creator, nonce) is globally unique because nonces are strictly
+/// increasing per account, so no two Create transactions can collide.
+pub fn derive_token_id(creator: &str, symbol: &str, nonce: u64) -> String {
+    use sha2::{Digest, Sha256};
+    let seed = format!("{}:{}:{}", creator, symbol, nonce);
+    let digest = Sha256::digest(seed.as_bytes());
+    format!("hkt{}", hex::encode(&digest[..20]))
+}
+
+/// AMM swap fee in basis points (0.30%), kept in the pool reserves and thus
+/// accruing to liquidity providers — the same fee level as Uniswap v2.
+pub const SWAP_FEE_BPS: u64 = 30;
+pub const AMM_FEE_DENOM: u64 = 10_000;
+
+/// Parameters for the AMM transaction types. Which fields matter depends on
+/// the transaction type (mirrors TokenAction): AddLiquidity uses
+/// amount_hkm/amount_token/min_shares; RemoveLiquidity uses
+/// shares/min_hkm/min_token; Swap uses amount_in/hkm_to_token/min_out. Every
+/// pool pairs an HTS token with HKM, so `token_id` identifies the pool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AmmAction {
+    pub token_id: String,
+    #[serde(default)]
+    pub amount_hkm: u64,
+    #[serde(default)]
+    pub amount_token: u64,
+    #[serde(default)]
+    pub shares: u64,
+    #[serde(default)]
+    pub amount_in: u64,
+    #[serde(default)]
+    pub hkm_to_token: bool,
+    #[serde(default)]
+    pub min_shares: u64,
+    #[serde(default)]
+    pub min_hkm: u64,
+    #[serde(default)]
+    pub min_token: u64,
+    #[serde(default)]
+    pub min_out: u64,
+}
 
 /// Proof that one validator signed two different blocks at the same height.
 /// Both blocks are self-contained: their hashes are recomputable from the
@@ -160,6 +235,12 @@ pub struct Transaction {
     pub vesting_cliff_blocks: Option<u64>,
     #[serde(default)]
     pub vesting_duration_blocks: Option<u64>,
+    /// Native-token action (TokenCreate / TokenTransfer / TokenBurn only).
+    #[serde(default)]
+    pub token: Option<TokenAction>,
+    /// AMM action (AddLiquidity / RemoveLiquidity / Swap only).
+    #[serde(default)]
+    pub amm: Option<AmmAction>,
 }
 
 /// Issue or revoke an on-chain verifiable credential. Only the hash of the
@@ -195,6 +276,8 @@ impl Transaction {
             credential: None,
             vesting_cliff_blocks: None,
             vesting_duration_blocks: None,
+            token: None,
+            amm: None,
         }
     }
 
@@ -239,6 +322,81 @@ impl Transaction {
     /// Canonical message a validator signs to authorize a stake withdrawal.
     pub fn withdraw_signing_message(address: &str, amount: u64, nonce: u64) -> String {
         format!("hikmalayer-withdraw:{}:{}:{}", address, amount, nonce)
+    }
+
+    /// Canonical message a creator signs to issue a new native token.
+    /// Binds every immutable parameter and the initial supply.
+    pub fn token_create_signing_message(
+        symbol: &str,
+        name: &str,
+        decimals: u32,
+        initial_supply: u64,
+        nonce: u64,
+    ) -> String {
+        format!(
+            "hikmalayer-token-create:{}:{}:{}:{}:{}",
+            symbol, name, decimals, initial_supply, nonce
+        )
+    }
+
+    /// Canonical message a holder signs to transfer native-token units.
+    pub fn token_transfer_signing_message(
+        token_id: &str,
+        to: &str,
+        amount: u64,
+        nonce: u64,
+    ) -> String {
+        format!(
+            "hikmalayer-token-transfer:{}:{}:{}:{}",
+            token_id, to, amount, nonce
+        )
+    }
+
+    /// Canonical message a holder signs to burn native-token units.
+    pub fn token_burn_signing_message(token_id: &str, amount: u64, nonce: u64) -> String {
+        format!("hikmalayer-token-burn:{}:{}:{}", token_id, amount, nonce)
+    }
+
+    /// Canonical message signed to add liquidity to a pool.
+    pub fn amm_add_signing_message(
+        token_id: &str,
+        amount_hkm: u64,
+        amount_token: u64,
+        min_shares: u64,
+        nonce: u64,
+    ) -> String {
+        format!(
+            "hikmalayer-amm-add:{}:{}:{}:{}:{}",
+            token_id, amount_hkm, amount_token, min_shares, nonce
+        )
+    }
+
+    /// Canonical message signed to remove liquidity from a pool.
+    pub fn amm_remove_signing_message(
+        token_id: &str,
+        shares: u64,
+        min_hkm: u64,
+        min_token: u64,
+        nonce: u64,
+    ) -> String {
+        format!(
+            "hikmalayer-amm-remove:{}:{}:{}:{}:{}",
+            token_id, shares, min_hkm, min_token, nonce
+        )
+    }
+
+    /// Canonical message signed to swap against a pool.
+    pub fn amm_swap_signing_message(
+        token_id: &str,
+        hkm_to_token: bool,
+        amount_in: u64,
+        min_out: u64,
+        nonce: u64,
+    ) -> String {
+        format!(
+            "hikmalayer-amm-swap:{}:{}:{}:{}:{}",
+            token_id, hkm_to_token, amount_in, min_out, nonce
+        )
     }
 
     /// Canonical message a sender signs to lock tokens into a vesting
@@ -383,6 +541,163 @@ impl Transaction {
                 }
                 Ok(())
             }
+            TransactionType::TokenCreate => {
+                let from = self
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "TokenCreate missing creator".to_string())?;
+                let action = self
+                    .token
+                    .as_ref()
+                    .ok_or_else(|| "TokenCreate missing token action".to_string())?;
+                let symbol = action.symbol.trim();
+                if symbol.is_empty() || symbol.len() > MAX_TOKEN_SYMBOL_LEN {
+                    return Err(format!(
+                        "Token symbol must be 1..={} characters",
+                        MAX_TOKEN_SYMBOL_LEN
+                    ));
+                }
+                if action.name.len() > MAX_TOKEN_NAME_LEN {
+                    return Err(format!(
+                        "Token name must be at most {} characters",
+                        MAX_TOKEN_NAME_LEN
+                    ));
+                }
+                if action.decimals > MAX_TOKEN_DECIMALS {
+                    return Err(format!(
+                        "Token decimals must be at most {}",
+                        MAX_TOKEN_DECIMALS
+                    ));
+                }
+                if self.amount == 0 {
+                    return Err("Token initial supply must be greater than zero".to_string());
+                }
+                let message = Self::token_create_signing_message(
+                    &action.symbol,
+                    &action.name,
+                    action.decimals,
+                    self.amount,
+                    self.nonce,
+                );
+                self.verify_sender_signature(from, &message)
+            }
+            TransactionType::TokenTransfer => {
+                let from = self
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "TokenTransfer missing sender".to_string())?;
+                let action = self
+                    .token
+                    .as_ref()
+                    .ok_or_else(|| "TokenTransfer missing token action".to_string())?;
+                if action.token_id.trim().is_empty() {
+                    return Err("TokenTransfer missing token id".to_string());
+                }
+                if self.to.trim().is_empty() {
+                    return Err("TokenTransfer missing recipient".to_string());
+                }
+                if self.amount == 0 {
+                    return Err("TokenTransfer amount must be greater than zero".to_string());
+                }
+                let message = Self::token_transfer_signing_message(
+                    &action.token_id,
+                    &self.to,
+                    self.amount,
+                    self.nonce,
+                );
+                self.verify_sender_signature(from, &message)
+            }
+            TransactionType::TokenBurn => {
+                let from = self
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "TokenBurn missing sender".to_string())?;
+                let action = self
+                    .token
+                    .as_ref()
+                    .ok_or_else(|| "TokenBurn missing token action".to_string())?;
+                if action.token_id.trim().is_empty() {
+                    return Err("TokenBurn missing token id".to_string());
+                }
+                if self.amount == 0 {
+                    return Err("TokenBurn amount must be greater than zero".to_string());
+                }
+                let message =
+                    Self::token_burn_signing_message(&action.token_id, self.amount, self.nonce);
+                self.verify_sender_signature(from, &message)
+            }
+            TransactionType::AddLiquidity => {
+                let from = self
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "AddLiquidity missing sender".to_string())?;
+                let action = self
+                    .amm
+                    .as_ref()
+                    .ok_or_else(|| "AddLiquidity missing amm action".to_string())?;
+                if action.token_id.trim().is_empty() {
+                    return Err("AddLiquidity missing token id".to_string());
+                }
+                if action.amount_hkm == 0 || action.amount_token == 0 {
+                    return Err("AddLiquidity requires non-zero HKM and token amounts".to_string());
+                }
+                let message = Self::amm_add_signing_message(
+                    &action.token_id,
+                    action.amount_hkm,
+                    action.amount_token,
+                    action.min_shares,
+                    self.nonce,
+                );
+                self.verify_sender_signature(from, &message)
+            }
+            TransactionType::RemoveLiquidity => {
+                let from = self
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "RemoveLiquidity missing sender".to_string())?;
+                let action = self
+                    .amm
+                    .as_ref()
+                    .ok_or_else(|| "RemoveLiquidity missing amm action".to_string())?;
+                if action.token_id.trim().is_empty() {
+                    return Err("RemoveLiquidity missing token id".to_string());
+                }
+                if action.shares == 0 {
+                    return Err("RemoveLiquidity requires a non-zero share amount".to_string());
+                }
+                let message = Self::amm_remove_signing_message(
+                    &action.token_id,
+                    action.shares,
+                    action.min_hkm,
+                    action.min_token,
+                    self.nonce,
+                );
+                self.verify_sender_signature(from, &message)
+            }
+            TransactionType::Swap => {
+                let from = self
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "Swap missing sender".to_string())?;
+                let action = self
+                    .amm
+                    .as_ref()
+                    .ok_or_else(|| "Swap missing amm action".to_string())?;
+                if action.token_id.trim().is_empty() {
+                    return Err("Swap missing token id".to_string());
+                }
+                if action.amount_in == 0 {
+                    return Err("Swap requires a non-zero input amount".to_string());
+                }
+                let message = Self::amm_swap_signing_message(
+                    &action.token_id,
+                    action.hkm_to_token,
+                    action.amount_in,
+                    action.min_out,
+                    self.nonce,
+                );
+                self.verify_sender_signature(from, &message)
+            }
         }
     }
 
@@ -452,7 +767,7 @@ mod tests {
         assert_eq!(block_reward(2 * HALVING_INTERVAL + 1), BLOCK_REWARD / 4);
 
         // The halvings floor at the tail emission and stay there forever —
-        // the perpetual security budget. 5,000 >> 7 = 39 HKM < 50 HKM, so
+        // the perpetual security budget. 3,700 >> 7 = 28 HKM < 50 HKM, so
         // epoch 8 (halvings = 7) is the first tail epoch.
         assert!(BLOCK_REWARD >> 7 < TAIL_EMISSION);
         assert!(BLOCK_REWARD >> 6 > TAIL_EMISSION);
@@ -460,15 +775,16 @@ mod tests {
         assert_eq!(block_reward(100 * HALVING_INTERVAL + 1), TAIL_EMISSION);
         assert_eq!(block_reward(u64::MAX), TAIL_EMISSION);
 
-        // Halving-phase emission + genesis lands just under the 100B cap:
-        // sum over epochs of interval * reward, in whole HKM.
+        // Halving-phase emission + the 30B genesis allocation lands just
+        // under the 100B cap (30/70 premine/mined): sum over epochs of
+        // interval * reward, in whole HKM.
         let mut mined_hkm: u128 = 0;
         for epoch in 0..7u32 {
             let reward = (BLOCK_REWARD >> epoch).max(TAIL_EMISSION);
             mined_hkm += (HALVING_INTERVAL as u128) * (reward as u128)
                 / (UNITS_PER_HKM as u128);
         }
-        let genesis_hkm: u128 = 20_000_000_000;
+        let genesis_hkm: u128 = 30_000_000_000;
         let total = genesis_hkm + mined_hkm;
         assert!(total > 99_000_000_000, "total at tail start: {total}");
         assert!(total <= 100_000_000_000, "total at tail start: {total}");

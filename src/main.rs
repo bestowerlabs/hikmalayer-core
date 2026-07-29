@@ -64,13 +64,35 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
         .ok()
         .filter(|v| !v.is_empty());
 
+    // Launch posture: an optional comma-separated validator allowlist,
+    // baked into the genesis state root. When set, only listed addresses
+    // can register as validators — the honest "permissioned hybrid at
+    // launch" configuration, opened later via a scheduled upgrade.
+    let allowlist: Vec<String> = std::env::var("GENESIS_VALIDATOR_ALLOWLIST")
+        .unwrap_or_default()
+        .split(',')
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    if !allowlist.is_empty() {
+        println!(
+            "🔒 Validator registration is allowlist-gated at genesis ({} addresses).",
+            allowlist.len()
+        );
+    }
+
     match (
         std::env::var("GENESIS_TREASURY_ADDRESS").ok().filter(|v| !v.is_empty()),
         std::env::var("GENESIS_VALIDATOR_PUBLIC_KEY").ok().filter(|v| !v.is_empty()),
     ) {
-        (Some(treasury), validator_key) => {
-            Blockchain::new_with_genesis(difficulty, treasury, validator_key, vrf_key, supply)
-        }
+        (Some(treasury), validator_key) => Blockchain::new_with_genesis(
+            difficulty,
+            treasury,
+            validator_key,
+            vrf_key,
+            supply,
+            allowlist,
+        ),
         (None, Some(validator_key)) => {
             let treasury = pos::derive_address(&validator_key).unwrap_or_default();
             Blockchain::new_with_genesis(
@@ -79,6 +101,7 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
                 Some(validator_key),
                 vrf_key,
                 supply,
+                allowlist,
             )
         }
         (None, None) => {
@@ -86,7 +109,9 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
                 "⚠️  GENESIS_TREASURY_ADDRESS not set: using the well-known DEV genesis. \
                  Configure real genesis parameters for any shared network."
             );
-            Blockchain::new(difficulty)
+            // The allowlist is honored on EVERY genesis path — a configured
+            // allowlist silently dropped here would launch permissionless.
+            Blockchain::new_dev_with_allowlist(difficulty, allowlist)
         }
     }
 }
@@ -303,13 +328,51 @@ async fn main() {
         treasury_key,
     };
 
-    // Configure CORS to allow React app on localhost:5173
+    // Browser origins allowed to call this node. Defaults cover the Vite dev
+    // server (5173) and the production-preview server (4173) on both
+    // loopback spellings; set CORS_ALLOWED_ORIGINS (comma-separated) to serve
+    // a deployed dashboard from anywhere else. Kept as an explicit allowlist
+    // — never a wildcard — so a hostile page cannot drive a node from a
+    // user's browser.
+    let cors_origins: Vec<axum::http::HeaderValue> =
+        std::env::var("CORS_ALLOWED_ORIGINS")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|origin| origin.trim().to_string())
+                    .filter(|origin| !origin.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    "http://localhost:5173".to_string(),
+                    "http://127.0.0.1:5173".to_string(),
+                    "http://localhost:4173".to_string(),
+                    "http://127.0.0.1:4173".to_string(),
+                ]
+            })
+            .into_iter()
+            .filter_map(|origin| match origin.parse::<axum::http::HeaderValue>() {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    eprintln!("⚠️  Ignoring malformed CORS origin: {}", origin);
+                    None
+                }
+            })
+            .collect();
+    println!(
+        "🌐 CORS origins allowed: {}",
+        cors_origins
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
     let cors = CorsLayer::new()
-        .allow_origin(
-            "http://localhost:5173"
-                .parse::<axum::http::HeaderValue>()
-                .unwrap(),
-        )
+        .allow_origin(cors_origins)
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -334,7 +397,6 @@ async fn main() {
         .unwrap_or(3000);
 
     println!("🚀 Hikmalayer REST API running on http://127.0.0.1:{}", port);
-    println!("🌐 CORS enabled for React app on http://localhost:5173");
     println!("📋 Available endpoints:");
     println!("  🔐 AUTHENTICATION:");
     println!("      🎫 POST /auth/nonce");

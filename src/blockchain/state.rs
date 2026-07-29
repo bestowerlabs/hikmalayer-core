@@ -20,6 +20,31 @@ pub const STAKING_POOL_ACCOUNT: &str = "__staking_pool__";
 /// Internal account holding all unvested (locked) funds.
 pub const VESTING_POOL_ACCOUNT: &str = "__vesting_pool__";
 
+/// Internal account custodying all AMM pool reserves (HKM and tokens). The
+/// per-pool split lives in `ChainState::pools`; this account holds the
+/// aggregate so HKM/token supply stays conserved.
+pub const AMM_POOL_ACCOUNT: &str = "__amm_pool__";
+
+/// LP shares permanently locked on first liquidity provision, preventing the
+/// first-depositor share-inflation attack (Uniswap-v2's MINIMUM_LIQUIDITY).
+pub const MINIMUM_LIQUIDITY: u64 = 1_000;
+
+/// Integer square root (floor) for u128 — used to size initial LP shares as
+/// sqrt(hkm * token), keeping the first provider's shares independent of the
+/// pool's price.
+fn isqrt_u128(n: u128) -> u128 {
+    if n < 2 {
+        return n;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
+}
+
 /// Consensus constant: percentage of stake burned for a proven equivocation.
 pub const SLASH_PERCENT: u64 = 10;
 
@@ -125,6 +150,32 @@ pub struct StakeInfo {
     pub vrf_public_key: String,
 }
 
+/// A native fungible token (HTS — Hikmalayer Token Standard): the ecosystem
+/// asset primitive a DEX and dapps build on. Supply is fixed at creation
+/// (only reducible by burning), so no issuer can silently inflate a token.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TokenInfo {
+    pub token_id: String,
+    pub symbol: String,
+    pub name: String,
+    pub decimals: u32,
+    pub total_supply: u64,
+    pub creator: String,
+    pub created_at_height: u64,
+}
+
+/// A constant-product AMM liquidity pool pairing a native token with HKM.
+/// `reserve_hkm * reserve_token` is the invariant a swap preserves (net of
+/// the fee, which stays in the reserves and accrues to LPs). `total_shares`
+/// includes the permanently-locked MINIMUM_LIQUIDITY minted on creation.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct Pool {
+    pub token_id: String,
+    pub reserve_hkm: u64,
+    pub reserve_token: u64,
+    pub total_shares: u64,
+}
+
 /// An on-chain verifiable credential: the issuer anchors a hash of the
 /// credential document (the document itself stays private/off-chain) bound
 /// to a subject. Revocation is a first-class on-chain operation by the
@@ -157,6 +208,27 @@ pub struct ChainState {
     /// Tokens vesting toward each recipient (team/investor lockups).
     #[serde(default)]
     pub vesting: BTreeMap<String, Vec<VestingEntry>>,
+    /// Native token registry (HTS): token_id → immutable token metadata.
+    #[serde(default)]
+    pub tokens: BTreeMap<String, TokenInfo>,
+    /// Native token balances: token_id → (holder address → units). Nested
+    /// BTreeMaps keep the state-root serialization canonical.
+    #[serde(default)]
+    pub token_balances: BTreeMap<String, BTreeMap<String, u64>>,
+    /// AMM liquidity pools, keyed by the token they pair with HKM.
+    #[serde(default)]
+    pub pools: BTreeMap<String, Pool>,
+    /// LP share balances: token_id → (provider address → shares).
+    #[serde(default)]
+    pub lp_shares: BTreeMap<String, BTreeMap<String, u64>>,
+    /// Genesis-configured validator allowlist. When NON-EMPTY, only listed
+    /// addresses may register a NEW stake (existing validators may top up);
+    /// empty means permissionless staking. Set once at genesis and part of
+    /// the state root, so every node enforces the identical policy — this
+    /// is the honest "permissioned hybrid at launch" lever, opened later
+    /// via a scheduled network upgrade.
+    #[serde(default)]
+    pub validator_allowlist: std::collections::BTreeSet<String>,
     /// Fees collected within the current block; paid to the validator and
     /// zeroed by `end_block`, so it is always 0 at block boundaries.
     #[serde(default)]
@@ -182,10 +254,12 @@ impl ChainState {
         treasury_public_key: Option<&str>,
         treasury_vrf_public_key: Option<&str>,
         initial_supply: u64,
+        validator_allowlist: &[String],
     ) -> Self {
         let mut state = ChainState {
             total_supply: initial_supply,
             base_fee: TX_FEE,
+            validator_allowlist: validator_allowlist.iter().cloned().collect(),
             ..Default::default()
         };
         state
@@ -226,6 +300,53 @@ impl ChainState {
 
     pub fn nonce_of(&self, account: &str) -> u64 {
         self.nonces.get(account).copied().unwrap_or(0)
+    }
+
+    /// Native-token balance of `account` for `token_id`.
+    pub fn token_balance_of(&self, token_id: &str, account: &str) -> u64 {
+        self.token_balances
+            .get(token_id)
+            .and_then(|holders| holders.get(account))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn credit_token(&mut self, token_id: &str, account: &str, amount: u64) {
+        *self
+            .token_balances
+            .entry(token_id.to_string())
+            .or_default()
+            .entry(account.to_string())
+            .or_insert(0) += amount;
+    }
+
+    /// LP shares held by `account` in the pool for `token_id`.
+    pub fn lp_shares_of(&self, token_id: &str, account: &str) -> u64 {
+        self.lp_shares
+            .get(token_id)
+            .and_then(|holders| holders.get(account))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn debit_token(&mut self, token_id: &str, account: &str, amount: u64) -> Result<(), String> {
+        let balance = self.token_balance_of(token_id, account);
+        if balance < amount {
+            return Err(format!(
+                "Insufficient token balance for {} in {}: has {}, needs {}",
+                account, token_id, balance, amount
+            ));
+        }
+        let holders = self
+            .token_balances
+            .get_mut(token_id)
+            .ok_or_else(|| format!("Unknown token {}", token_id))?;
+        let entry = holders.get_mut(account).unwrap();
+        *entry -= amount;
+        if *entry == 0 {
+            holders.remove(account);
+        }
+        Ok(())
     }
 
     /// Total stake currently unbonding for an account.
@@ -308,6 +429,19 @@ impl ChainState {
                     .vrf_public_key
                     .as_ref()
                     .ok_or_else(|| "Stake missing VRF public key".to_string())?;
+                // Launch posture: when an allowlist is configured, only
+                // listed addresses may JOIN the validator set (existing
+                // validators may add stake). Checked before any mutation.
+                if !self.validator_allowlist.is_empty()
+                    && !self.stakers.contains_key(from)
+                    && !self.validator_allowlist.contains(from)
+                {
+                    return Err(format!(
+                        "Validator registration is allowlist-gated at this network's genesis; \
+                         {} is not on the allowlist",
+                        from
+                    ));
+                }
                 // Validator floor: the resulting total stake must meet the
                 // minimum (checked before any state mutation).
                 let current = self.stakers.get(from).map(|i| i.stake).unwrap_or(0);
@@ -419,6 +553,293 @@ impl ChainState {
             TransactionType::Reward => {
                 self.credit(&tx.to, tx.amount);
                 self.total_supply += tx.amount;
+                Ok(())
+            }
+            TransactionType::TokenCreate => {
+                let from = tx
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "TokenCreate missing creator".to_string())?;
+                let action = tx
+                    .token
+                    .as_ref()
+                    .ok_or_else(|| "TokenCreate missing token action".to_string())?;
+                let token_id =
+                    crate::blockchain::transaction::derive_token_id(from, &action.symbol, tx.nonce);
+                if self.tokens.contains_key(&token_id) {
+                    return Err(format!("Token {} already exists", token_id));
+                }
+                // Fee is charged in HKM (ties token issuance to HKM demand
+                // and gates spam); the token's own supply is separate.
+                self.consume_nonce(from, tx.nonce)?;
+                let fee = self.base_fee;
+                self.debit(from, fee)?;
+                self.fee_pot += fee;
+
+                self.tokens.insert(
+                    token_id.clone(),
+                    TokenInfo {
+                        token_id: token_id.clone(),
+                        symbol: action.symbol.clone(),
+                        name: action.name.clone(),
+                        decimals: action.decimals,
+                        total_supply: tx.amount,
+                        creator: from.clone(),
+                        created_at_height: height,
+                    },
+                );
+                self.credit_token(&token_id, from, tx.amount);
+                Ok(())
+            }
+            TransactionType::TokenTransfer => {
+                let from = tx
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "TokenTransfer missing sender".to_string())?;
+                let action = tx
+                    .token
+                    .as_ref()
+                    .ok_or_else(|| "TokenTransfer missing token action".to_string())?;
+                if !self.tokens.contains_key(&action.token_id) {
+                    return Err(format!("Unknown token {}", action.token_id));
+                }
+                self.consume_nonce(from, tx.nonce)?;
+                let fee = self.base_fee;
+                self.debit(from, fee)?; // HKM fee
+                self.fee_pot += fee;
+                self.debit_token(&action.token_id, from, tx.amount)?;
+                self.credit_token(&action.token_id, &tx.to, tx.amount);
+                Ok(())
+            }
+            TransactionType::TokenBurn => {
+                let from = tx
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "TokenBurn missing sender".to_string())?;
+                let action = tx
+                    .token
+                    .as_ref()
+                    .ok_or_else(|| "TokenBurn missing token action".to_string())?;
+                if !self.tokens.contains_key(&action.token_id) {
+                    return Err(format!("Unknown token {}", action.token_id));
+                }
+                self.consume_nonce(from, tx.nonce)?;
+                let fee = self.base_fee;
+                self.debit(from, fee)?; // HKM fee
+                self.fee_pot += fee;
+                self.debit_token(&action.token_id, from, tx.amount)?;
+                // Reduce the token's recorded supply to match.
+                if let Some(info) = self.tokens.get_mut(&action.token_id) {
+                    info.total_supply = info.total_supply.saturating_sub(tx.amount);
+                }
+                Ok(())
+            }
+            TransactionType::AddLiquidity => {
+                let from = tx
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "AddLiquidity missing sender".to_string())?;
+                let action = tx
+                    .amm
+                    .as_ref()
+                    .ok_or_else(|| "AddLiquidity missing amm action".to_string())?;
+                if !self.tokens.contains_key(&action.token_id) {
+                    return Err(format!("Unknown token {}", action.token_id));
+                }
+                let existing = self.pools.get(&action.token_id).cloned().unwrap_or_default();
+
+                // Determine the amounts actually used and the shares minted.
+                let (use_hkm, use_token, minted, first) = if existing.total_shares == 0 {
+                    // First provider sets the price and mints sqrt(hkm*token).
+                    let product =
+                        (action.amount_hkm as u128).saturating_mul(action.amount_token as u128);
+                    let shares0 = isqrt_u128(product);
+                    if shares0 <= MINIMUM_LIQUIDITY as u128 {
+                        return Err("Initial liquidity is below the minimum".to_string());
+                    }
+                    let minted = (shares0 - MINIMUM_LIQUIDITY as u128) as u64;
+                    (action.amount_hkm, action.amount_token, minted, true)
+                } else {
+                    // Preserve the pool ratio; use whichever side binds.
+                    let rh = existing.reserve_hkm as u128;
+                    let rt = existing.reserve_token as u128;
+                    let token_optimal =
+                        ((action.amount_hkm as u128) * rt / rh) as u64;
+                    let (use_hkm, use_token) = if token_optimal <= action.amount_token {
+                        (action.amount_hkm, token_optimal)
+                    } else {
+                        let hkm_optimal = ((action.amount_token as u128) * rh / rt) as u64;
+                        (hkm_optimal, action.amount_token)
+                    };
+                    if use_hkm == 0 || use_token == 0 {
+                        return Err("AddLiquidity amounts round to zero".to_string());
+                    }
+                    let ts = existing.total_shares as u128;
+                    let shares_hkm = (use_hkm as u128) * ts / rh;
+                    let shares_token = (use_token as u128) * ts / rt;
+                    (use_hkm, use_token, shares_hkm.min(shares_token) as u64, false)
+                };
+
+                if minted == 0 || minted < action.min_shares {
+                    return Err(format!(
+                        "AddLiquidity slippage: {} shares minted, {} required",
+                        minted, action.min_shares
+                    ));
+                }
+
+                self.consume_nonce(from, tx.nonce)?;
+                let fee = self.base_fee;
+                self.debit(from, use_hkm + fee)?;
+                self.fee_pot += fee;
+                self.credit(AMM_POOL_ACCOUNT, use_hkm);
+                self.debit_token(&action.token_id, from, use_token)?;
+                self.credit_token(&action.token_id, AMM_POOL_ACCOUNT, use_token);
+
+                let pool = self.pools.entry(action.token_id.clone()).or_insert(Pool {
+                    token_id: action.token_id.clone(),
+                    ..Default::default()
+                });
+                pool.reserve_hkm += use_hkm;
+                pool.reserve_token += use_token;
+                pool.total_shares += if first {
+                    minted + MINIMUM_LIQUIDITY
+                } else {
+                    minted
+                };
+                *self
+                    .lp_shares
+                    .entry(action.token_id.clone())
+                    .or_default()
+                    .entry(from.clone())
+                    .or_insert(0) += minted;
+                Ok(())
+            }
+            TransactionType::RemoveLiquidity => {
+                let from = tx
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "RemoveLiquidity missing sender".to_string())?;
+                let action = tx
+                    .amm
+                    .as_ref()
+                    .ok_or_else(|| "RemoveLiquidity missing amm action".to_string())?;
+                let pool = self
+                    .pools
+                    .get(&action.token_id)
+                    .cloned()
+                    .ok_or_else(|| format!("No pool for {}", action.token_id))?;
+                let held = self.lp_shares_of(&action.token_id, from);
+                if held < action.shares {
+                    return Err(format!(
+                        "Insufficient LP shares: has {}, needs {}",
+                        held, action.shares
+                    ));
+                }
+                let ts = pool.total_shares as u128;
+                let amount_hkm = ((action.shares as u128) * pool.reserve_hkm as u128 / ts) as u64;
+                let amount_token =
+                    ((action.shares as u128) * pool.reserve_token as u128 / ts) as u64;
+                if amount_hkm == 0 || amount_token == 0 {
+                    return Err("RemoveLiquidity amounts round to zero".to_string());
+                }
+                if amount_hkm < action.min_hkm || amount_token < action.min_token {
+                    return Err("RemoveLiquidity slippage bound not met".to_string());
+                }
+
+                self.consume_nonce(from, tx.nonce)?;
+                let fee = self.base_fee;
+                self.debit(from, fee)?; // fee from liquid HKM
+                self.fee_pot += fee;
+
+                // Burn shares, return the underlying assets.
+                let holders = self.lp_shares.get_mut(&action.token_id).unwrap();
+                let entry = holders.get_mut(from).unwrap();
+                *entry -= action.shares;
+                if *entry == 0 {
+                    holders.remove(from);
+                }
+                self.debit(AMM_POOL_ACCOUNT, amount_hkm)?;
+                self.credit(from, amount_hkm);
+                self.debit_token(&action.token_id, AMM_POOL_ACCOUNT, amount_token)?;
+                self.credit_token(&action.token_id, from, amount_token);
+
+                let pool = self.pools.get_mut(&action.token_id).unwrap();
+                pool.reserve_hkm -= amount_hkm;
+                pool.reserve_token -= amount_token;
+                pool.total_shares -= action.shares;
+                Ok(())
+            }
+            TransactionType::Swap => {
+                let from = tx
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| "Swap missing sender".to_string())?;
+                let action = tx
+                    .amm
+                    .as_ref()
+                    .ok_or_else(|| "Swap missing amm action".to_string())?;
+                let pool = self
+                    .pools
+                    .get(&action.token_id)
+                    .cloned()
+                    .ok_or_else(|| format!("No pool for {}", action.token_id))?;
+                if pool.reserve_hkm == 0 || pool.reserve_token == 0 {
+                    return Err("Pool has no liquidity".to_string());
+                }
+                let (reserve_in, reserve_out) = if action.hkm_to_token {
+                    (pool.reserve_hkm, pool.reserve_token)
+                } else {
+                    (pool.reserve_token, pool.reserve_hkm)
+                };
+                // Constant-product with a 0.3% fee kept in the pool. u128
+                // intermediates, checked so a pathologically large swap is
+                // rejected rather than overflowing.
+                let fee_num = crate::blockchain::transaction::AMM_FEE_DENOM
+                    - crate::blockchain::transaction::SWAP_FEE_BPS;
+                let amount_in_with_fee = (action.amount_in as u128)
+                    .checked_mul(fee_num as u128)
+                    .ok_or_else(|| "Swap amount too large".to_string())?;
+                let numerator = amount_in_with_fee
+                    .checked_mul(reserve_out as u128)
+                    .ok_or_else(|| "Swap amount too large".to_string())?;
+                let denominator = (reserve_in as u128)
+                    .checked_mul(crate::blockchain::transaction::AMM_FEE_DENOM as u128)
+                    .ok_or_else(|| "Pool reserve too large".to_string())?
+                    + amount_in_with_fee;
+                let amount_out = (numerator / denominator) as u64;
+                if amount_out == 0 || amount_out >= reserve_out {
+                    return Err("Swap produces no output or drains the pool".to_string());
+                }
+                if amount_out < action.min_out {
+                    return Err(format!(
+                        "Swap slippage: {} out, {} required",
+                        amount_out, action.min_out
+                    ));
+                }
+
+                self.consume_nonce(from, tx.nonce)?;
+                let fee = self.base_fee;
+
+                if action.hkm_to_token {
+                    self.debit(from, action.amount_in + fee)?;
+                    self.fee_pot += fee;
+                    self.credit(AMM_POOL_ACCOUNT, action.amount_in);
+                    self.debit_token(&action.token_id, AMM_POOL_ACCOUNT, amount_out)?;
+                    self.credit_token(&action.token_id, from, amount_out);
+                    let pool = self.pools.get_mut(&action.token_id).unwrap();
+                    pool.reserve_hkm += action.amount_in;
+                    pool.reserve_token -= amount_out;
+                } else {
+                    self.debit(from, fee)?; // HKM fee only
+                    self.fee_pot += fee;
+                    self.debit_token(&action.token_id, from, action.amount_in)?;
+                    self.credit_token(&action.token_id, AMM_POOL_ACCOUNT, action.amount_in);
+                    self.debit(AMM_POOL_ACCOUNT, amount_out)?;
+                    self.credit(from, amount_out);
+                    let pool = self.pools.get_mut(&action.token_id).unwrap();
+                    pool.reserve_token += action.amount_in;
+                    pool.reserve_hkm -= amount_out;
+                }
                 Ok(())
             }
             TransactionType::Certificate => {
@@ -629,7 +1050,7 @@ mod tests {
     fn genesis_state() -> (ChainState, String, String, String) {
         let (address, public_key, private_key) = wallet(1);
         let vrf_key = crate::consensus::vrf::derive_vrf_public_key(&private_key).unwrap();
-        let state = ChainState::genesis(&address, Some(&public_key), Some(&vrf_key), TEST_SUPPLY);
+        let state = ChainState::genesis(&address, Some(&public_key), Some(&vrf_key), TEST_SUPPLY, &[]);
         (state, address, public_key, private_key)
     }
 
@@ -804,6 +1225,79 @@ mod tests {
     }
 
     #[test]
+    fn allowlist_gates_new_validator_registration() {
+        let (t_addr, t_pub, t_priv) = wallet(1);
+        let t_vrf = crate::consensus::vrf::derive_vrf_public_key(&t_priv).unwrap();
+        let (allowed_addr, allowed_pub, allowed_key) = wallet(2);
+        let (outsider_addr, outsider_pub, outsider_key) = wallet(3);
+
+        // Genesis with an allowlist naming only wallet(2).
+        let mut state = ChainState::genesis(
+            &t_addr,
+            Some(&t_pub),
+            Some(&t_vrf),
+            TEST_SUPPLY,
+            std::slice::from_ref(&allowed_addr),
+        );
+
+        // Fund both candidates.
+        let funded = MIN_VALIDATOR_STAKE * 2;
+        for (i, dest) in [(1u64, &allowed_addr), (2u64, &outsider_addr)] {
+            let mut fund = Transaction::new(
+                Some(t_addr.clone()),
+                dest.to_string(),
+                funded,
+                TransactionType::Transfer,
+            );
+            fund.nonce = i;
+            state.apply_transaction(&fund, 1).unwrap();
+        }
+
+        let make_stake = |addr: &str, pubkey: &str, key: &str| {
+            let mut stake = Transaction::new(
+                Some(addr.to_string()),
+                STAKING_POOL_ACCOUNT.to_string(),
+                MIN_VALIDATOR_STAKE,
+                TransactionType::Stake,
+            );
+            stake.nonce = 1;
+            stake.public_key = Some(pubkey.to_string());
+            stake.vrf_public_key =
+                Some(crate::consensus::vrf::derive_vrf_public_key(key).unwrap());
+            stake
+        };
+
+        // An address NOT on the allowlist cannot join the validator set.
+        let err = state
+            .apply_transaction(&make_stake(&outsider_addr, &outsider_pub, &outsider_key), 1)
+            .unwrap_err();
+        assert!(err.contains("allowlist"), "{err}");
+        assert_eq!(state.validator_set().len(), 1);
+
+        // An allowlisted address joins normally.
+        state
+            .apply_transaction(&make_stake(&allowed_addr, &allowed_pub, &allowed_key), 1)
+            .unwrap();
+        assert_eq!(state.validator_set().len(), 2);
+
+        // Existing validators (the genesis treasury) may top up regardless.
+        let mut top_up = Transaction::new(
+            Some(t_addr.clone()),
+            STAKING_POOL_ACCOUNT.to_string(),
+            MIN_VALIDATOR_STAKE,
+            TransactionType::Stake,
+        );
+        top_up.nonce = 3;
+        top_up.public_key = Some(t_pub.clone());
+        top_up.vrf_public_key = Some(t_vrf.clone());
+        state.apply_transaction(&top_up, 1).unwrap();
+        assert_eq!(
+            state.stakers[&t_addr].stake,
+            GENESIS_VALIDATOR_STAKE + MIN_VALIDATOR_STAKE
+        );
+    }
+
+    #[test]
     fn vesting_releases_after_cliff_then_linearly() {
         let (mut state, treasury, _, _) = genesis_state();
         let recipient = "hkmteammember".to_string();
@@ -846,6 +1340,299 @@ mod tests {
 
         // Supply is conserved: vesting moves tokens, it never mints.
         assert_eq!(state.total_supply, TEST_SUPPLY);
+    }
+
+    #[test]
+    fn native_token_create_transfer_burn_lifecycle() {
+        use crate::blockchain::transaction::{derive_token_id, TokenAction};
+        let (mut state, treasury, _, _) = genesis_state();
+        let (holder, ..) = wallet(4);
+
+        // Create a token: 1,000,000 units (8 decimals) minted to the creator.
+        let supply = 1_000_000u64;
+        let mut create = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            supply,
+            TransactionType::TokenCreate,
+        );
+        create.nonce = 1;
+        create.token = Some(TokenAction {
+            token_id: String::new(),
+            symbol: "HTEST".to_string(),
+            name: "Hik Test".to_string(),
+            decimals: 8,
+        });
+        let hkm_before = state.balance_of(&treasury);
+        state.apply_transaction(&create, 1).unwrap();
+
+        let token_id = derive_token_id(&treasury, "HTEST", 1);
+        assert!(state.tokens.contains_key(&token_id));
+        assert_eq!(state.tokens[&token_id].total_supply, supply);
+        assert_eq!(state.tokens[&token_id].decimals, 8);
+        assert_eq!(state.token_balance_of(&token_id, &treasury), supply);
+        // Creation charged an HKM base fee (no token minted to anyone else).
+        assert_eq!(state.balance_of(&treasury), hkm_before - state.base_fee);
+
+        // Transfer 250,000 units to a holder.
+        let mut send = Transaction::new(
+            Some(treasury.clone()),
+            holder.clone(),
+            250_000,
+            TransactionType::TokenTransfer,
+        );
+        send.nonce = 2;
+        send.token = Some(TokenAction {
+            token_id: token_id.clone(),
+            ..Default::default()
+        });
+        state.apply_transaction(&send, 1).unwrap();
+        assert_eq!(state.token_balance_of(&token_id, &holder), 250_000);
+        assert_eq!(state.token_balance_of(&token_id, &treasury), 750_000);
+        // Token supply is unchanged by transfers.
+        assert_eq!(state.tokens[&token_id].total_supply, supply);
+
+        // Burn 100,000 units from the treasury: supply drops accordingly.
+        let mut burn = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            100_000,
+            TransactionType::TokenBurn,
+        );
+        burn.nonce = 3;
+        burn.token = Some(TokenAction {
+            token_id: token_id.clone(),
+            ..Default::default()
+        });
+        state.apply_transaction(&burn, 1).unwrap();
+        assert_eq!(state.token_balance_of(&token_id, &treasury), 650_000);
+        assert_eq!(state.tokens[&token_id].total_supply, supply - 100_000);
+
+        // HKM supply is untouched by any native-token operation.
+        assert_eq!(state.total_supply, TEST_SUPPLY);
+    }
+
+    /// Helper: create a token owned by `owner` and return its id.
+    fn make_token(state: &mut ChainState, owner: &str, symbol: &str, supply: u64, nonce: u64) -> String {
+        use crate::blockchain::transaction::TokenAction;
+        let mut create = Transaction::new(
+            Some(owner.to_string()),
+            String::new(),
+            supply,
+            TransactionType::TokenCreate,
+        );
+        create.nonce = nonce;
+        create.token = Some(TokenAction {
+            symbol: symbol.to_string(),
+            ..Default::default()
+        });
+        state.apply_transaction(&create, 1).unwrap();
+        crate::blockchain::transaction::derive_token_id(owner, symbol, nonce)
+    }
+
+    #[test]
+    fn amm_add_swap_remove_lifecycle_conserves_supply() {
+        use crate::blockchain::transaction::AmmAction;
+        let (mut state, treasury, _, _) = genesis_state();
+        let hkm_supply_before = state.total_supply;
+
+        // Create a token and a HKM<->token pool.
+        let token_id = make_token(&mut state, &treasury, "LPTOK", 10_000_000, 1);
+
+        // Seed the pool: 1,000,000 HKM units + 1,000,000 token units.
+        let mut add = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            0,
+            TransactionType::AddLiquidity,
+        );
+        add.nonce = 2;
+        add.amm = Some(AmmAction {
+            token_id: token_id.clone(),
+            amount_hkm: 1_000_000,
+            amount_token: 1_000_000,
+            min_shares: 1,
+            ..Default::default()
+        });
+        state.apply_transaction(&add, 1).unwrap();
+
+        let pool = state.pools[&token_id].clone();
+        assert_eq!(pool.reserve_hkm, 1_000_000);
+        assert_eq!(pool.reserve_token, 1_000_000);
+        // Provider shares = sqrt(1e6*1e6) - MINIMUM_LIQUIDITY.
+        let provider_shares = state.lp_shares_of(&token_id, &treasury);
+        assert_eq!(provider_shares, 1_000_000 - MINIMUM_LIQUIDITY);
+        assert_eq!(pool.total_shares, 1_000_000);
+        // The pool custody account holds the reserves.
+        assert_eq!(state.balance_of(AMM_POOL_ACCOUNT), 1_000_000);
+        assert_eq!(state.token_balance_of(&token_id, AMM_POOL_ACCOUNT), 1_000_000);
+
+        // Swap 100,000 HKM for the token. Constant-product with 0.3% fee:
+        // out = 997*100000*1e6 / (1e6*1000 + 997*100000) ≈ 90,661.
+        let k_before = pool.reserve_hkm as u128 * pool.reserve_token as u128;
+        let mut swap = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            0,
+            TransactionType::Swap,
+        );
+        swap.nonce = 3;
+        swap.amm = Some(AmmAction {
+            token_id: token_id.clone(),
+            amount_in: 100_000,
+            hkm_to_token: true,
+            min_out: 1,
+            ..Default::default()
+        });
+        let token_before = state.token_balance_of(&token_id, &treasury);
+        state.apply_transaction(&swap, 1).unwrap();
+        let received = state.token_balance_of(&token_id, &treasury) - token_before;
+        assert_eq!(received, 90_661, "constant-product output");
+
+        // The pool moved: more HKM, less token, and k grew (fee accrual).
+        let pool2 = state.pools[&token_id].clone();
+        assert_eq!(pool2.reserve_hkm, 1_100_000);
+        assert_eq!(pool2.reserve_token, 1_000_000 - 90_661);
+        let k_after = pool2.reserve_hkm as u128 * pool2.reserve_token as u128;
+        assert!(k_after > k_before, "fee grows the invariant for LPs");
+
+        // Remove all of the provider's liquidity; they get back reserves pro
+        // rata (now HKM-heavier and token-lighter from the swap + the fee).
+        let mut remove = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            0,
+            TransactionType::RemoveLiquidity,
+        );
+        remove.nonce = 4;
+        remove.amm = Some(AmmAction {
+            token_id: token_id.clone(),
+            shares: provider_shares,
+            min_hkm: 1,
+            min_token: 1,
+            ..Default::default()
+        });
+        state.apply_transaction(&remove, 1).unwrap();
+        assert_eq!(state.lp_shares_of(&token_id, &treasury), 0);
+        // Only the locked MINIMUM_LIQUIDITY worth of reserves remains.
+        let pool3 = state.pools[&token_id].clone();
+        assert_eq!(pool3.total_shares, MINIMUM_LIQUIDITY);
+        assert!(pool3.reserve_hkm > 0 && pool3.reserve_token > 0);
+
+        // HKM total supply is conserved across every AMM operation (fees to
+        // the validator stay in circulation; the pool never mints or burns).
+        // Account for fees paid to the (unset) validator: they sit in fee_pot
+        // until end_block, so total_supply is unchanged throughout.
+        assert_eq!(state.total_supply, hkm_supply_before);
+    }
+
+    #[test]
+    fn amm_enforces_slippage_and_liquidity_bounds() {
+        use crate::blockchain::transaction::AmmAction;
+        let (mut state, treasury, _, _) = genesis_state();
+        let token_id = make_token(&mut state, &treasury, "SLIP", 10_000_000, 1);
+
+        let mut add = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            0,
+            TransactionType::AddLiquidity,
+        );
+        add.nonce = 2;
+        add.amm = Some(AmmAction {
+            token_id: token_id.clone(),
+            amount_hkm: 1_000_000,
+            amount_token: 1_000_000,
+            min_shares: 1,
+            ..Default::default()
+        });
+        state.apply_transaction(&add, 1).unwrap();
+
+        // Swap with an unsatisfiable min_out is rejected.
+        let mut swap = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            0,
+            TransactionType::Swap,
+        );
+        swap.nonce = 3;
+        swap.amm = Some(AmmAction {
+            token_id: token_id.clone(),
+            amount_in: 100_000,
+            hkm_to_token: true,
+            min_out: 99_999_999, // absurd
+            ..Default::default()
+        });
+        let err = state.apply_transaction(&swap, 1).unwrap_err();
+        assert!(err.contains("slippage"), "{err}");
+
+        // Swap against a pool that does not exist is rejected.
+        let mut ghost = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            0,
+            TransactionType::Swap,
+        );
+        ghost.nonce = 3;
+        ghost.amm = Some(AmmAction {
+            token_id: "hktnope".to_string(),
+            amount_in: 1,
+            hkm_to_token: true,
+            min_out: 0,
+            ..Default::default()
+        });
+        assert!(state.apply_transaction(&ghost, 1).is_err());
+    }
+
+    #[test]
+    fn native_token_rejects_overdraft_and_unknown_token() {
+        use crate::blockchain::transaction::TokenAction;
+        let (mut state, treasury, _, _) = genesis_state();
+
+        // Transfer against a token that does not exist.
+        let mut send = Transaction::new(
+            Some(treasury.clone()),
+            "hkmsomeone".to_string(),
+            1,
+            TransactionType::TokenTransfer,
+        );
+        send.nonce = 1;
+        send.token = Some(TokenAction {
+            token_id: "hktdeadbeef".to_string(),
+            ..Default::default()
+        });
+        assert!(state.apply_transaction(&send, 1).is_err());
+
+        // Create a small token, then try to transfer more than held.
+        let mut create = Transaction::new(
+            Some(treasury.clone()),
+            String::new(),
+            100,
+            TransactionType::TokenCreate,
+        );
+        create.nonce = 1;
+        create.token = Some(TokenAction {
+            token_id: String::new(),
+            symbol: "SMALL".to_string(),
+            name: String::new(),
+            decimals: 0,
+        });
+        state.apply_transaction(&create, 1).unwrap();
+        let token_id = crate::blockchain::transaction::derive_token_id(&treasury, "SMALL", 1);
+
+        let mut overspend = Transaction::new(
+            Some(treasury.clone()),
+            "hkmsomeone".to_string(),
+            101,
+            TransactionType::TokenTransfer,
+        );
+        overspend.nonce = 2;
+        overspend.token = Some(TokenAction {
+            token_id: token_id.clone(),
+            ..Default::default()
+        });
+        let err = state.apply_transaction(&overspend, 1).unwrap_err();
+        assert!(err.contains("Insufficient token balance"), "{err}");
     }
 
     #[test]

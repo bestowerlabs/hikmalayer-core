@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from "react";
-import { WalletProvider } from "./hooks/useWallet";
+import { WalletProvider, useWallet } from "./hooks/useWallet";
+import { SignerProvider } from "./hooks/useSigner";
+import { ExtensionProvider } from "./hooks/useExtension";
 import { getBlockchainStats } from "./api";
 import StatsGrid from "./components/StatsGrid";
 import CertificateManager from "./components/CertificateManager";
@@ -8,8 +10,13 @@ import MiningActions from "./components/MiningActions";
 import BlockchainViewer from "./components/BlockchainViewer";
 import WalletAuth from "./components/WalletAuth";
 import ProtectedAction from "./components/ProtectedAction";
+import DexSwap from "./components/DexSwap";
+import DexLiquidity from "./components/DexLiquidity";
+import AssetExplorer from "./components/AssetExplorer";
+import WalletPanel from "./components/WalletPanel";
 
 const AppContent = () => {
+  const { connectWallet } = useWallet();
   const [stats, setStats] = useState({
     total_blocks: 0,
     pending_transactions: 0,
@@ -169,6 +176,35 @@ const AppContent = () => {
               <MiningActions onUpdate={handleUpdate} />
             </ProtectedAction>
           </div>
+
+          {/* Ecosystem: native assets + the on-chain AMM DEX. Read-only
+              browsing needs no wallet; actions are authorized by offline
+              signatures, so no auth gate is required here. */}
+          {/* Unlocking the wallet also sets the active address for the
+              address-based panels, so there is one identity on screen. */}
+          <ExtensionProvider>
+          <SignerProvider onUnlock={connectWallet}>
+            <div className="mb-4">
+              <h2 className="text-2xl font-bold text-white">
+                Ecosystem{" "}
+                <span className="bg-gradient-to-r from-teal-400 to-purple-400 bg-clip-text text-transparent">
+                  DEX
+                </span>
+              </h2>
+              <p className="text-gray-400 text-sm">
+                Native assets and constant-product HKM pools. Trades HKM and
+                Hikmalayer-issued tokens only — this is not a bridge to other
+                chains.
+              </p>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
+              <WalletPanel refreshTrigger={refreshTrigger} />
+              <DexSwap refreshTrigger={refreshTrigger} onUpdate={handleUpdate} />
+              <DexLiquidity refreshTrigger={refreshTrigger} onUpdate={handleUpdate} />
+              <AssetExplorer refreshTrigger={refreshTrigger} onUpdate={handleUpdate} />
+            </div>
+          </SignerProvider>
+          </ExtensionProvider>
 
           {/* Blockchain Viewer - No auth required (read-only) */}
           <BlockchainViewer refreshTrigger={refreshTrigger} />

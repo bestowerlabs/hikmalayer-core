@@ -79,6 +79,73 @@ export const getTokenBalance = async (account) => {
   return api.get(`/tokens/balance/${account}`);
 };
 
+// ===== NATIVE TOKEN STANDARD (HTS) =====
+
+export const listAssets = async () => {
+  return api.get("/assets");
+};
+
+export const getAsset = async (tokenId) => {
+  return api.get(`/assets/${encodeURIComponent(tokenId)}`);
+};
+
+export const getAssetBalance = async (tokenId, account) => {
+  return api.get(
+    `/assets/${encodeURIComponent(tokenId)}/balance/${encodeURIComponent(account)}`
+  );
+};
+
+export const createAsset = async (data) => {
+  return api.post("/assets/create", data);
+};
+
+export const transferAsset = async (data) => {
+  return api.post("/assets/transfer", data);
+};
+
+export const burnAsset = async (data) => {
+  return api.post("/assets/burn", data);
+};
+
+// ===== NATIVE AMM DEX =====
+
+export const listPools = async () => {
+  return api.get("/dex/pools");
+};
+
+export const getPool = async (tokenId) => {
+  return api.get(`/dex/pool/${encodeURIComponent(tokenId)}`);
+};
+
+export const getLpPosition = async (tokenId, account) => {
+  return api.get(
+    `/dex/position/${encodeURIComponent(tokenId)}/${encodeURIComponent(account)}`
+  );
+};
+
+/// Read-only quote: the exact output the on-chain math would produce.
+export const getSwapQuote = async (tokenId, direction, amountIn) => {
+  return api.get(
+    `/dex/quote/${encodeURIComponent(tokenId)}/${direction}/${amountIn}`
+  );
+};
+
+export const submitSwap = async (data) => {
+  return api.post("/dex/swap", data);
+};
+
+export const addLiquidity = async (data) => {
+  return api.post("/dex/add", data);
+};
+
+export const removeLiquidity = async (data) => {
+  return api.post("/dex/remove", data);
+};
+
+export const getAccountNonce = async (account) => {
+  return api.get(`/tokens/nonce/${encodeURIComponent(account)}`);
+};
+
 // ===== BLOCKCHAIN OPERATIONS =====
 
 export const getBlocks = async () => {

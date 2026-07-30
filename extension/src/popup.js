@@ -89,43 +89,9 @@ async function renderApproval() {
     return;
   }
 
-  if (request.kind === "unlock") {
-    const view = el(`
-      <div>
-        <h1>Unlock wallet</h1>
-        <p class="muted">${escape(origin)} requested a signature.</p>
-        <div class="card">
-          <input type="password" id="password" placeholder="Password" autofocus />
-          <div class="row">
-            <button class="ghost" id="reject">Cancel</button>
-            <button id="approve">Unlock</button>
-          </div>
-        </div>
-      </div>`);
-    view.querySelector("#approve").onclick = async () => {
-      try {
-        await send({
-          type: "request:approve",
-          id: requestId,
-          password: view.querySelector("#password").value,
-        });
-        window.close();
-      } catch (error) {
-        showError(view, error.message);
-      }
-    };
-    view.querySelector("#reject").onclick = async () => {
-      await send({ type: "request:reject", id: requestId });
-      window.close();
-    };
-    render(view);
-    view.querySelector("#password").addEventListener("keydown", (e) => {
-      if (e.key === "Enter") view.querySelector("#approve").click();
-    });
-    return;
-  }
-
-  // kind === "sign"
+  // kind === "sign". A locked wallet is unlocked on this same screen: the
+  // user must be able to read what they are authorizing before typing a
+  // password, not after.
   const shown = safe(request.message, 600);
   const altered = shown !== String(request.message).trim();
   const view = el(`
@@ -142,24 +108,46 @@ async function renderApproval() {
           : ""
       }
       <div class="card">
-        <p class="muted" style="margin:0 0 6px">Signing account</p>
+        <p class="muted" style="margin:0 0 6px">Signing account${
+          request.label ? ` · ${escape(safe(request.label, 40))}` : ""
+        }</p>
         <div class="addr">${escape(request.address)}</div>
       </div>
+      ${
+        request.needsUnlock
+          ? `<div class="card">
+               <p class="muted" style="margin:0 0 6px">Your wallet is locked</p>
+               <input type="password" id="password" placeholder="Password" autofocus />
+             </div>`
+          : ""
+      }
       <p class="muted">Approve only if this matches what you just did on the site.</p>
       <div class="row">
         <button class="ghost" id="reject">Reject</button>
         <button id="approve">Approve &amp; sign</button>
       </div>
     </div>`);
-  view.querySelector("#approve").onclick = async () => {
-    await send({ type: "request:approve", id: requestId });
-    window.close();
+  const approve = async () => {
+    try {
+      await send({
+        type: "request:approve",
+        id: requestId,
+        password: view.querySelector("#password")?.value,
+      });
+      window.close();
+    } catch (error) {
+      showError(view, error.message);
+    }
   };
+  view.querySelector("#approve").onclick = approve;
   view.querySelector("#reject").onclick = async () => {
     await send({ type: "request:reject", id: requestId });
     window.close();
   };
   render(view);
+  view.querySelector("#password")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") approve();
+  });
 }
 
 // ===== Main popup =====
@@ -269,10 +257,37 @@ function renderAccount(state) {
       <h1>Hikmalayer Wallet <span class="pill on">Unlocked</span></h1>
       <p class="muted">Auto-locks after 15 minutes idle.</p>
       <div class="card">
-        <p class="muted" style="margin:0 0 6px">Address</p>
+        <p class="muted" style="margin:0 0 6px">Active address</p>
         <div class="addr" id="address">${escape(state.address)}</div>
         <p class="muted" style="margin:8px 0 0">Balance: <span id="balance">…</span></p>
         <button class="ghost" id="copy" style="margin-top:8px">Copy address</button>
+      </div>
+
+      <div class="card">
+        <h2>Accounts</h2>
+        <div id="accounts"></div>
+        <div class="tabs" style="margin:10px 0 8px">
+          <button class="active" data-tab="new">New</button>
+          <button data-tab="import">Import key</button>
+        </div>
+        <input type="password" id="newKey" class="hidden" placeholder="Private key (64 hex chars)" autocomplete="off" />
+        <input type="text" id="newLabel" placeholder="Label (optional)" autocomplete="off" />
+        <input type="password" id="addPassword" placeholder="Your password" autocomplete="current-password" />
+        <button id="addAccount">Add account</button>
+        <p class="muted" style="margin:8px 0 0">Adding an account re-encrypts the
+        keyring, so your password is required.</p>
+        <div id="added"></div>
+      </div>
+
+      <div class="card">
+        <h2>Network</h2>
+        <p class="muted" style="margin:0 0 8px">Node used for balances. Signing
+        never contacts a node.</p>
+        <input type="text" id="nodeUrl" placeholder="https://node.example" value="${escape(
+          state.nodeUrl || ""
+        )}" />
+        <button class="ghost" id="saveNode">Save node URL</button>
+        <div id="nodeStatus"></div>
       </div>
 
       <div class="card">
@@ -286,11 +301,116 @@ function renderAccount(state) {
       </div>
       <div class="card" style="margin-top:12px">
         <h2>Export private key</h2>
+        <p class="muted" style="margin:0 0 8px">Exports the active account only.</p>
         <input type="password" id="exportPassword" placeholder="Confirm password" autocomplete="off" />
         <button class="danger" id="export">Reveal</button>
         <div id="revealed"></div>
       </div>
     </div>`);
+
+  // ---- Accounts ----
+  const accounts = view.querySelector("#accounts");
+  state.accounts.forEach((account, index) => {
+    const isActive = index === state.activeIndex;
+    const row = el(`
+      <div class="acct ${isActive ? "active" : ""}">
+        <span class="check">${isActive ? "●" : "○"}</span>
+        <span class="who">
+          <span class="name">${escape(safe(account.label, 40))}</span><br />
+          <span class="tiny">${escape(account.address.slice(0, 14))}…${escape(
+            account.address.slice(-6)
+          )}</span>
+        </span>
+        <button class="ghost" data-act="rename">Rename</button>
+        ${
+          state.accounts.length > 1
+            ? `<button class="danger" data-act="remove">✕</button>`
+            : ""
+        }
+      </div>`);
+
+    row.querySelector(".who").onclick = async () => {
+      if (isActive) return;
+      await send({ type: "wallet:select-account", index });
+      renderMain();
+    };
+    row.querySelector('[data-act="rename"]').onclick = async (event) => {
+      event.stopPropagation();
+      const label = prompt("Name this account", account.label);
+      if (label === null) return;
+      await send({ type: "wallet:rename-account", index, label });
+      renderMain();
+    };
+    row.querySelector('[data-act="remove"]')?.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      if (!confirm(`Remove ${account.label}? Back up its key first — this cannot be undone.`)) {
+        return;
+      }
+      const password = prompt("Confirm your password to re-encrypt the keyring");
+      if (!password) return;
+      try {
+        await send({ type: "wallet:remove-account", index, password });
+        renderMain();
+      } catch (error) {
+        showError(view, error.message);
+      }
+    });
+
+    accounts.appendChild(row);
+  });
+
+  let addTab = "new";
+  view.querySelectorAll(".tabs button").forEach((button) => {
+    button.onclick = () => {
+      addTab = button.dataset.tab;
+      view.querySelectorAll(".tabs button").forEach((b) => b.classList.remove("active"));
+      button.classList.add("active");
+      view.querySelector("#newKey").classList.toggle("hidden", addTab !== "import");
+    };
+  });
+
+  view.querySelector("#addAccount").onclick = async () => {
+    const password = view.querySelector("#addPassword").value;
+    const label = view.querySelector("#newLabel").value.trim();
+    const privateKey =
+      addTab === "import" ? view.querySelector("#newKey").value.trim() : null;
+    try {
+      const result = await send({ type: "wallet:add-account", password, label, privateKey });
+      // A generated key is shown once, here, so it can be backed up.
+      if (result.privateKey) {
+        view.querySelector("#added").replaceChildren(
+          el(`<div class="warn" style="margin-top:8px">
+                <p style="margin:0 0 6px">Back up this key — it is shown once.</p>
+                <div class="mono" style="word-break:break-all;font-size:11px">${escape(
+                  result.privateKey
+                )}</div>
+              </div>`)
+        );
+      } else {
+        renderMain();
+      }
+      view.querySelector("#addPassword").value = "";
+      view.querySelector("#newKey").value = "";
+      view.querySelector("#newLabel").value = "";
+    } catch (error) {
+      showError(view, error.message);
+    }
+  };
+
+  // ---- Network ----
+  view.querySelector("#saveNode").onclick = async () => {
+    try {
+      const { nodeUrl } = await send({
+        type: "wallet:set-node",
+        nodeUrl: view.querySelector("#nodeUrl").value,
+      });
+      view
+        .querySelector("#nodeStatus")
+        .replaceChildren(el(`<p class="ok">Saved: ${escape(nodeUrl)}</p>`));
+    } catch (error) {
+      showError(view, error.message);
+    }
+  };
 
   const sites = view.querySelector("#sites");
   if (state.sites.length === 0) {
@@ -339,7 +459,8 @@ function renderAccount(state) {
   render(view);
 
   // Balance is a nicety: failure to reach a node must not break the popup.
-  fetch("http://127.0.0.1:3000/tokens/balance/" + encodeURIComponent(state.address))
+  const nodeUrl = (state.nodeUrl || "http://127.0.0.1:3000").replace(/\/+$/, "");
+  fetch(`${nodeUrl}/tokens/balance/${encodeURIComponent(state.address)}`)
     .then((r) => r.json())
     .then((data) => {
       const hkm = (Number(data.balance ?? 0) / 1_000_000).toLocaleString(undefined, {

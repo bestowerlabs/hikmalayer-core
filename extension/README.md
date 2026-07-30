@@ -102,12 +102,35 @@ signature = hex(compact ECDSA r||s), low-S normalized
 The crypto is imported from `dashboard/src/lib/wallet.js` — one implementation,
 one place to audit, no drift between the wallet, the dashboard, and the CLI.
 
+## Accounts
+
+Several accounts live in one keyring, encrypted together under a single
+password — one password to remember, one KDF run to unlock. Public metadata
+(address, label) sits alongside the ciphertext so the popup can list accounts
+while locked.
+
+- **Add** generates a new key, or imports one you paste. A generated key is
+  displayed once so you can back it up.
+- **Switch** changes the account sites see; connected sites receive an
+  `accountsChanged` event. Sites you have *not* connected are told nothing.
+- **Rename** touches only the label — no password, no re-encryption.
+- **Remove** re-encrypts the remaining keys, so it needs your password. The
+  last account cannot be removed; remove the wallet instead.
+
+A signature request is pinned to the account it displays: switching accounts
+while an approval is open cannot redirect the signature to a different key.
+
+## Network
+
+The node URL is editable in the popup (**Network**). It is used only to show
+your balance — signing never contacts a node. Only `http://` and `https://`
+URLs are accepted.
+
 ## Limits
 
-- Single account per install (multi-account is a natural next step).
-- Talks to a node at `http://127.0.0.1:3000` for the balance display only;
-  signing never needs a node. Update `host_permissions` in the manifest and
-  the popup's fetch URL to point at a public node.
+- Up to 20 accounts per wallet, all under one password. There is no seed
+  phrase or HD derivation: each account is an independent key, so back up
+  each one.
 - Not published to any store; install unpacked, or package and sign it
   yourself. Before publishing, get the extension reviewed — it is the piece
   users trust with their keys.

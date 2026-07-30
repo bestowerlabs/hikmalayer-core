@@ -79,6 +79,23 @@ units, 1 HKM = 1,000,000 units. Genesis supply is 30B HKM (30,000,000,000,000,00
 units); ~70B more is mined on the halving schedule (~100B total — a 30/70
 premine/mined split).
 
+**Amounts may be sent as a JSON string, and usually should be.** Every amount
+field (`amount`, `amount_hkm`, `amount_token`, `amount_in`, `initial_supply`,
+`shares`, and the `min_*` bounds) accepts either a JSON number or a decimal
+string of digits.
+
+Use a string from JavaScript. The full supply is 10^17 base units, well past
+`Number.MAX_SAFE_INTEGER` (2^53−1 ≈ 9.007×10^15), so a large amount routed
+through `Number` silently loses its low digits. That is not only a display
+problem: signatures cover the *exact* decimal text of the amount, so a rounded
+value produces a request that no longer matches what the user signed, and the
+node rejects an otherwise honest transaction. Sending `BigInt.toString()` is
+exact by construction.
+
+Numbers keep working for small values. A number that is fractional, negative,
+or beyond 2^53−1 is **rejected** rather than truncated — silently accepting a
+value the client already corrupted would be worse than failing.
+
 **Native token standard (HTS).** First-class fungible tokens as ecosystem
 assets (the DEX foundation), under `/assets/*`:
 `POST /assets/create` issues a token — `{creator, symbol, name, decimals,

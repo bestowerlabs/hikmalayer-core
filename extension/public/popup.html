@@ -65,6 +65,17 @@
       .site { font-size: 12px; display: flex; justify-content: space-between; gap: 8px; padding: 4px 0; }
       .site button { width: auto; padding: 3px 8px; font-size: 11px; margin: 0; }
       .hidden { display: none; }
+      .acct {
+        display: flex; align-items: center; gap: 8px; padding: 7px 8px;
+        border-radius: 9px; border: 1px solid transparent; cursor: pointer;
+      }
+      .acct:hover { background: rgba(255,255,255,.06); }
+      .acct.active { background: rgba(16,185,129,.16); border-color: rgba(16,185,129,.4); }
+      .acct .who { flex: 1; min-width: 0; }
+      .acct .name { font-size: 12px; color: #fff; }
+      .acct .tiny { font-size: 10px; color: #8fa0bd; font-family: ui-monospace, Menlo, monospace; }
+      .acct button { width: auto; padding: 3px 7px; font-size: 10px; margin: 0; }
+      .check { color: #6ee7b7; font-size: 13px; }
     </style>
   </head>
   <body>

@@ -154,11 +154,11 @@ pub fn verify_message(message: &str, public_key_hex: &str, signature_hex: &str) 
     verify_digest(&message_digest(message), public_key_hex, signature_hex)
 }
 
-pub fn slash_staker(stakers: &mut Vec<Staker>, address: &str) -> u64 {
+pub fn slash_staker(stakers: &mut [Staker], address: &str) -> u64 {
     slash_staker_with_percent(stakers, address, SLASH_PERCENT)
 }
 
-pub fn slash_staker_with_percent(stakers: &mut Vec<Staker>, address: &str, percent: u64) -> u64 {
+pub fn slash_staker_with_percent(stakers: &mut [Staker], address: &str, percent: u64) -> u64 {
     for staker in stakers.iter_mut() {
         if staker.address == address {
             let slashed = staker.stake.saturating_mul(percent) / 100;

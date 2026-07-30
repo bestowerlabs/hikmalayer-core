@@ -3,7 +3,6 @@ use hikmalayer::api::routes::{api_routes, AppState, LocalValidatorKey, Metrics};
 use hikmalayer::auth::{routes::auth_routes, AuthManager};
 use hikmalayer::blockchain::chain::{Blockchain, DEFAULT_GENESIS_SUPPLY};
 use hikmalayer::consensus::pos;
-use hikmalayer::contract::contract::ContractExecutor;
 use hikmalayer::p2p::{peerbook::PeerBook, protocol::SeenMessageCache, service::P2PService};
 use hikmalayer::persistence::load_state;
 use std::sync::Arc;
@@ -143,7 +142,7 @@ async fn main() {
         snapshot
             .as_ref()
             .map(|state| state.contracts.clone())
-            .unwrap_or_else(ContractExecutor::new),
+            .unwrap_or_default(),
     ));
     let pending_transactions = Arc::new(Mutex::new(
         snapshot

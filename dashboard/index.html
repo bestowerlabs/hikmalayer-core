@@ -17,9 +17,17 @@
       'unsafe-inline' is required in style-src only because React sets inline
       style attributes (animation delays); it does NOT permit script execution.
 
-      Adjust connect-src to your node's public origin when deploying, and
-      prefer serving the same policy as a real HTTP header (a header also
-      enforces frame-ancestors, which is ignored in a meta tag).
+      connect-src is extended automatically at build time with VITE_API_BASE
+      (see vite.config.js), so a dashboard pointed at a real node is not
+      blocked by its own policy.
+
+      Deployments should ALSO serve this policy as a real HTTP header. A
+      header can enforce `frame-ancestors 'none'` — the anti-clickjacking
+      directive that protects the signing confirmation — which a meta tag
+      cannot. It is deliberately omitted below rather than included and
+      ignored: browsers reject it here and log an error on every page load,
+      which trains people to ignore console errors. See
+      docs/wallet_security.md §4 for the header to serve.
     -->
     <meta
       http-equiv="Content-Security-Policy"
@@ -31,8 +39,7 @@
                connect-src 'self' http://127.0.0.1:3000 http://localhost:3000;
                object-src 'none';
                base-uri 'none';
-               form-action 'none';
-               frame-ancestors 'none'"
+               form-action 'none'"
     />
     <meta name="referrer" content="no-referrer" />
 

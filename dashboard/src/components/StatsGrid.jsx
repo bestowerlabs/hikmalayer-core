@@ -1,29 +1,37 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 
 // Animated Counter Component
 const AnimatedCounter = ({ value, duration = 2000 }) => {
   const [count, setCount] = useState(0);
+  // What is currently on screen. Kept in a ref rather than read from `count`
+  // so a new target animates from where the last one stopped without making
+  // the effect re-run on every animated frame.
+  const displayed = useRef(0);
 
   useEffect(() => {
+    const startValue = displayed.current;
+    const endValue = Number(value) || 0;
+    if (startValue === endValue) return undefined;
+
+    let frame = 0;
     let startTime = null;
-    const startValue = count;
-    const endValue = value;
 
     const animate = (timestamp) => {
-      if (!startTime) startTime = timestamp;
+      if (startTime === null) startTime = timestamp;
       const progress = Math.min((timestamp - startTime) / duration, 1);
       const easeOutCubic = 1 - Math.pow(1 - progress, 3);
-      setCount(Math.floor(startValue + (endValue - startValue) * easeOutCubic));
-
-      if (progress < 1) {
-        requestAnimationFrame(animate);
-      }
+      const next = Math.round(startValue + (endValue - startValue) * easeOutCubic);
+      displayed.current = next;
+      setCount(next);
+      if (progress < 1) frame = requestAnimationFrame(animate);
     };
 
-    if (value !== count) {
-      requestAnimationFrame(animate);
-    }
-  }, [value]);
+    frame = requestAnimationFrame(animate);
+    // Cancel on unmount, and whenever a new target supersedes this one —
+    // otherwise stats refreshing every 30s leave a pile of rival animation
+    // loops writing to the same counter.
+    return () => cancelAnimationFrame(frame);
+  }, [value, duration]);
 
   return <span>{count}</span>;
 };

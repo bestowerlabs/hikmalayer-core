@@ -105,6 +105,7 @@ pub struct VerifyCertificateRequest {
 pub struct TokenTransferRequest {
     pub from: String,
     pub to: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount: u64,
     #[serde(default)]
     pub nonce: u64,
@@ -116,6 +117,7 @@ pub struct TokenTransferRequest {
 pub struct VestRequest {
     pub from: String,
     pub to: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount: u64,
     pub cliff_blocks: u64,
     pub duration_blocks: u64,
@@ -133,6 +135,7 @@ pub struct TokenCreateRequest {
     pub name: String,
     pub decimals: u32,
     /// Initial supply in the token's own base units (all minted to creator).
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub initial_supply: u64,
     #[serde(default)]
     pub nonce: u64,
@@ -145,6 +148,7 @@ pub struct TokenSendRequest {
     pub token_id: String,
     pub from: String,
     pub to: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount: u64,
     #[serde(default)]
     pub nonce: u64,
@@ -156,6 +160,7 @@ pub struct TokenSendRequest {
 pub struct TokenBurnRequest {
     pub token_id: String,
     pub from: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount: u64,
     #[serde(default)]
     pub nonce: u64,
@@ -174,9 +179,11 @@ pub struct TokenBalanceResponse {
 pub struct AddLiquidityRequest {
     pub token_id: String,
     pub provider: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount_hkm: u64,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount_token: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::amount::deserialize_default")]
     pub min_shares: u64,
     #[serde(default)]
     pub nonce: u64,
@@ -188,10 +195,11 @@ pub struct AddLiquidityRequest {
 pub struct RemoveLiquidityRequest {
     pub token_id: String,
     pub provider: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub shares: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::amount::deserialize_default")]
     pub min_hkm: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::amount::deserialize_default")]
     pub min_token: u64,
     #[serde(default)]
     pub nonce: u64,
@@ -205,8 +213,9 @@ pub struct SwapRequest {
     pub trader: String,
     /// true = HKM in / token out; false = token in / HKM out.
     pub hkm_to_token: bool,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount_in: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::amount::deserialize_default")]
     pub min_out: u64,
     #[serde(default)]
     pub nonce: u64,
@@ -235,6 +244,7 @@ pub struct SwapQuoteResponse {
 #[derive(Deserialize)]
 pub struct FaucetRequest {
     pub to: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount: u64,
 }
 
@@ -262,6 +272,7 @@ pub struct DifficultyRequest {
 #[derive(Deserialize)]
 pub struct StakeRequest {
     pub address: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount: u64,
     pub public_key: Option<String>,
     pub vrf_public_key: Option<String>,
@@ -2798,7 +2809,7 @@ async fn receive_protocol_message(
                         message: "Gossiped transaction not applicable".to_string(),
                     });
                 }
-                pending.push(transaction);
+                pending.push(*transaction);
             }
 
             reward_peer(&state, &node_id).await;
@@ -2817,7 +2828,7 @@ async fn receive_protocol_message(
                 let governance = state.governance.lock().await;
                 governance.finality_depth
             };
-            match accept_peer_block(&state, block, finality_depth).await {
+            match accept_peer_block(&state, *block, finality_depth).await {
                 Ok(_) => {
                     reward_peer(&state, &node_id).await;
                     let mut metrics = state.metrics.lock().await;
@@ -3690,7 +3701,7 @@ mod tests {
 
         let envelope = P2PEnvelope::new(
             "node-b".to_string(),
-            P2PPayload::Transaction(tx.clone()),
+            P2PPayload::Transaction(Box::new(tx.clone())),
         );
         let response =
             receive_protocol_message(State(state.clone()), p2p_headers(), Json(envelope)).await;
@@ -3702,7 +3713,7 @@ mod tests {
         forged.id = "forged".to_string();
         forged.amount = 9999;
         let envelope =
-            P2PEnvelope::new("node-b".to_string(), P2PPayload::Transaction(forged));
+            P2PEnvelope::new("node-b".to_string(), P2PPayload::Transaction(Box::new(forged)));
         let response =
             receive_protocol_message(State(state.clone()), p2p_headers(), Json(envelope)).await;
         assert_eq!(response.0.status, "error");
@@ -3758,7 +3769,7 @@ mod tests {
             forged.id = format!("forged-{}", i);
             forged.nonce = 1;
             // no signature → verify_for_block fails → penalized
-            let envelope = P2PEnvelope::new("x".to_string(), P2PPayload::Transaction(forged))
+            let envelope = P2PEnvelope::new("x".to_string(), P2PPayload::Transaction(Box::new(forged)))
                 .signed(&attacker)
                 .unwrap();
             let node_id = envelope.node_id.clone();

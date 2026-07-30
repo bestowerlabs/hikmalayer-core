@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { useAuthenticatedApi } from "../hooks/useAuthenticatedApi";
 
-const CertificateManager = ({ onCertificateIssued }) => {
+const CertificateManager = ({ onUpdate }) => {
   const [formData, setFormData] = useState({
     id: "",
     issued_to: "",
@@ -80,8 +80,8 @@ const CertificateManager = ({ onCertificateIssued }) => {
           description: "",
         });
 
-        if (onCertificateIssued) {
-          onCertificateIssued();
+        if (onUpdate) {
+          onUpdate();
         }
       } else {
         setMessage(`Failed to issue certificate: ${result.message}`);

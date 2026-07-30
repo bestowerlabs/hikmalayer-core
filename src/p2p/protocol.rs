@@ -64,9 +64,13 @@ pub struct P2PEnvelope {
 pub enum P2PPayload {
     Ping,
     PeerAnnounce { address: String },
-    Block(Block),
+    /// `Block` and `Transaction` are boxed so the enum is pointer-sized
+    /// rather than as large as its biggest payload — otherwise every
+    /// envelope, including a bare `Ping`, carries that cost. Boxing is
+    /// invisible to serde, so the wire format is unchanged.
+    Block(Box<Block>),
     BlockBatch(Vec<Block>),
-    Transaction(Transaction),
+    Transaction(Box<Transaction>),
 }
 
 impl P2PEnvelope {

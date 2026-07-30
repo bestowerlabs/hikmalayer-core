@@ -13,13 +13,20 @@ import { safeText } from "../lib/sanitize";
 import OfflineSigner from "./OfflineSigner";
 import {
   HKM_DECIMALS,
+  applySlippage,
   formatUnits,
   parseUnits,
   poolPrice,
+  quoteAddLiquidity,
+  quoteRemoveLiquidity,
   shortId,
   signingCommands,
   signingMessages,
 } from "../lib/hts";
+
+/// A slippage bound of zero is no bound at all, so every floor is at least
+/// one base unit — the chain rejects a deposit that mints nothing anyway.
+const atLeastOne = (value) => (value > 1n ? value : 1n);
 
 /// Provide or withdraw liquidity in HKM<->token pools, and view LP positions.
 /// The first deposit into a pool sets its price; later deposits must match
@@ -34,6 +41,7 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
   const [amountHkm, setAmountHkm] = useState("");
   const [amountToken, setAmountToken] = useState("");
   const [shares, setShares] = useState("");
+  const [slippage, setSlippage] = useState(0.5);
   const [position, setPosition] = useState(null);
   const [nonce, setNonce] = useState(null);
   const [publicKey, setPublicKey] = useState("");
@@ -102,18 +110,41 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
     return (parsed.hkm * BigInt(pool.reserve_token)) / BigInt(pool.reserve_hkm);
   }, [pool, parsed.hkm]);
 
+  // What the chain will actually do with these inputs — same arithmetic,
+  // same rounding. The slippage bounds below are derived from it, so they
+  // bind against a real number rather than a placeholder.
+  const addQuote = useMemo(
+    () => quoteAddLiquidity(pool, parsed.hkm, parsed.token),
+    [pool, parsed.hkm, parsed.token]
+  );
+  const removeQuote = useMemo(
+    () => quoteRemoveLiquidity(pool, parsed.shares),
+    [pool, parsed.shares]
+  );
+
+  // The bounds the signature commits to. Without them a deposit or
+  // withdrawal can be sandwiched: an attacker moves the pool between signing
+  // and execution and keeps the difference.
+  const minShares = addQuote ? atLeastOne(applySlippage(addQuote.minted, slippage)) : 1n;
+  const minHkm = removeQuote
+    ? atLeastOne(applySlippage(removeQuote.amountHkm, slippage))
+    : 1n;
+  const minToken = removeQuote
+    ? atLeastOne(applySlippage(removeQuote.amountToken, slippage))
+    : 1n;
+
   const addParams = {
     tokenId,
     amountHkm: parsed.hkm.toString(),
     amountToken: parsed.token.toString(),
-    minShares: "1",
+    minShares: minShares.toString(),
     nonce: nonce ?? 0,
   };
   const removeParams = {
     tokenId,
     shares: parsed.shares.toString(),
-    minHkm: "1",
-    minToken: "1",
+    minHkm: minHkm.toString(),
+    minToken: minToken.toString(),
     nonce: nonce ?? 0,
   };
 
@@ -137,21 +168,25 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
         : { public_key: publicKey.trim(), signature: signature.trim() };
       const res =
         mode === "add"
+          // Amounts go on the wire as decimal strings. `Number()` would
+          // round anything past 2^53 base units, and since the signature
+          // covers the exact digits, a rounded value silently stops matching
+          // what the user authorized.
           ? await addLiquidity({
               token_id: tokenId,
               provider: account,
-              amount_hkm: Number(parsed.hkm),
-              amount_token: Number(parsed.token),
-              min_shares: 1,
+              amount_hkm: addParams.amountHkm,
+              amount_token: addParams.amountToken,
+              min_shares: addParams.minShares,
               nonce,
               ...signedBy,
             })
           : await removeLiquidity({
               token_id: tokenId,
               provider: account,
-              shares: Number(parsed.shares),
-              min_hkm: 1,
-              min_token: 1,
+              shares: removeParams.shares,
+              min_hkm: removeParams.minHkm,
+              min_token: removeParams.minToken,
               nonce,
               ...signedBy,
             });
@@ -308,6 +343,76 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
         )}
 
         {parsed.error && <p className="text-xs text-red-300 mt-2">{parsed.error}</p>}
+
+        {/* Slippage bounds travel inside the signed message, so the chain
+            rejects the transaction if the pool moved against the user before
+            it executed. Without them a deposit or withdrawal is free money
+            for anyone who can reorder it. */}
+        <div className="flex items-center gap-2 mt-3">
+          <label className="text-xs text-gray-400">Slippage tolerance</label>
+          {[0.1, 0.5, 1].map((v) => (
+            <button
+              key={v}
+              type="button"
+              onClick={() => setSlippage(v)}
+              className={`text-xs px-2 py-0.5 rounded-md border transition ${
+                slippage === v
+                  ? "bg-purple-500/30 border-purple-400/50 text-purple-100"
+                  : "bg-white/5 border-white/10 text-gray-300 hover:bg-white/10"
+              }`}
+            >
+              {v}%
+            </button>
+          ))}
+        </div>
+
+        {mode === "add" && addQuote && (
+          <div className="rounded-lg bg-black/20 border border-white/10 p-3 text-xs space-y-1 mt-2">
+            <div className="flex justify-between text-gray-300">
+              <span>Deposits</span>
+              <span className="text-white">
+                {formatUnits(addQuote.useHkm, HKM_DECIMALS)} HKM +{" "}
+                {formatUnits(addQuote.useToken, tokenDecimals)}{" "}
+                {safeText(asset?.symbol, 12)}
+              </span>
+            </div>
+            <div className="flex justify-between text-gray-300">
+              <span>LP shares minted</span>
+              <span className="text-white">{addQuote.minted.toString()}</span>
+            </div>
+            <div className="flex justify-between text-gray-300">
+              <span>Minimum accepted</span>
+              <span className="text-white">{minShares.toString()} shares</span>
+            </div>
+            {(addQuote.useHkm !== parsed.hkm || addQuote.useToken !== parsed.token) && (
+              <p className="text-amber-300 pt-1">
+                The pool ratio binds on one side — the remainder stays in your
+                account.
+              </p>
+            )}
+          </div>
+        )}
+
+        {mode === "remove" && removeQuote && (
+          <div className="rounded-lg bg-black/20 border border-white/10 p-3 text-xs space-y-1 mt-2">
+            <div className="flex justify-between text-gray-300">
+              <span>You receive</span>
+              <span className="text-white">
+                {formatUnits(removeQuote.amountHkm, HKM_DECIMALS)} HKM +{" "}
+                {formatUnits(removeQuote.amountToken, tokenDecimals)}{" "}
+                {safeText(asset?.symbol, 12)}
+              </span>
+            </div>
+            <div className="flex justify-between text-gray-300">
+              <span>Minimum accepted</span>
+              <span className="text-white">
+                {formatUnits(minHkm, HKM_DECIMALS)} HKM +{" "}
+                {formatUnits(minToken, tokenDecimals)}{" "}
+                {safeText(asset?.symbol, 12)}
+              </span>
+            </div>
+          </div>
+        )}
 
         {!account && (
           <p className="text-xs text-amber-300 mt-3">

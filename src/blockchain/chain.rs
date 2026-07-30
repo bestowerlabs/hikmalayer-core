@@ -246,7 +246,7 @@ impl Blockchain {
     /// RETARGET_INTERVAL blocks' timestamps (excluding genesis when rooted at
     /// it). `blocks` is the prefix ending at the just-produced block.
     fn retarget(blocks: &[Block], produced_abs: u64, base_height: u64, current: usize) -> usize {
-        if (produced_abs + 1) % RETARGET_INTERVAL != 0 {
+        if !(produced_abs + 1).is_multiple_of(RETARGET_INTERVAL) {
             return current;
         }
         let mut start = blocks.len().saturating_sub(RETARGET_INTERVAL as usize);
@@ -271,7 +271,7 @@ impl Blockchain {
         checkpoint: CheckpointRoot,
         forward_blocks: Vec<Block>,
     ) -> Result<Self, String> {
-        if anchor.index % RETARGET_INTERVAL != 0 {
+        if !anchor.index.is_multiple_of(RETARGET_INTERVAL) {
             return Err("Checkpoint anchor must sit on a retarget boundary".to_string());
         }
         if anchor.state_root != checkpoint.state.state_root() {
@@ -877,7 +877,7 @@ impl Blockchain {
     /// Export a checkpoint bundle at the current tip so another node can
     /// fast-sync from here (the tip must be a retarget boundary).
     pub fn export_checkpoint(&self) -> Result<(Block, CheckpointRoot), String> {
-        if self.tip_index() == 0 || self.tip_index() % RETARGET_INTERVAL != 0 {
+        if self.tip_index() == 0 || !self.tip_index().is_multiple_of(RETARGET_INTERVAL) {
             return Err(format!(
                 "Checkpoints can only be exported when the tip height is a positive multiple of {}",
                 RETARGET_INTERVAL

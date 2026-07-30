@@ -1,7 +1,6 @@
 // src/hooks/useAuthenticatedApi.js
 import { useWallet } from "./useWallet";
-
-const API_BASE = "http://127.0.0.1:3000";
+import { API_BASE } from "../api";
 
 export const useAuthenticatedApi = () => {
   const { getAuthHeaders, isConnected, account } = useWallet();

@@ -3347,8 +3347,8 @@ mod tests {
         let response = transfer_tokens(
             State(state),
             Json(TokenTransferRequest {
-                from: "hkmnobody".to_string(),
-                to: "hkmsomeone".to_string(),
+                from: "hkm063456789abcdef0123456789abcdef012345678".to_string(),
+                to: "hkm02789abcdef0123456789abcdef0123456789abc".to_string(),
                 amount: 10,
                 nonce: 1,
                 public_key: None,
@@ -3370,31 +3370,31 @@ mod tests {
         let t = treasury_key();
         let from = (t.address.clone(), t.public_key.clone(), t.private_key.clone());
 
-        let response = signed_transfer_request(&state, &from, "hkmrecipient", 40).await;
+        let response = signed_transfer_request(&state, &from, "hkm010123456789abcdef0123456789abcdef012345", 40).await;
         assert_eq!(response.0.status, "success", "{}", response.0.message);
 
         // Balance is unchanged until the transfer is mined.
-        let balance = get_token_balance(State(state.clone()), Path("hkmrecipient".to_string()))
+        let balance = get_token_balance(State(state.clone()), Path("hkm010123456789abcdef0123456789abcdef012345".to_string()))
             .await
             .0
             .balance;
         assert_eq!(balance, 0);
 
         mine_next(&state, &base_keyring()).await;
-        let balance = get_token_balance(State(state.clone()), Path("hkmrecipient".to_string()))
+        let balance = get_token_balance(State(state.clone()), Path("hkm010123456789abcdef0123456789abcdef012345".to_string()))
             .await
             .0
             .balance;
         assert_eq!(balance, 40);
 
         // Replaying the identical signed payload (same nonce) is rejected.
-        let message = Transaction::transfer_signing_message(&from.0, "hkmrecipient", 40, 1);
+        let message = Transaction::transfer_signing_message(&from.0, "hkm010123456789abcdef0123456789abcdef012345", 40, 1);
         let signature = pos::sign_message(&message, &from.2).unwrap();
         let replay = transfer_tokens(
             State(state.clone()),
             Json(TokenTransferRequest {
                 from: from.0.clone(),
-                to: "hkmrecipient".to_string(),
+                to: "hkm010123456789abcdef0123456789abcdef012345".to_string(),
                 amount: 40,
                 nonce: 1,
                 public_key: Some(from.1.clone()),
@@ -3412,13 +3412,13 @@ mod tests {
         let attacker = test_wallet(12);
         let (victim, ..) = test_wallet(13);
 
-        let message = Transaction::transfer_signing_message(&victim, "hkmattacker", 40, 1);
+        let message = Transaction::transfer_signing_message(&victim, "hkm03ef0123456789abcdef0123456789abcdef0123", 40, 1);
         let signature = pos::sign_message(&message, &attacker.2).unwrap();
         let response = transfer_tokens(
             State(state),
             Json(TokenTransferRequest {
                 from: victim,
-                to: "hkmattacker".to_string(),
+                to: "hkm03ef0123456789abcdef0123456789abcdef0123".to_string(),
                 amount: 40,
                 nonce: 1,
                 public_key: Some(attacker.1),
@@ -3592,7 +3592,7 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Json(FaucetRequest {
-                to: "hkmuser".to_string(),
+                to: "hkm0456789abcdef0123456789abcdef0123456789a".to_string(),
                 amount: 10,
             }),
         )
@@ -3603,7 +3603,7 @@ mod tests {
             State(state.clone()),
             admin_headers(),
             Json(FaucetRequest {
-                to: "hkmuser".to_string(),
+                to: "hkm0456789abcdef0123456789abcdef0123456789a".to_string(),
                 amount: 10,
             }),
         )
@@ -3611,7 +3611,7 @@ mod tests {
         assert_eq!(response.0.status, "success", "{}", response.0.message);
 
         mine_next(&state, &base_keyring()).await;
-        let balance = get_token_balance(State(state.clone()), Path("hkmuser".to_string()))
+        let balance = get_token_balance(State(state.clone()), Path("hkm0456789abcdef0123456789abcdef0123456789a".to_string()))
             .await
             .0
             .balance;
@@ -3624,7 +3624,7 @@ mod tests {
             State(no_treasury),
             admin_headers(),
             Json(FaucetRequest {
-                to: "hkmuser".to_string(),
+                to: "hkm0456789abcdef0123456789abcdef0123456789a".to_string(),
                 amount: 10,
             }),
         )
@@ -3689,14 +3689,14 @@ mod tests {
         let nonce = 1;
         let mut tx = Transaction::new(
             Some(t.address.clone()),
-            "hkmrecipient".to_string(),
+            "hkm010123456789abcdef0123456789abcdef012345".to_string(),
             25,
             TransactionType::Transfer,
         );
         tx.nonce = nonce;
         tx.public_key = Some(t.public_key.clone());
         let message =
-            Transaction::transfer_signing_message(&t.address, "hkmrecipient", 25, nonce);
+            Transaction::transfer_signing_message(&t.address, "hkm010123456789abcdef0123456789abcdef012345", 25, nonce);
         tx.signature = Some(pos::sign_message(&message, &t.private_key).unwrap());
 
         let envelope = P2PEnvelope::new(
@@ -3726,7 +3726,7 @@ mod tests {
         assert_eq!(fees.base_fee, crate::blockchain::state::TX_FEE);
         assert_eq!(fees.target_txs, crate::blockchain::state::BASE_FEE_TARGET_TXS);
 
-        let nonce = get_account_nonce(State(state.clone()), Path("hkmx".to_string()))
+        let nonce = get_account_nonce(State(state.clone()), Path("hkm07abcdef0123456789abcdef0123456789abcdef".to_string()))
             .await
             .0;
         assert_eq!(nonce.base_fee, crate::blockchain::state::TX_FEE);
@@ -3761,8 +3761,8 @@ mod tests {
         // the same signed node identity trip the ban threshold.
         for i in 0..3 {
             let mut forged = Transaction::new(
-                Some("hkmnobody".to_string()),
-                "hkmsink".to_string(),
+                Some("hkm063456789abcdef0123456789abcdef012345678".to_string()),
+                "hkm05cdef0123456789abcdef0123456789abcdef01".to_string(),
                 9_999_999,
                 TransactionType::Transfer,
             );
@@ -3802,7 +3802,7 @@ mod tests {
             for i in 0..MAX_PENDING_TXS {
                 let mut filler = Transaction::new(
                     Some("hkmfiller".to_string()),
-                    "hkmsink".to_string(),
+                    "hkm05cdef0123456789abcdef0123456789abcdef01".to_string(),
                     1,
                     TransactionType::Transfer,
                 );
@@ -3812,13 +3812,13 @@ mod tests {
         }
         let t = treasury_key();
         let from = (t.address.clone(), t.public_key.clone(), t.private_key.clone());
-        let message = Transaction::transfer_signing_message(&from.0, "hkmx", 1, 1);
+        let message = Transaction::transfer_signing_message(&from.0, "hkm07abcdef0123456789abcdef0123456789abcdef", 1, 1);
         let signature = pos::sign_message(&message, &from.2).unwrap();
         let response = transfer_tokens(
             State(state.clone()),
             Json(TokenTransferRequest {
                 from: from.0.clone(),
-                to: "hkmx".to_string(),
+                to: "hkm07abcdef0123456789abcdef0123456789abcdef".to_string(),
                 amount: 1,
                 nonce: 1,
                 public_key: Some(from.1.clone()),

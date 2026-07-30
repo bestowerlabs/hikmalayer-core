@@ -1,0 +1,19 @@
+# Lint configuration for docs/openapi.yaml.
+#
+#   npx @redocly/cli lint          # uses the api declared below
+#   npx @redocly/cli preview-docs  # browsable reference
+
+apis:
+  hikmalayer:
+    root: docs/openapi.yaml
+
+extends:
+  - recommended
+
+rules:
+  # This API reports domain failures with HTTP 200 and {"status":"error"} —
+  # documented in the spec's description and handled by the SDK. Requiring a
+  # 4xx response on every operation would mean documenting responses the node
+  # does not send. Genuine 4xx cases (missing admin/p2p tokens) ARE declared
+  # where they occur.
+  operation-4xx-response: off

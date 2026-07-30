@@ -1,0 +1,25 @@
+{
+  "name": "@hikmalayer/sdk",
+  "version": "0.1.0",
+  "description": "Client library for the Hikmalayer blockchain: keys, native signing, transactions, tokens and the AMM DEX.",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./units": "./src/units.js",
+    "./messages": "./src/messages.js"
+  },
+  "files": ["src", "README.md"],
+  "scripts": {
+    "test": "node --test test/",
+    "test:integration": "HIKMALAYER_NODE=${HIKMALAYER_NODE:-http://127.0.0.1:3000} node --test test/integration/"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.9.1",
+    "@noble/hashes": "^1.8.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

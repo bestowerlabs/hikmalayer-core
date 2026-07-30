@@ -29,6 +29,19 @@ pub const AMM_POOL_ACCOUNT: &str = "__amm_pool__";
 /// first-depositor share-inflation attack (Uniswap-v2's MINIMUM_LIQUIDITY).
 pub const MINIMUM_LIQUIDITY: u64 = 1_000;
 
+/// Is this a well-formed native address (`hkm` + 40 lowercase hex)?
+///
+/// Balances are keyed by string, so without this check a recipient of
+/// `"hkm13320…"` with one character wrong is simply a different account —
+/// one nobody holds the key to. The transfer succeeds, the balance exists,
+/// and the funds are gone. There is no checksum to catch it later and no way
+/// to reverse it, so the only place to stop it is here.
+pub fn is_valid_address(value: &str) -> bool {
+    value.len() == 43
+        && value.starts_with("hkm")
+        && value[3..].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
 /// Integer square root (floor) for u128 — used to size initial LP shares as
 /// sqrt(hkm * token), keeping the first provider's shares independent of the
 /// pool's price.
@@ -409,6 +422,12 @@ impl ChainState {
                     .from
                     .as_ref()
                     .ok_or_else(|| "Transfer missing sender".to_string())?;
+                if !is_valid_address(&tx.to) {
+                    return Err(format!(
+                        "Transfer recipient '{}' is not a valid hkm address",
+                        tx.to
+                    ));
+                }
                 self.consume_nonce(from, tx.nonce)?;
                 let fee = self.base_fee;
                 self.debit(from, tx.amount + fee)?;
@@ -533,6 +552,12 @@ impl ChainState {
                 if duration == 0 || cliff > duration {
                     return Err("Invalid vesting schedule".to_string());
                 }
+                if !is_valid_address(&tx.to) {
+                    return Err(format!(
+                        "Vest beneficiary '{}' is not a valid hkm address",
+                        tx.to
+                    ));
+                }
                 self.consume_nonce(from, tx.nonce)?;
                 let fee = self.base_fee;
                 self.debit(from, tx.amount + fee)?;
@@ -602,6 +627,12 @@ impl ChainState {
                     .ok_or_else(|| "TokenTransfer missing token action".to_string())?;
                 if !self.tokens.contains_key(&action.token_id) {
                     return Err(format!("Unknown token {}", action.token_id));
+                }
+                if !is_valid_address(&tx.to) {
+                    return Err(format!(
+                        "TokenTransfer recipient '{}' is not a valid hkm address",
+                        tx.to
+                    ));
                 }
                 self.consume_nonce(from, tx.nonce)?;
                 let fee = self.base_fee;
@@ -1070,11 +1101,72 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_well_formed_addresses() {
+        let (address, ..) = wallet(1);
+        assert!(is_valid_address(&address));
+        // Wrong length, wrong prefix, non-hex, and uppercase hex (which would
+        // let one key have two spellings) are all refused.
+        assert!(!is_valid_address(""));
+        assert!(!is_valid_address("hkm"));
+        assert!(!is_valid_address(&address[..42]));
+        assert!(!is_valid_address(&format!("{}0", address)));
+        assert!(!is_valid_address(&address.replace("hkm", "abc")));
+        assert!(!is_valid_address(&address.to_uppercase()));
+        assert!(!is_valid_address(&format!("hkm{}", "z".repeat(40))));
+        assert!(!is_valid_address("typo-address"));
+        // Internal pool accounts are not addressable by users either.
+        assert!(!is_valid_address(STAKING_POOL_ACCOUNT));
+        assert!(!is_valid_address(AMM_POOL_ACCOUNT));
+    }
+
+    /// Balances are keyed by string, so an unvalidated recipient means a
+    /// mistyped address is simply a different account — one nobody can spend
+    /// from. The transfer would "succeed" and the funds would be gone.
+    #[test]
+    fn transfer_to_a_malformed_address_is_rejected() {
+        let (mut state, treasury, _, _) = genesis_state();
+        for bad in ["typo-address", "", "hkmshort", STAKING_POOL_ACCOUNT] {
+            let mut tx = Transaction::new(
+                Some(treasury.clone()),
+                bad.to_string(),
+                100,
+                TransactionType::Transfer,
+            );
+            tx.nonce = 1;
+            let sender_before = state.balance_of(&treasury);
+            let target_before = state.balance_of(bad);
+            assert!(
+                state.apply_transaction(&tx, 1).is_err(),
+                "accepted a transfer to {bad:?}"
+            );
+            // Rejected cleanly: nothing moved, and no nonce was consumed.
+            assert_eq!(state.balance_of(&treasury), sender_before);
+            assert_eq!(state.balance_of(bad), target_before);
+        }
+    }
+
+    #[test]
+    fn vesting_to_a_malformed_beneficiary_is_rejected() {
+        let (mut state, treasury, _, _) = genesis_state();
+        let mut vest = Transaction::new(
+            Some(treasury),
+            "not-an-address".to_string(),
+            1_000,
+            TransactionType::Vest,
+        );
+        vest.nonce = 1;
+        vest.vesting_cliff_blocks = Some(10);
+        vest.vesting_duration_blocks = Some(100);
+        assert!(state.apply_transaction(&vest, 1).is_err());
+        assert_eq!(state.balance_of(VESTING_POOL_ACCOUNT), 0);
+    }
+
+    #[test]
     fn state_root_is_deterministic_and_sensitive() {
         let (state_a, ..) = genesis_state();
         let (mut state_b, ..) = genesis_state();
         assert_eq!(state_a.state_root(), state_b.state_root());
-        state_b.credit("hkmsomeone", 1);
+        state_b.credit("hkm02789abcdef0123456789abcdef0123456789abc", 1);
         assert_ne!(state_a.state_root(), state_b.state_root());
     }
 
@@ -1083,13 +1175,13 @@ mod tests {
         let (mut state, treasury, _, _) = genesis_state();
         let mut tx = Transaction::new(
             Some(treasury.clone()),
-            "hkmrecipient".to_string(),
+            "hkm010123456789abcdef0123456789abcdef012345".to_string(),
             100,
             TransactionType::Transfer,
         );
         tx.nonce = 1;
         state.apply_transaction(&tx, 1).unwrap();
-        assert_eq!(state.balance_of("hkmrecipient"), 100);
+        assert_eq!(state.balance_of("hkm010123456789abcdef0123456789abcdef012345"), 100);
         assert_eq!(state.nonce_of(&treasury), 1);
 
         // Same nonce cannot apply twice.
@@ -1102,7 +1194,7 @@ mod tests {
         let (poor, ..) = wallet(9);
         let mut tx = Transaction::new(
             Some(poor),
-            "hkmrecipient".to_string(),
+            "hkm010123456789abcdef0123456789abcdef012345".to_string(),
             1,
             TransactionType::Transfer,
         );
@@ -1300,7 +1392,7 @@ mod tests {
     #[test]
     fn vesting_releases_after_cliff_then_linearly() {
         let (mut state, treasury, _, _) = genesis_state();
-        let recipient = "hkmteammember".to_string();
+        let (recipient, _, _) = wallet(9);
         let total = 1_000_000 * UNITS_PER_HKM; // 1M HKM lockup
 
         // Vest at height 10: cliff 100 blocks, full vest over 400 blocks.
@@ -1592,7 +1684,7 @@ mod tests {
         // Transfer against a token that does not exist.
         let mut send = Transaction::new(
             Some(treasury.clone()),
-            "hkmsomeone".to_string(),
+            "hkm02789abcdef0123456789abcdef0123456789abc".to_string(),
             1,
             TransactionType::TokenTransfer,
         );
@@ -1622,7 +1714,7 @@ mod tests {
 
         let mut overspend = Transaction::new(
             Some(treasury.clone()),
-            "hkmsomeone".to_string(),
+            "hkm02789abcdef0123456789abcdef0123456789abc".to_string(),
             101,
             TransactionType::TokenTransfer,
         );
@@ -1642,7 +1734,7 @@ mod tests {
         // Cliff beyond duration: rejected.
         let mut bad = Transaction::new(
             Some(treasury.clone()),
-            "hkmsomeone".to_string(),
+            "hkm02789abcdef0123456789abcdef0123456789abc".to_string(),
             100 * UNITS_PER_HKM,
             TransactionType::Vest,
         );
@@ -1655,7 +1747,7 @@ mod tests {
         let (pauper, ..) = wallet(9);
         let mut broke = Transaction::new(
             Some(pauper),
-            "hkmsomeone".to_string(),
+            "hkm02789abcdef0123456789abcdef0123456789abc".to_string(),
             100 * UNITS_PER_HKM,
             TransactionType::Vest,
         );
@@ -1767,7 +1859,7 @@ mod tests {
         let (mut state, treasury, _, _) = genesis_state();
         let mut tx = Transaction::new(
             Some(treasury.clone()),
-            "hkmrecipient".to_string(),
+            "hkm010123456789abcdef0123456789abcdef012345".to_string(),
             100,
             TransactionType::Transfer,
         );

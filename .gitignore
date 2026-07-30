@@ -17,3 +17,6 @@ data/
 
 # Extension build output (node_modules is already ignored above)
 extension/dist/
+
+# Devnet working directory (ops/devnet.sh)
+.devnet/

@@ -3,7 +3,7 @@ import { getAccountNonce, getTokenBalance, transferTokens } from "../api";
 import { useWallet } from "../hooks/useWallet";
 import { useActiveSigner } from "../hooks/useActiveSigner";
 import OfflineSigner from "./OfflineSigner";
-import { HKM_DECIMALS, formatUnits, parseUnits } from "../lib/hts";
+import { HKM_DECIMALS, formatUnits, getActiveChainId, parseUnits, scoped } from "../lib/hts";
 
 /// Send the native coin.
 ///
@@ -66,9 +66,12 @@ const TokenManager = ({ refreshTrigger, onUpdate }) => {
     }
   }, [amount]);
 
-  const canonicalMessage =
+  // Scoped to this network, exactly as the node will reconstruct it.
+  const canonicalMessage = scoped(
+    getActiveChainId() ?? "<network>",
     `hikmalayer-transfer:${account || "<from>"}:${to.trim() || "<to>"}` +
-    `:${parsed.units}:${nonce ?? "<nonce>"}`;
+      `:${parsed.units}:${nonce ?? "<nonce>"}`
+  );
 
   const signingCommand =
     `hikma-wallet sign-transfer ${account || "<from>"} ${to.trim() || "<to>"} ` +

@@ -445,6 +445,8 @@ pub struct NonceStateResponse {
 
 #[derive(Serialize)]
 pub struct StateSummaryResponse {
+    /// The network these transactions must be signed for.
+    pub chain_id: String,
     pub height: u64,
     pub state_root: String,
     pub total_supply: u64,
@@ -617,10 +619,24 @@ fn project_pending_state(
 /// Validate and queue a transaction into the pending pool, then gossip it.
 /// The transaction must be statelessly valid AND apply cleanly on top of the
 /// chain state plus everything already queued.
-async fn queue_transaction(state: &AppState, tx: Transaction) -> Result<(), String> {
+async fn queue_transaction(state: &AppState, mut tx: Transaction) -> Result<(), String> {
     if tx.transaction_type == TransactionType::Reward {
         return Err("Reward transactions cannot be submitted".to_string());
     }
+
+    // Stamp THIS node's network onto the transaction before verifying.
+    //
+    // The chain id is part of the signed message, so a client that signed for
+    // a different network simply fails verification below — there is nothing
+    // to trust in a client-supplied chain id, and nothing to check, because
+    // the only value that can produce a valid signature here is this one. It
+    // is what stops a transaction signed while testing from being replayed
+    // against real funds.
+    tx.chain_id = {
+        let chain = state.chain.lock().await;
+        chain.state.chain_id.clone()
+    };
+
     tx.verify_for_block("__queue__")
         .map_err(|err| format!("Invalid transaction: {}", err))?;
 
@@ -1059,8 +1075,20 @@ async fn faucet_tokens(
         projected.nonce_of(&treasury.address) + 1
     };
 
-    let message =
-        Transaction::transfer_signing_message(&treasury.address, &payload.to, payload.amount, nonce);
+    // Scoped to this node's network, exactly as any other client would.
+    let chain_id = {
+        let chain = state.chain.lock().await;
+        chain.state.chain_id.clone()
+    };
+    let message = Transaction::scoped_signing_message(
+        &chain_id,
+        &Transaction::transfer_signing_message(
+            &treasury.address,
+            &payload.to,
+            payload.amount,
+            nonce,
+        ),
+    );
     let signature = match pos::sign_message(&message, &treasury.private_key) {
         Ok(value) => value,
         Err(err) => {
@@ -1184,6 +1212,7 @@ async fn get_state_summary(State(state): State<AppState>) -> Json<StateSummaryRe
         .state
         .balance_of(crate::blockchain::state::STAKING_POOL_ACCOUNT);
     Json(StateSummaryResponse {
+        chain_id: chain.state.chain_id.clone(),
         height: chain.tip_index(),
         state_root: chain.state.state_root(),
         total_supply: chain.state.total_supply,
@@ -1340,10 +1369,18 @@ fn plan_block(
     pending: &[Transaction],
     producer: Option<&str>,
 ) -> Result<BlockPlan, String> {
-    let has_only_genesis = chain.blocks.len() == 1;
-    if pending.is_empty() && !has_only_genesis {
-        return Err("No pending transactions to mine".to_string());
-    }
+    // Empty blocks ARE produced.
+    //
+    // Refusing them would tie block height to user traffic, and height is
+    // what drives the chain's clock: the emission schedule is defined per
+    // height (a halving every 9,500,000 blocks assumes ~15s blocks, not
+    // "whenever someone transacts"), vesting releases per block, unbonding
+    // completes per block, and the slashing window is measured in blocks. On
+    // a quiet chain none of that would advance — locked funds would never
+    // release and emission would silently fall behind schedule.
+    //
+    // Producing a reward-only block also keeps the validator's incentive
+    // aligned: there is always a reason to build the next block.
 
     let next_index = chain.next_index();
     // Slot seeds come from the VRF randomness beacon: unbiasable by grinding.
@@ -3280,7 +3317,13 @@ mod tests {
             .0
             .next_nonce;
         let message = Transaction::transfer_signing_message(&from.0, to, amount, nonce);
-        let signature = pos::sign_message(&message, &from.2).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &from.2,
+        ).unwrap();
         transfer_tokens(
             State(state.clone()),
             Json(TokenTransferRequest {
@@ -3320,7 +3363,13 @@ mod tests {
         let vrf_public_key = vrf::derive_vrf_public_key(&private_key).unwrap();
         let message =
             Transaction::stake_signing_message(&address, stake, nonce, &vrf_public_key);
-        let signature = pos::sign_message(&message, &private_key).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &private_key,
+        ).unwrap();
         let response = stake_tokens(
             State(state.clone()),
             Json(StakeRequest {
@@ -3389,7 +3438,13 @@ mod tests {
 
         // Replaying the identical signed payload (same nonce) is rejected.
         let message = Transaction::transfer_signing_message(&from.0, "hkm010123456789abcdef0123456789abcdef012345", 40, 1);
-        let signature = pos::sign_message(&message, &from.2).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &from.2,
+        ).unwrap();
         let replay = transfer_tokens(
             State(state.clone()),
             Json(TokenTransferRequest {
@@ -3413,7 +3468,13 @@ mod tests {
         let (victim, ..) = test_wallet(13);
 
         let message = Transaction::transfer_signing_message(&victim, "hkm03ef0123456789abcdef0123456789abcdef0123", 40, 1);
-        let signature = pos::sign_message(&message, &attacker.2).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &attacker.2,
+        ).unwrap();
         let response = transfer_tokens(
             State(state),
             Json(TokenTransferRequest {
@@ -3459,7 +3520,13 @@ mod tests {
             .0
             .next_nonce;
         let message = Transaction::withdraw_signing_message(&address, stake, nonce);
-        let signature = pos::sign_message(&message, &private_key).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &private_key,
+        ).unwrap();
         let response = withdraw_stake(
             State(state.clone()),
             Json(StakeRequest {
@@ -3697,7 +3764,14 @@ mod tests {
         tx.public_key = Some(t.public_key.clone());
         let message =
             Transaction::transfer_signing_message(&t.address, "hkm010123456789abcdef0123456789abcdef012345", 25, nonce);
-        tx.signature = Some(pos::sign_message(&message, &t.private_key).unwrap());
+tx.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
+                tx.signature = Some(pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &t.private_key,
+        ).unwrap());
 
         let envelope = P2PEnvelope::new(
             "node-b".to_string(),
@@ -3813,7 +3887,13 @@ mod tests {
         let t = treasury_key();
         let from = (t.address.clone(), t.public_key.clone(), t.private_key.clone());
         let message = Transaction::transfer_signing_message(&from.0, "hkm07abcdef0123456789abcdef0123456789abcdef", 1, 1);
-        let signature = pos::sign_message(&message, &from.2).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &from.2,
+        ).unwrap();
         let response = transfer_tokens(
             State(state.clone()),
             Json(TokenTransferRequest {
@@ -3860,7 +3940,13 @@ mod tests {
             revoke: false,
         };
         let message = Transaction::credential_signing_message(&action, 1);
-        let signature = pos::sign_message(&message, &issuer.2).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &issuer.2,
+        ).unwrap();
         let response = issue_credential(
             State(state.clone()),
             Json(CredentialWriteRequest {
@@ -3900,7 +3986,13 @@ mod tests {
             revoke: true,
         };
         let message = Transaction::credential_signing_message(&revoke_action, 1);
-        let signature = pos::sign_message(&message, &stranger.2).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &stranger.2,
+        ).unwrap();
         let response = revoke_credential(
             State(state.clone()),
             Json(CredentialWriteRequest {
@@ -3919,7 +4011,13 @@ mod tests {
 
         // The real issuer revokes (nonce 2).
         let message = Transaction::credential_signing_message(&revoke_action, 2);
-        let signature = pos::sign_message(&message, &issuer.2).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &issuer.2,
+        ).unwrap();
         let response = revoke_credential(
             State(state.clone()),
             Json(CredentialWriteRequest {

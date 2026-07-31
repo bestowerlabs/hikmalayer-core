@@ -23,6 +23,9 @@ DATA_DIR="${DATA_DIR:-$ROOT/.devnet}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-devadmin}"
 P2P_TOKEN="${P2P_TOKEN:-devp2p}"
 BLOCK_SECONDS="${BLOCK_SECONDS:-5}"
+# Every signature is bound to this network id, so a transaction signed here
+# can never be replayed against a testnet or mainnet.
+CHAIN_ID="${CHAIN_ID:-hikmalayer-devnet}"
 KEEP_STATE="${KEEP_STATE:-0}"
 # Origins the dashboard may be served from during development.
 CORS="${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173}"
@@ -44,10 +47,10 @@ fi
 DEVNET_KEY="${DEVNET_KEY:-80f91adc283392febbfc86b7327c055b8559373459040e07e78640e3ac592517}"
 
 keyinfo() { ./target/release/hikma-wallet address "$1"; }
-derived=$(./target/release/hikma-wallet sign-transfer a b 1 0 "$DEVNET_KEY")
+derived=$(HIKMALAYER_CHAIN_ID="$CHAIN_ID" ./target/release/hikma-wallet sign-transfer a b 1 0 "$DEVNET_KEY")
 PUBLIC_KEY=$(awk '/public_key:/{print $2}' <<<"$derived")
 ADDRESS=$(./target/release/hikma-wallet address "$PUBLIC_KEY" | awk '/address:/{print $2}')
-VRF_KEY=$(./target/release/hikma-wallet sign-stake "$ADDRESS" 1 0 "$DEVNET_KEY" \
+VRF_KEY=$(HIKMALAYER_CHAIN_ID="$CHAIN_ID" ./target/release/hikma-wallet sign-stake "$ADDRESS" 1 0 "$DEVNET_KEY" \
           | awk '/vrf_public_key:/{print $2}')
 
 # ---------------------------------------------------------------- state
@@ -73,6 +76,7 @@ TREASURY_PRIVATE_KEY="$DEVNET_KEY" \
 GENESIS_TREASURY_ADDRESS="$ADDRESS" \
 GENESIS_VALIDATOR_PUBLIC_KEY="$PUBLIC_KEY" \
 GENESIS_VALIDATOR_VRF_PUBLIC_KEY="$VRF_KEY" \
+GENESIS_CHAIN_ID="$CHAIN_ID" \
 ADMIN_TOKEN="$ADMIN_TOKEN" \
 P2P_TOKEN="$P2P_TOKEN" \
 CORS_ALLOWED_ORIGINS="$CORS" \
@@ -118,6 +122,7 @@ cat <<INFO
 $(say "Hikmalayer devnet is up.")
 
   RPC            http://127.0.0.1:$PORT
+  Network        $CHAIN_ID  (every signature is bound to this)
   Admin token    $ADMIN_TOKEN
   Treasury       $ADDRESS
   Balance        $BALANCE base units  (1 HKM = 1,000,000)

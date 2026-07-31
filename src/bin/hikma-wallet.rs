@@ -21,6 +21,7 @@
 //!   hikma-wallet sign-credential <id> <subject> <data_hash> <revoke> <nonce> <private_key_hex>
 
 use hikmalayer::blockchain::transaction::{CredentialAction, Transaction};
+use hikmalayer::blockchain::state::DEFAULT_CHAIN_ID;
 use hikmalayer::consensus::{pos, vrf};
 use rand::RngCore;
 use secp256k1::SecretKey;
@@ -50,9 +51,21 @@ fn keygen() -> Result<(), String> {
     Ok(())
 }
 
+/// Sign a canonical message, scoped to a network.
+///
+/// The network comes from `HIKMALAYER_CHAIN_ID` (default the dev network).
+/// It is part of what gets signed, so a signature produced for one network
+/// is inert on every other — set it to match the chain you are signing for,
+/// or the node will reject the signature.
 fn sign_and_print(message: &str, private_key: &str) -> Result<(), String> {
+    let chain_id = std::env::var("HIKMALAYER_CHAIN_ID")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_CHAIN_ID.to_string());
+    let message = &Transaction::scoped_signing_message(&chain_id, message);
     let public_key = pos::derive_public_key(private_key)?;
     let signature = pos::sign_message(message, private_key)?;
+    println!("chain_id:   {}", chain_id);
     println!("message:    {}", message);
     println!("public_key: {}", public_key);
     println!("signature:  {}", signature);

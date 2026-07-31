@@ -159,6 +159,12 @@ export const removeLiquidity = async (data) => {
   return api.post("/dex/remove", data);
 };
 
+/// The network this node is on. Every signature must be scoped to it.
+export const getChainId = async () => {
+  const res = await api.get("/blockchain/state");
+  return res.data?.chain_id ?? null;
+};
+
 export const getAccountNonce = async (account) => {
   return api.get(`/tokens/nonce/${encodeURIComponent(account)}`);
 };

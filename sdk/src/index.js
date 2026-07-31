@@ -42,4 +42,5 @@ export {
   ADDRESS_PREFIX,
   MESSAGE_PREFIX,
   messages,
+  scoped,
 } from "./messages.js";

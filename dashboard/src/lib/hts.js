@@ -212,9 +212,42 @@ export const signingCommands = {
     `hikma-wallet sign-token-burn ${q(tokenId)} ${amount} ${nonce} <PRIVATE_KEY>`,
 };
 
+/// Bind a canonical message to a network. Mirrors
+/// `Transaction::scoped_signing_message` in the node: a signature made for
+/// one network must be inert on every other, and keeping the network visible
+/// in the message means the wallet's confirmation screen names it too.
+export const scoped = (chainId, message) => `${chainId}:${message}`;
+
+// The network this page is signing for.
+//
+// It is module state rather than a parameter threaded through every panel
+// because there is exactly one node per page load — and because a parameter
+// that can be forgotten at one of a dozen call sites is a parameter that
+// eventually will be. Unset means signing throws rather than producing a
+// signature scoped to nothing.
+let activeChainId = null;
+
+/// Set once, when the dashboard learns which node it is talking to.
+export function setActiveChainId(chainId) {
+  activeChainId = chainId || null;
+}
+
+export function getActiveChainId() {
+  return activeChainId;
+}
+
+function requireChainId() {
+  if (!activeChainId) {
+    throw new Error(
+      "The network is not known yet — cannot sign. Check the node is reachable."
+    );
+  }
+  return activeChainId;
+}
+
 /// The canonical messages the node verifies — shown so a user can confirm
 /// exactly what they are authorizing before signing.
-export const signingMessages = {
+const canonicalMessages = {
   swap: ({ tokenId, hkmToToken, amountIn, minOut, nonce }) =>
     `hikmalayer-amm-swap:${tokenId}:${hkmToToken}:${amountIn}:${minOut}:${nonce}`,
   addLiquidity: ({ tokenId, amountHkm, amountToken, minShares, nonce }) =>
@@ -228,6 +261,15 @@ export const signingMessages = {
   burnAsset: ({ tokenId, amount, nonce }) =>
     `hikmalayer-token-burn:${tokenId}:${amount}:${nonce}`,
 };
+
+/// The canonical messages, each bound to the active network. Every panel
+/// signs and displays these, so what the user approves names the chain.
+export const signingMessages = Object.fromEntries(
+  Object.entries(canonicalMessages).map(([name, build]) => [
+    name,
+    (params) => scoped(requireChainId(), build(params)),
+  ])
+);
 
 export const shortId = (value, lead = 10, tail = 6) => {
   const text = String(value ?? "");

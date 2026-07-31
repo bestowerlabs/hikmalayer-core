@@ -192,9 +192,12 @@ describe("live chain", { skip: reachable ? false : `no node at ${URL}` }, () => 
       /must be a native address/
     );
     // And the chain refuses it too, even if a client skipped the guard.
+    // Signed properly (scoped to this network) so the request reaches the
+    // recipient check rather than failing earlier on the signature.
     const nonce = await bob.nextNonce();
+    const chainId = await bob.resolveChainId();
     const signed = await bob.signer.sign(
-      `hikmalayer-transfer:${bob.signer.address}:typo-address:1:${nonce}`
+      `${chainId}:hikmalayer-transfer:${bob.signer.address}:typo-address:1:${nonce}`
     );
     await assert.rejects(
       () =>

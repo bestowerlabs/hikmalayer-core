@@ -241,6 +241,16 @@ pub struct Transaction {
     /// AMM action (AddLiquidity / RemoveLiquidity / Swap only).
     #[serde(default)]
     pub amm: Option<AmmAction>,
+    /// Which network this transaction is for.
+    ///
+    /// Without it, a signature is valid on every Hikmalayer network at once:
+    /// addresses are derived from the key, so a user has the same address on
+    /// a testnet and on mainnet, and a transaction they signed while testing
+    /// replays verbatim against their real balance. The chain id is part of
+    /// the signed message and is checked against the chain's own id on
+    /// apply, so a signature made for one network is inert on every other.
+    #[serde(default)]
+    pub chain_id: String,
 }
 
 /// Issue or revoke an on-chain verifiable credential. Only the hash of the
@@ -278,7 +288,15 @@ impl Transaction {
             vesting_duration_blocks: None,
             token: None,
             amm: None,
+            chain_id: String::new(),
         }
+    }
+
+    /// Set the network this transaction is for. Chainable, so a client can
+    /// write `Transaction::new(..).for_chain(&chain_id)`.
+    pub fn for_chain(mut self, chain_id: &str) -> Self {
+        self.chain_id = chain_id.to_string();
+        self
     }
 
     /// The block reward paid to the validator producing the block at
@@ -419,6 +437,27 @@ impl Transaction {
     /// Stateless consensus verification of a transaction inside a block
     /// produced by `validator`. Stateful rules (nonces, balances, registered
     /// keys) are enforced by `ChainState::apply_transaction`.
+    /// Verify a transaction's authorization without block context.
+    ///
+    /// `verify_for_block` needs to know which validator produced the block in
+    /// order to check a `Reward`. Everything a *user* submits is authorized
+    /// entirely by its own signature, so it can be checked anywhere — and
+    /// `ChainState::apply_transaction` does exactly that, so applying a
+    /// transaction is safe regardless of what the caller remembered to do
+    /// first. Relying on call order to keep forged transactions out of the
+    /// ledger is the kind of assumption that holds until one code path
+    /// forgets.
+    ///
+    /// `Reward` and `Slash` carry no sender signature: their rules are block
+    /// rules, enforced by `verify_for_block` during block validation, which
+    /// is the only place they can be checked at all.
+    pub fn verify_authorization(&self) -> Result<(), String> {
+        match self.transaction_type {
+            TransactionType::Reward | TransactionType::Slash => Ok(()),
+            _ => self.verify_for_block(""),
+        }
+    }
+
     pub fn verify_for_block(&self, validator: &str) -> Result<(), String> {
         match self.transaction_type {
             TransactionType::Transfer => {
@@ -704,7 +743,18 @@ impl Transaction {
     /// Verify a native Hikmalayer signature: the embedded public key must
     /// derive to the sender's address and the compact secp256k1 signature
     /// must verify over the domain-prefixed message.
+    /// Bind a canonical message to a network.
+    ///
+    /// Clients build the same string: `<chain_id>:<canonical message>`. It is
+    /// deliberately a visible prefix rather than a hidden change to the
+    /// digest, so a wallet's confirmation screen shows the user which network
+    /// they are authorizing — "hikmalayer-mainnet:hikmalayer-transfer:…".
+    pub fn scoped_signing_message(chain_id: &str, message: &str) -> String {
+        format!("{}:{}", chain_id, message)
+    }
+
     fn verify_sender_signature(&self, from: &str, message: &str) -> Result<(), String> {
+        let message = &Self::scoped_signing_message(&self.chain_id, message);
         let public_key = self
             .public_key
             .as_ref()
@@ -807,7 +857,14 @@ mod tests {
         assert!(tx.verify_for_block("validator-1").is_err());
 
         let message = Transaction::transfer_signing_message(&from, &tx.to, tx.amount, tx.nonce);
-        tx.signature = Some(pos::sign_message(&message, &private_key).unwrap());
+tx.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
+                tx.signature = Some(pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &private_key,
+        ).unwrap());
         assert!(tx.verify_for_block("validator-1").is_ok());
 
         // Tampered amount: rejected.
@@ -829,7 +886,14 @@ mod tests {
         tx.nonce = 1;
         tx.public_key = Some(public_key);
         let message = Transaction::transfer_signing_message(&victim, &tx.to, tx.amount, tx.nonce);
-        tx.signature = Some(pos::sign_message(&message, &private_key).unwrap());
+tx.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
+                tx.signature = Some(pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &private_key,
+        ).unwrap());
         assert!(tx.verify_for_block("validator-1").is_err());
     }
 
@@ -847,7 +911,14 @@ mod tests {
         let vrf_key = crate::consensus::vrf::derive_vrf_public_key(&private_key).unwrap();
         tx.vrf_public_key = Some(vrf_key.clone());
         let message = Transaction::stake_signing_message(&from, 100, 1, &vrf_key);
-        tx.signature = Some(pos::sign_message(&message, &private_key).unwrap());
+tx.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
+                tx.signature = Some(pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &private_key,
+        ).unwrap());
         assert!(tx.verify_for_block("validator-1").is_ok());
 
         // Wrong destination account: rejected.

@@ -2,7 +2,8 @@ import React, { useState, useEffect } from "react";
 import { WalletProvider, useWallet } from "./hooks/useWallet";
 import { SignerProvider } from "./hooks/useSigner";
 import { ExtensionProvider } from "./hooks/useExtension";
-import { getBlockchainStats, API_BASE } from "./api";
+import { getBlockchainStats, getChainId, API_BASE } from "./api";
+import { setActiveChainId } from "./lib/hts";
 import StatsGrid from "./components/StatsGrid";
 import CertificateManager from "./components/CertificateManager";
 import TokenManager from "./components/TokenManager";
@@ -53,6 +54,15 @@ const AppContent = () => {
     // Auto-refresh stats every 30 seconds
     const interval = setInterval(loadStats, 30000);
     return () => clearInterval(interval);
+  }, []);
+
+  // Learn which network this node is, so every signature is scoped to it.
+  // Until this lands, signing fails closed rather than producing a
+  // signature that would be valid on any Hikmalayer network.
+  useEffect(() => {
+    getChainId()
+      .then(setActiveChainId)
+      .catch(() => setActiveChainId(null));
   }, []);
 
   if (loading) {

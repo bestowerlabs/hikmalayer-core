@@ -9,7 +9,7 @@
 // above it, so responses are parsed from raw text with a reviver that keeps
 // large integers intact.
 
-import { messages } from "./messages.js";
+import { messages, scoped } from "./messages.js";
 import { LocalSigner, isValidAddress } from "./signer.js";
 import { applySlippage, encodeAmount, isqrt, toBaseUnits } from "./units.js";
 
@@ -92,10 +92,20 @@ export class HikmalayerClient {
   ///                                   object with `address`, `publicKey`
   ///                                   and `sign(message)`
   /// @param {string} options.adminToken  for admin-gated endpoints
-  constructor({ url = "http://127.0.0.1:3000", signer, adminToken, fetch: fetchImpl } = {}) {
+  constructor({
+    url = "http://127.0.0.1:3000",
+    signer,
+    adminToken,
+    chainId,
+    fetch: fetchImpl,
+  } = {}) {
     this.url = String(url).replace(/\/+$/, "");
     this.signer = signer ?? null;
     this.adminToken = adminToken ?? null;
+    // Which network we sign for. Discovered from the node on first use
+    // unless pinned here — pin it when you must be certain, since a node
+    // that reports the wrong id would have you signing for the wrong chain.
+    this.chainId = chainId ?? null;
     this.fetch = fetchImpl ?? globalThis.fetch;
     if (!this.fetch) throw new Error("No fetch implementation available");
   }
@@ -241,12 +251,29 @@ export class HikmalayerClient {
     return this.signer.address;
   }
 
+  /// The network this client signs for, fetched once and cached.
+  async resolveChainId() {
+    if (this.chainId) return this.chainId;
+    const state = await this.state();
+    if (!state?.chain_id) {
+      throw new Error("Node did not report a chain_id; cannot sign safely");
+    }
+    this.chainId = state.chain_id;
+    return this.chainId;
+  }
+
   async #authorize(message) {
     if (!this.signer) throw new Error("No signer configured");
     if (!this.signer.publicKey) {
       throw new Error("Signer has no public key — call connect() first");
     }
-    return { public_key: this.signer.publicKey, signature: await this.signer.sign(message) };
+    // Everything is signed scoped to a network. A signature made for one
+    // chain must never be usable on another.
+    const scopedMessage = scoped(await this.resolveChainId(), message);
+    return {
+      public_key: this.signer.publicKey,
+      signature: await this.signer.sign(scopedMessage),
+    };
   }
 
   /// Resolve the nonce once, so the message and the request cannot disagree.

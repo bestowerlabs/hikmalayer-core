@@ -23,6 +23,18 @@ export const ADDRESS_PREFIX = "hkm";
 
 const bool = (value) => (value ? "true" : "false");
 
+/// Bind a canonical message to a network.
+///
+/// Without this, a signature is valid on every Hikmalayer network at once:
+/// addresses come from the key, so the same account exists on a testnet and
+/// on mainnet, and a transaction signed while testing replays verbatim
+/// against real funds. It is a visible prefix rather than a hidden change to
+/// the digest so a wallet's confirmation screen can show which network is
+/// being authorized.
+///
+/// Mirrors `Transaction::scoped_signing_message` in the node.
+export const scoped = (chainId, message) => `${chainId}:${message}`;
+
 /// Move native HKM.
 export const transfer = ({ from, to, amount, nonce }) =>
   `hikmalayer-transfer:${from}:${to}:${encodeAmount(amount)}:${nonce}`;

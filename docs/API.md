@@ -14,6 +14,14 @@ Hikmalayer is a hybrid PoS/PoW blockchain platform with REST execution APIs, sta
 Where an example below conflicts with this section, this section is
 authoritative.
 
+**Every signature is bound to a network.** Canonical messages are prefixed
+with the chain's id — `hikmalayer-mainnet:hikmalayer-transfer:…` — and the
+node stamps its own id on submission, so a signature produced for a different
+network simply fails verification. Read the id from `GET /blockchain/state`
+(`chain_id`) and scope every message you build with it. Without this a user
+who signs a transaction on a testnet could have it replayed verbatim against
+their mainnet balance, since their address is the same on both.
+
 **Native identity — no Ethereum.** Addresses are `hkm` + hex(SHA-256(uncompressed
 secp256k1 public key)[..20]) — 43 characters. There is no `0x`/keccak address and
 no `personal_sign`/Ethereum message prefix. All signatures are native compact

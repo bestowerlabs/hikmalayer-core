@@ -28,3 +28,16 @@ base64 = "0.21"       # For encoding/decoding
 schnorrkel = "0.11"
 hmac = "0.12"         # R-05: HMAC-signed self-expiring admin/P2P tokens
 subtle = "2"          # Constant-time comparisons (timing side channels)
+
+# Release builds keep integer overflow checks ON.
+#
+# This is deliberately not the Rust default. In a state machine that moves
+# money, a wrapped `u64` is not a rounding error: it mints supply or destroys
+# funds, silently and irreversibly, and every node computes the same wrong
+# answer so consensus never notices.
+#
+# The state machine uses checked arithmetic everywhere, so these checks should
+# never fire. They are the backstop for the line someone adds later: a halted
+# node is recoverable, a corrupted ledger is not.
+[profile.release]
+overflow-checks = true

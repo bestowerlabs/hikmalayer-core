@@ -17,7 +17,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { LocalSigner, deriveAddress, derivePublicKey, signMessage } from "../src/index.js";
-import { messages } from "../src/messages.js";
+import { messages, scoped } from "../src/messages.js";
+
+// The CLI signs scoped to this network; the SDK must produce the same string.
+const CHAIN_ID = "hikmalayer-conformance";
+process.env.HIKMALAYER_CHAIN_ID = CHAIN_ID;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, "../..");
@@ -33,7 +37,10 @@ const TOKEN = "hktcc3f73fed737c988826bc2540f1483bf8a640993";
 
 /// Run the CLI and pull out the labelled fields it prints.
 function cli(...args) {
-  const output = execFileSync(CLI, args, { encoding: "utf8" });
+  const output = execFileSync(CLI, args, {
+    encoding: "utf8",
+    env: { ...process.env, HIKMALAYER_CHAIN_ID: CHAIN_ID },
+  });
   const field = (label) =>
     output.match(new RegExp(`^${label}:\\s*(\\S+)`, "m"))?.[1] ?? null;
   return {
@@ -225,7 +232,9 @@ describe("parity with the hikma-wallet CLI", { skip: CLI ? false : "hikma-wallet
   for (const scenario of cases) {
     test(`${scenario.name}: message and signature match the CLI`, () => {
       const out = cli(...scenario.args(), KEY);
-      const message = scenario.message(out);
+      // Every signature is bound to a network, so the network is part of
+      // what is compared.
+      const message = scoped(CHAIN_ID, scenario.message(out));
 
       // The canonical message itself must match, so a failure says which
       // field is wrong instead of only "signatures differ".
@@ -236,4 +245,37 @@ describe("parity with the hikma-wallet CLI", { skip: CLI ? false : "hikma-wallet
       assert.equal(signature.length, 128, "compact signature must be 64 bytes of hex");
     });
   }
+});
+
+describe("network scoping", () => {
+  test("the same transaction signs differently on different networks", () => {
+    const base = messages.transfer({
+      from: "hkm1111111111111111111111111111111111111111",
+      to: "hkm2222222222222222222222222222222222222222",
+      amount: 1_000_000n,
+      nonce: 1,
+    });
+    const onTest = signMessage(scoped("hikmalayer-testnet", base), KEY);
+    const onMain = signMessage(scoped("hikmalayer-mainnet", base), KEY);
+    assert.notEqual(
+      onTest,
+      onMain,
+      "a testnet signature is byte-identical on mainnet — it would replay"
+    );
+  });
+
+  test("the network is visible in what the user approves", () => {
+    const message = scoped(
+      "hikmalayer-mainnet",
+      messages.transfer({
+        from: "hkm1111111111111111111111111111111111111111",
+        to: "hkm2222222222222222222222222222222222222222",
+        amount: 1n,
+        nonce: 1,
+      })
+    );
+    // A wallet shows this string verbatim, so the network must be readable
+    // in it — not hidden inside a digest the user cannot inspect.
+    assert.ok(message.startsWith("hikmalayer-mainnet:"), message);
+  });
 });

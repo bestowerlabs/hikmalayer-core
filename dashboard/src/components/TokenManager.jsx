@@ -73,7 +73,10 @@ const TokenManager = ({ refreshTrigger, onUpdate }) => {
       `:${parsed.units}:${nonce ?? "<nonce>"}`
   );
 
+  // The CLI scopes what it signs to HIKMALAYER_CHAIN_ID; without it the
+  // signature is for the dev network and this node refuses it.
   const signingCommand =
+    `HIKMALAYER_CHAIN_ID=${getActiveChainId() ?? "<network>"} ` +
     `hikma-wallet sign-transfer ${account || "<from>"} ${to.trim() || "<to>"} ` +
     `${parsed.units} ${nonce ?? "<nonce>"} <PRIVATE_KEY>`;
 

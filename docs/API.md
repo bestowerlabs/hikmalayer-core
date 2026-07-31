@@ -52,15 +52,17 @@ on the node; endpoints gated by an unset token reject every request.
 }
 ```
 
-The signature covers `hikmalayer-transfer:{from}:{to}:{amount}:{nonce}`; the
-`public_key` must derive to `from`. Fetch the next nonce with
+The signature covers
+`{chain_id}:hikmalayer-transfer:{from}:{to}:{amount}:{nonce}` — the network
+prefix is not optional — and the `public_key` must derive to `from`. Fetch the next nonce with
 `GET /tokens/nonce/{account}`, sign offline with `hikma-wallet sign-transfer`.
 
 **Staking is on-chain, signed, and key-bound.** `POST /staking/deposit` submits a
 signed Stake transaction (`public_key`, `nonce`, signature over
-`hikmalayer-stake:{address}:{amount}:{nonce}`; `address` must derive from
-`public_key`). `POST /staking/withdraw` submits a signed Withdraw transaction
-(signature over `hikmalayer-withdraw:{address}:{amount}:{nonce}` by the
+`{chain_id}:hikmalayer-stake:{address}:{amount}:{nonce}:{vrf_public_key}`;
+`address` must derive from `public_key`). `POST /staking/withdraw` submits a
+signed Withdraw transaction (signature over
+`{chain_id}:hikmalayer-withdraw:{address}:{amount}:{nonce}` by the
 validator's on-chain key). Both take effect when mined; the validator set is
 derived from state.
 
@@ -115,7 +117,8 @@ creator; the deterministic `hkt…` token id is derived from
 Read models: `GET /assets` (registry), `GET /assets/{token_id}` (metadata),
 `GET /assets/{token_id}/balance/{account}`. Token amounts are in the token's own
 base units; each operation pays its fee in HKM. Sign offline with
-`hikma-wallet sign-token-create|sign-token-transfer|sign-token-burn`.
+`hikma-wallet sign-token-create|sign-token-transfer|sign-token-burn`, setting
+`HIKMALAYER_CHAIN_ID` to the network's id.
 
 **Native AMM DEX (`/dex/*`).** Constant-product (Uniswap-v2-style) pools, each
 pairing a native token with **HKM**. `POST /dex/add`
@@ -133,7 +136,8 @@ and `GET /dex/quote/{token_id}/{direction}/{amount_in}` — a read-only quote
 (`direction` = `hkm_to_token` or `token_to_hkm`) returning the exact output the
 same math would produce, for setting `min_out`. All amounts are base units;
 each op also pays the HKM base fee. Sign offline with
-`hikma-wallet sign-amm-add|sign-amm-remove|sign-amm-swap`. Pools are for HKM and
+`hikma-wallet sign-amm-add|sign-amm-remove|sign-amm-swap`, setting
+`HIKMALAYER_CHAIN_ID` to the network's id. Pools are for HKM and
 native tokens only — this is not a bridge to external chains.
 
 **Vesting.** `POST /tokens/vest` queues a signed lockup: `amount` moves into

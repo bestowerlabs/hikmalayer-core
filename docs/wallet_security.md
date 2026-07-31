@@ -14,9 +14,16 @@ Signing reproduces `src/consensus/pos.rs` exactly:
 
 ```
 address   = "hkm" + hex(SHA256(uncompressed secp256k1 pubkey)[..20])
+message   = "<chain_id>:<canonical message>"
 digest    = SHA256("\x19Hikmalayer Signed Message:\n" + <UTF-8 byte length> + message)
 signature = hex(compact ECDSA r||s), low-S normalized
 ```
+
+The `chain_id` prefix is what stops a signature made on one network being
+replayed on another — addresses come from the key, so the same account exists
+on a testnet and on mainnet. It is a *visible* prefix rather than a hidden
+change to the digest precisely so the confirmation dialog can show the user
+which network they are authorizing.
 
 Signatures are **byte-for-byte identical** to those from the `hikma-wallet`
 CLI — verified across transfer, swap and token-create domains, including a

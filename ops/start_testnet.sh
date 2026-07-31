@@ -59,6 +59,21 @@ wait_up() {
 echo "Waiting for all nodes to boot..."
 for node in "${NODES[@]}"; do wait_up "${node}"; done
 
+# Sign for the network the nodes are actually running.
+#
+# `hikma-wallet` binds every signature to HIKMALAYER_CHAIN_ID. If it does not
+# match the chain, the node refuses the signature — and the error says only
+# "signature verification failed", which points at nothing. Reading the id
+# back from a live node makes this correct no matter what .env holds.
+CHAIN_ID=$(curl -sf "${BOOT}/blockchain/state" \
+           | sed 's/.*"chain_id":"\([^"]*\)".*/\1/')
+if [[ -z "${CHAIN_ID}" ]]; then
+  echo "ERROR: could not read chain_id from ${BOOT}; refusing to sign blindly."
+  exit 1
+fi
+export HIKMALAYER_CHAIN_ID="${CHAIN_ID}"
+echo "Network: ${CHAIN_ID} (signatures are bound to it)"
+
 # Wire the full P2P mesh FIRST, on EVERY node, so transactions gossip to all
 # validators before any of them needs to mine, and mined blocks gossip back.
 # (Registering peers only on the bootnode — and only at the end — left the

@@ -1013,6 +1013,20 @@ pub struct SlashEvidence {
 
 #[cfg(test)]
 mod tests {
+    /// A transaction scoped to this test network.
+    ///
+    /// Every real transaction names the network it is for, and the state
+    /// machine refuses one that does not match. Tests build transactions by
+    /// hand, so they use this instead of `Transaction::new` directly.
+    fn test_tx(
+        from: Option<String>,
+        to: String,
+        amount: u64,
+        kind: TransactionType,
+    ) -> Transaction {
+        Transaction::new(from, to, amount, kind)
+            .for_chain(crate::blockchain::state::DEFAULT_CHAIN_ID)
+    }
     use super::*;
     use crate::blockchain::state::STAKING_POOL_ACCOUNT;
     use crate::blockchain::transaction::SlashProof;
@@ -1097,7 +1111,7 @@ mod tests {
         amount: u64,
         nonce: u64,
     ) -> Transaction {
-        let mut tx = Transaction::new(
+        let mut tx = test_tx(
             Some(from.0.to_string()),
             to.to_string(),
             amount,
@@ -1158,7 +1172,7 @@ tx.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
         let fund = signed_transfer((&t_addr, &t_pub, &t_key), &v_addr, funded, 1);
         mine_block_with(&mut chain, vec![fund]).unwrap();
 
-        let mut stake = Transaction::new(
+        let mut stake = test_tx(
             Some(v_addr.clone()),
             STAKING_POOL_ACCOUNT.to_string(),
             stake_amount,
@@ -1256,7 +1270,7 @@ stake.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
         let funded = stake_amount + stake_amount / 2;
         let fund = signed_transfer((&t_addr, &t_pub, &t_key), &v_addr, funded, 1);
         mine_block_with(&mut chain, vec![fund]).unwrap();
-        let mut stake = Transaction::new(
+        let mut stake = test_tx(
             Some(v_addr.clone()),
             STAKING_POOL_ACCOUNT.to_string(),
             stake_amount,
@@ -1810,7 +1824,7 @@ stake.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
         assert_ne!(block_a.hash, block_b.hash);
 
         // Build the slash transaction and mine it into the chain.
-        let mut slash = Transaction::new(None, t_addr.clone(), 0, TransactionType::Slash);
+        let mut slash = test_tx(None, t_addr.clone(), 0, TransactionType::Slash);
         slash.slash_proof = Some(SlashProof { block_a, block_b });
         slash.verify_for_block("anyone").unwrap();
 

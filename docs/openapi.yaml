@@ -24,6 +24,11 @@ info:
     string of digits as well as a number. Send strings. A number that is
     fractional, negative, or beyond 2^53−1 is rejected rather than truncated.
 
+    **Every signature names its network.** Canonical messages are prefixed
+    with the chain id — `hikmalayer-mainnet:hikmalayer-transfer:…` — read from
+    `chain_id` on `GET /blockchain/state`. The node stamps its own id on
+    submission, so a signature made for another network fails verification.
+
     **Submitting is not executing.** A value-bearing request is validated,
     signature-checked and *queued*. It changes state only when mined into a
     block. Read `GET /tokens/balance/{account}` to see settled state.
@@ -150,8 +155,13 @@ components:
       pattern: "^[0-9a-f]{128}$"
       description: |
         Compact ECDSA `r||s`, low-S normalized, over
-        `SHA256("\x19Hikmalayer Signed Message:\n" + <UTF-8 byte length> + message)`.
-        The length is the UTF-8 **byte** length, not the character count.
+        `SHA256("\x19Hikmalayer Signed Message:\n" + <UTF-8 byte length> + message)`
+        where `message` is `<chain_id>:<canonical message>`.
+
+        The network prefix is mandatory: without it a signature is valid on
+        every Hikmalayer network at once, and a transaction signed while
+        testing replays against real funds. The length is the UTF-8 **byte**
+        length, not the character count.
 
     Nonce:
       type: integer
@@ -207,6 +217,12 @@ components:
     StateSummary:
       type: object
       properties:
+        chain_id:
+          type: string
+          description: |
+            The network these transactions must be signed for. Read it once
+            and prefix every canonical message with it.
+          examples: ["hikmalayer-mainnet"]
         height: { type: integer }
         state_root:
           type: string

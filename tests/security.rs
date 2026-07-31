@@ -860,3 +860,40 @@ fn a_transaction_on_its_own_network_still_applies() {
     testnet.apply_transaction(&tx, 1).unwrap();
     assert_eq!(testnet.balance_of(&recipient.address), 42 * UNITS_PER_HKM);
 }
+
+/// A validator must not be able to smuggle a foreign-network transaction into
+/// a block.
+///
+/// Block validation applies transactions through the already-verified path,
+/// so if the network check lived only in the ordinary entry point, a genuine
+/// signature made for another chain would sail through here — the signature
+/// is real, just for a different network. That is precisely the replay this
+/// is meant to stop, arriving by the one route that matters.
+#[test]
+fn a_block_cannot_carry_a_transaction_from_another_network() {
+    let (mut mainnet, treasury) = chain_named("hikmalayer-mainnet");
+    let attacker = account(2);
+
+    let foreign = signed_transfer_on(
+        "hikmalayer-testnet",
+        &treasury,
+        &attacker.address,
+        1_000 * UNITS_PER_HKM,
+        1,
+    );
+
+    // Its signature is genuine — it is a real transaction on its own chain.
+    assert!(
+        foreign.verify_authorization().is_ok(),
+        "test setup: the foreign transaction should be internally valid"
+    );
+
+    // The path block validation uses must still refuse it.
+    let before = mainnet.balance_of(&treasury.address);
+    assert!(
+        mainnet.apply_verified(&foreign, 1).is_err(),
+        "a foreign-network transaction was applied through the block path"
+    );
+    assert_eq!(mainnet.balance_of(&treasury.address), before);
+    assert_eq!(mainnet.balance_of(&attacker.address), 0);
+}

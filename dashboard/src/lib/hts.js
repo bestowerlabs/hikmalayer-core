@@ -197,7 +197,7 @@ export function quoteRemoveLiquidity(pool, shares) {
 
 const q = (value) => `"${String(value)}"`;
 
-export const signingCommands = {
+const baseCommands = {
   swap: ({ tokenId, hkmToToken, amountIn, minOut, nonce }) =>
     `hikma-wallet sign-amm-swap ${q(tokenId)} ${hkmToToken} ${amountIn} ${minOut} ${nonce} <PRIVATE_KEY>`,
   addLiquidity: ({ tokenId, amountHkm, amountToken, minShares, nonce }) =>
@@ -211,6 +211,19 @@ export const signingCommands = {
   burnAsset: ({ tokenId, amount, nonce }) =>
     `hikma-wallet sign-token-burn ${q(tokenId)} ${amount} ${nonce} <PRIVATE_KEY>`,
 };
+
+/// The offline signing commands, prefixed with the network.
+///
+/// `hikma-wallet` scopes what it signs to `HIKMALAYER_CHAIN_ID`. Without it
+/// the CLI signs for the dev network, and the resulting signature is refused
+/// here with a message that says nothing about why — so the network is part
+/// of the command the user is shown, not a footnote they have to know about.
+export const signingCommands = Object.fromEntries(
+  Object.entries(baseCommands).map(([name, build]) => [
+    name,
+    (params) => `HIKMALAYER_CHAIN_ID=${requireChainId()} ${build(params)}`,
+  ])
+);
 
 /// Bind a canonical message to a network. Mirrors
 /// `Transaction::scoped_signing_message` in the node: a signature made for

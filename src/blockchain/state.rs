@@ -517,7 +517,6 @@ impl ChainState {
         // code path away from writing a forged transaction into the ledger,
         // and by then it is consensus.
         tx.verify_authorization()?;
-        self.verify_chain_scope(tx)?;
         self.apply_verified(tx, height)
     }
 
@@ -551,6 +550,16 @@ impl ChainState {
     /// — block validation and block production — where re-verifying every
     /// signature would double the cost of the hot path for no added safety.
     pub fn apply_verified(&mut self, tx: &Transaction, height: u64) -> Result<(), String> {
+        // The network check lives HERE, not in `apply_transaction`, because
+        // block validation applies transactions through this path. If it sat
+        // one level up, a validator could put a transaction signed for
+        // another network into a block and every node would accept it — the
+        // signature is genuine, just for a different chain. That would defeat
+        // the replay protection entirely at the only layer where it matters.
+        //
+        // It is a string comparison, not a signature check, so unlike
+        // authorization there is nothing to gain by skipping it.
+        self.verify_chain_scope(tx)?;
         match tx.transaction_type {
             TransactionType::Transfer => {
                 let from = tx
@@ -1236,6 +1245,19 @@ impl ChainState {
 
 #[cfg(test)]
 mod tests {
+    /// A transaction scoped to this test network.
+    ///
+    /// Every real transaction names the network it is for, and the state
+    /// machine refuses one that does not match. Tests build transactions by
+    /// hand, so they use this instead of `Transaction::new` directly.
+    fn test_tx(
+        from: Option<String>,
+        to: String,
+        amount: u64,
+        kind: TransactionType,
+    ) -> Transaction {
+        Transaction::new(from, to, amount, kind).for_chain(DEFAULT_CHAIN_ID)
+    }
     use super::*;
     use crate::blockchain::transaction::{AmmAction, BLOCK_REWARD};
 
@@ -1301,7 +1323,7 @@ mod tests {
 
         // Chosen so `amount + base_fee` wraps to exactly zero.
         let amount = u64::MAX - state.base_fee + 1;
-        let mut tx = Transaction::new(
+        let mut tx = test_tx(
             Some(attacker.clone()),
             treasury.clone(),
             amount,
@@ -1329,7 +1351,7 @@ mod tests {
         let vrf_key = crate::consensus::vrf::derive_vrf_public_key(&private_key).unwrap();
 
         let amount = u64::MAX - state.base_fee + 1;
-        let mut tx = Transaction::new(
+        let mut tx = test_tx(
             Some(attacker.clone()),
             attacker.clone(),
             amount,
@@ -1384,7 +1406,7 @@ mod tests {
             },
         );
 
-        let mut tx = Transaction::new(
+        let mut tx = test_tx(
             Some(treasury.clone()),
             treasury.clone(),
             0,
@@ -1435,7 +1457,7 @@ mod tests {
     fn transfer_to_a_malformed_address_is_rejected() {
         let (mut state, treasury, _, _) = genesis_state();
         for bad in ["typo-address", "", "hkmshort", STAKING_POOL_ACCOUNT] {
-            let mut tx = Transaction::new(
+            let mut tx = test_tx(
                 Some(treasury.clone()),
                 bad.to_string(),
                 100,
@@ -1457,7 +1479,7 @@ mod tests {
     #[test]
     fn vesting_to_a_malformed_beneficiary_is_rejected() {
         let (mut state, treasury, _, _) = genesis_state();
-        let mut vest = Transaction::new(
+        let mut vest = test_tx(
             Some(treasury),
             "not-an-address".to_string(),
             1_000,
@@ -1482,7 +1504,7 @@ mod tests {
     #[test]
     fn transfer_updates_balances_and_nonce() {
         let (mut state, treasury, _, _) = genesis_state();
-        let mut tx = Transaction::new(
+        let mut tx = test_tx(
             Some(treasury.clone()),
             "hkm010123456789abcdef0123456789abcdef012345".to_string(),
             100,
@@ -1501,7 +1523,7 @@ mod tests {
     fn transfer_rejects_overdraft() {
         let (mut state, ..) = genesis_state();
         let (poor, ..) = wallet(9);
-        let mut tx = Transaction::new(
+        let mut tx = test_tx(
             Some(poor),
             "hkm010123456789abcdef0123456789abcdef012345".to_string(),
             1,
@@ -1520,7 +1542,7 @@ mod tests {
         let funded = stake_amount + 10 * TX_FEE;
 
         // Fund the new validator from treasury (sender pays the fee).
-        let mut fund = Transaction::new(
+        let mut fund = test_tx(
             Some(treasury.clone()),
             address.clone(),
             funded,
@@ -1530,7 +1552,7 @@ mod tests {
         state.apply_verified(&fund, 1).unwrap();
 
         // Stake the validator minimum (+fee).
-        let mut stake = Transaction::new(
+        let mut stake = test_tx(
             Some(address.clone()),
             STAKING_POOL_ACCOUNT.to_string(),
             stake_amount,
@@ -1546,7 +1568,7 @@ mod tests {
 
         // Withdraw the full stake (+fee) at height 2: funds enter
         // UNBONDING, they are NOT immediately spendable.
-        let mut withdraw = Transaction::new(
+        let mut withdraw = test_tx(
             Some(address.clone()),
             address.clone(),
             stake_amount,
@@ -1583,7 +1605,7 @@ mod tests {
         let (mut state, treasury, _, _) = genesis_state();
         let (address, public_key, private_key) = wallet(2);
 
-        let mut fund = Transaction::new(
+        let mut fund = test_tx(
             Some(treasury.clone()),
             address.clone(),
             MIN_VALIDATOR_STAKE,
@@ -1592,7 +1614,7 @@ mod tests {
         fund.nonce = 1;
         state.apply_verified(&fund, 1).unwrap();
 
-        let mut stake = Transaction::new(
+        let mut stake = test_tx(
             Some(address.clone()),
             STAKING_POOL_ACCOUNT.to_string(),
             MIN_VALIDATOR_STAKE - 1,
@@ -1616,7 +1638,7 @@ mod tests {
         // would leave a sub-minimum validator — rejected. Full exit is fine.
         let leave_dust = GENESIS_VALIDATOR_STAKE - MIN_VALIDATOR_STAKE + 1;
         let (treasury_addr, ..) = wallet(1);
-        let mut withdraw = Transaction::new(
+        let mut withdraw = test_tx(
             Some(treasury_addr.clone()),
             treasury_addr.clone(),
             leave_dust,
@@ -1652,7 +1674,7 @@ mod tests {
         // Fund both candidates.
         let funded = MIN_VALIDATOR_STAKE * 2;
         for (i, dest) in [(1u64, &allowed_addr), (2u64, &outsider_addr)] {
-            let mut fund = Transaction::new(
+            let mut fund = test_tx(
                 Some(t_addr.clone()),
                 dest.to_string(),
                 funded,
@@ -1663,7 +1685,7 @@ mod tests {
         }
 
         let make_stake = |addr: &str, pubkey: &str, key: &str| {
-            let mut stake = Transaction::new(
+            let mut stake = test_tx(
                 Some(addr.to_string()),
                 STAKING_POOL_ACCOUNT.to_string(),
                 MIN_VALIDATOR_STAKE,
@@ -1690,7 +1712,7 @@ mod tests {
         assert_eq!(state.validator_set().len(), 2);
 
         // Existing validators (the genesis treasury) may top up regardless.
-        let mut top_up = Transaction::new(
+        let mut top_up = test_tx(
             Some(t_addr.clone()),
             STAKING_POOL_ACCOUNT.to_string(),
             MIN_VALIDATOR_STAKE,
@@ -1713,7 +1735,7 @@ mod tests {
         let total = 1_000_000 * UNITS_PER_HKM; // 1M HKM lockup
 
         // Vest at height 10: cliff 100 blocks, full vest over 400 blocks.
-        let mut vest = Transaction::new(
+        let mut vest = test_tx(
             Some(treasury.clone()),
             recipient.clone(),
             total,
@@ -1759,7 +1781,7 @@ mod tests {
 
         // Create a token: 1,000,000 units (8 decimals) minted to the creator.
         let supply = 1_000_000u64;
-        let mut create = Transaction::new(
+        let mut create = test_tx(
             Some(treasury.clone()),
             String::new(),
             supply,
@@ -1784,7 +1806,7 @@ mod tests {
         assert_eq!(state.balance_of(&treasury), hkm_before - state.base_fee);
 
         // Transfer 250,000 units to a holder.
-        let mut send = Transaction::new(
+        let mut send = test_tx(
             Some(treasury.clone()),
             holder.clone(),
             250_000,
@@ -1802,7 +1824,7 @@ mod tests {
         assert_eq!(state.tokens[&token_id].total_supply, supply);
 
         // Burn 100,000 units from the treasury: supply drops accordingly.
-        let mut burn = Transaction::new(
+        let mut burn = test_tx(
             Some(treasury.clone()),
             String::new(),
             100_000,
@@ -1824,7 +1846,7 @@ mod tests {
     /// Helper: create a token owned by `owner` and return its id.
     fn make_token(state: &mut ChainState, owner: &str, symbol: &str, supply: u64, nonce: u64) -> String {
         use crate::blockchain::transaction::TokenAction;
-        let mut create = Transaction::new(
+        let mut create = test_tx(
             Some(owner.to_string()),
             String::new(),
             supply,
@@ -1849,7 +1871,7 @@ mod tests {
         let token_id = make_token(&mut state, &treasury, "LPTOK", 10_000_000, 1);
 
         // Seed the pool: 1,000,000 HKM units + 1,000,000 token units.
-        let mut add = Transaction::new(
+        let mut add = test_tx(
             Some(treasury.clone()),
             String::new(),
             0,
@@ -1879,7 +1901,7 @@ mod tests {
         // Swap 100,000 HKM for the token. Constant-product with 0.3% fee:
         // out = 997*100000*1e6 / (1e6*1000 + 997*100000) ≈ 90,661.
         let k_before = pool.reserve_hkm as u128 * pool.reserve_token as u128;
-        let mut swap = Transaction::new(
+        let mut swap = test_tx(
             Some(treasury.clone()),
             String::new(),
             0,
@@ -1907,7 +1929,7 @@ mod tests {
 
         // Remove all of the provider's liquidity; they get back reserves pro
         // rata (now HKM-heavier and token-lighter from the swap + the fee).
-        let mut remove = Transaction::new(
+        let mut remove = test_tx(
             Some(treasury.clone()),
             String::new(),
             0,
@@ -1941,7 +1963,7 @@ mod tests {
         let (mut state, treasury, _, _) = genesis_state();
         let token_id = make_token(&mut state, &treasury, "SLIP", 10_000_000, 1);
 
-        let mut add = Transaction::new(
+        let mut add = test_tx(
             Some(treasury.clone()),
             String::new(),
             0,
@@ -1958,7 +1980,7 @@ mod tests {
         state.apply_verified(&add, 1).unwrap();
 
         // Swap with an unsatisfiable min_out is rejected.
-        let mut swap = Transaction::new(
+        let mut swap = test_tx(
             Some(treasury.clone()),
             String::new(),
             0,
@@ -1976,7 +1998,7 @@ mod tests {
         assert!(err.contains("slippage"), "{err}");
 
         // Swap against a pool that does not exist is rejected.
-        let mut ghost = Transaction::new(
+        let mut ghost = test_tx(
             Some(treasury.clone()),
             String::new(),
             0,
@@ -1999,7 +2021,7 @@ mod tests {
         let (mut state, treasury, _, _) = genesis_state();
 
         // Transfer against a token that does not exist.
-        let mut send = Transaction::new(
+        let mut send = test_tx(
             Some(treasury.clone()),
             "hkm02789abcdef0123456789abcdef0123456789abc".to_string(),
             1,
@@ -2013,7 +2035,7 @@ mod tests {
         assert!(state.apply_verified(&send, 1).is_err());
 
         // Create a small token, then try to transfer more than held.
-        let mut create = Transaction::new(
+        let mut create = test_tx(
             Some(treasury.clone()),
             String::new(),
             100,
@@ -2029,7 +2051,7 @@ mod tests {
         state.apply_verified(&create, 1).unwrap();
         let token_id = crate::blockchain::transaction::derive_token_id(&treasury, "SMALL", 1);
 
-        let mut overspend = Transaction::new(
+        let mut overspend = test_tx(
             Some(treasury.clone()),
             "hkm02789abcdef0123456789abcdef0123456789abc".to_string(),
             101,
@@ -2049,7 +2071,7 @@ mod tests {
         let (mut state, treasury, _, _) = genesis_state();
 
         // Cliff beyond duration: rejected.
-        let mut bad = Transaction::new(
+        let mut bad = test_tx(
             Some(treasury.clone()),
             "hkm02789abcdef0123456789abcdef0123456789abc".to_string(),
             100 * UNITS_PER_HKM,
@@ -2062,7 +2084,7 @@ mod tests {
 
         // Overdraft: a pauper cannot vest what they do not hold.
         let (pauper, ..) = wallet(9);
-        let mut broke = Transaction::new(
+        let mut broke = test_tx(
             Some(pauper),
             "hkm02789abcdef0123456789abcdef0123456789abc".to_string(),
             100 * UNITS_PER_HKM,
@@ -2081,7 +2103,7 @@ mod tests {
 
         // Treasury withdraws 400k HKM of its 1M HKM genesis stake at height 5.
         let withdrawn = 400_000 * UNITS_PER_HKM;
-        let mut withdraw = Transaction::new(
+        let mut withdraw = test_tx(
             Some(treasury.clone()),
             treasury.clone(),
             withdrawn,
@@ -2115,7 +2137,7 @@ mod tests {
                 "root".to_string(),
             )
         };
-        let mut slash = Transaction::new(None, treasury.clone(), 0, TransactionType::Slash);
+        let mut slash = test_tx(None, treasury.clone(), 0, TransactionType::Slash);
         slash.slash_proof = Some(SlashProof {
             block_a: make_block("a"),
             block_b: make_block("b"),
@@ -2178,7 +2200,7 @@ mod tests {
     #[test]
     fn fees_flow_to_the_block_validator() {
         let (mut state, treasury, _, _) = genesis_state();
-        let mut tx = Transaction::new(
+        let mut tx = test_tx(
             Some(treasury.clone()),
             "hkm010123456789abcdef0123456789abcdef012345".to_string(),
             100,
@@ -2197,7 +2219,7 @@ mod tests {
     fn withdraw_rejects_wrong_key() {
         let (mut state, treasury, _, _) = genesis_state();
         let (_, _, intruder_key) = wallet(7);
-        let mut withdraw = Transaction::new(
+        let mut withdraw = test_tx(
             Some(treasury.clone()),
             treasury.clone(),
             10,

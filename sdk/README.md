@@ -29,6 +29,29 @@ await client.transfer({
 Need a chain to talk to? `ops/devnet.sh` starts one, funded and mining, in a
 single command.
 
+## Networks
+
+Every signature is bound to a network. Addresses come from the key, so the
+same account exists on a testnet and on mainnet — without a network binding, a
+transaction signed while testing replays verbatim against real funds.
+
+The client discovers the network from the node and scopes every message it
+signs:
+
+```js
+await client.resolveChainId();   // "hikmalayer-mainnet"
+```
+
+Pin it when you need certainty, since a node that reported the wrong id would
+have you signing for the wrong chain:
+
+```js
+new HikmalayerClient({ url, signer, chainId: "hikmalayer-mainnet" });
+```
+
+Signing offline with the CLI? Set `HIKMALAYER_CHAIN_ID` to match, or the
+signature is for the dev network and the node will refuse it.
+
 ## Two things this library exists to prevent
 
 **Amounts are BigInt. Always.** HKM has 6 decimals and a 100-billion supply,

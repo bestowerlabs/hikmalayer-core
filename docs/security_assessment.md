@@ -25,6 +25,8 @@ what was found, and what changed.
 | 5 | Block height frozen on an idle chain (emission and vesting stall) | **Medium** | Fixed |
 | 6 | Client-side amount rounding breaks honest transactions | **Medium** | Fixed |
 | 7 | Liquidity provision shipped without slippage bounds | **Medium** | Fixed |
+| 8 | Network check missed the block-validation path | **High** | Fixed |
+| 9 | Mempool projection re-verified every pooled signature | **Medium** | Fixed |
 
 Verified as **sound** and left unchanged: sender/key binding, nonce replay
 protection, cross-domain signature separation, the constant-product invariant,
@@ -226,6 +228,49 @@ rejected by the chain.
 
 ---
 
+## 8. Network check missed the block-validation path — **High**
+
+Found while reviewing the fix for finding 2, which is the point of reviewing
+a fix rather than trusting it.
+
+`verify_chain_scope` was called from `apply_transaction`. But block validation
+applies transactions through `apply_verified` — the path that skips the
+redundant signature check — and that path did not run it.
+
+So a validator could put a transaction signed for another network into a
+block, and every node would accept it. The signature is genuine; it is simply
+for a different chain. That is the exact replay the fix exists to prevent,
+arriving by the only route that actually matters, and the ordinary entry point
+being protected would have made it look fixed.
+
+**Fix.** The network check moved into `apply_verified`, so every path that
+touches state runs it. It is a string comparison, not a signature check —
+unlike authorization there was never anything to gain by skipping it.
+
+**Regression test:** `a_block_cannot_carry_a_transaction_from_another_network`,
+which asserts the transaction is internally valid first, so it fails for the
+right reason.
+
+---
+
+## 9. Mempool projection re-verified every pooled signature — **Medium**
+
+A regression introduced by the fix for finding 4. Making
+`apply_transaction` verify signatures was right, but `project_pending_state`
+applies every pooled transaction on **every** submission — so each request
+cost one secp256k1 verification per transaction already in the mempool.
+
+With the 1,000-transaction cap that is up to 1,000 verifications per request,
+triggerable by anyone, repeatedly: O(n) work per call and O(n²) overall, for
+no added safety, since mempool contents are verified at admission.
+
+**Fix.** Callers that have just verified use `apply_verified`: the mempool
+projection, the block builder, the submission path and the gossip path. Each
+signature is now checked exactly once. The network check stays in the shared
+path (see finding 8), so none of this weakens replay protection.
+
+---
+
 ## What was checked and found sound
 
 **Authorization.** The public key in a transaction must derive to the sender's
@@ -278,6 +323,11 @@ surprised by them.
 ---
 
 ## Reproducing
+
+Two of the nine findings (8 and 9) were introduced or exposed by fixing the
+others. That is normal, and it is why the fixes were reviewed as carefully as
+the original code: a fix that looks right from the entry point everyone reads
+can still miss the path that matters.
 
 ```bash
 cargo test --test security             # adversarial suite, debug

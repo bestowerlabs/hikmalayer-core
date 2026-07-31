@@ -611,7 +611,11 @@ fn project_pending_state(
 ) -> ChainState {
     let mut projected = chain_state.clone();
     for tx in pending {
-        let _ = projected.apply_transaction(tx, next_height);
+        // Already verified at admission (`queue_transaction`). Re-verifying
+        // here would cost one signature check per pooled transaction on
+        // EVERY submission — O(n) work per request, n requests, all of it
+        // attacker-triggerable, and none of it adding safety.
+        let _ = projected.apply_verified(tx, next_height);
     }
     projected
 }
@@ -653,8 +657,10 @@ async fn queue_transaction(state: &AppState, mut tx: Transaction) -> Result<(), 
 
         let next_height = chain.blocks.len() as u64;
         let mut projected = project_pending_state(&chain.state, &pending, next_height);
+        // `verify_for_block` ran above; the network check is inside
+        // `apply_verified`, so this still refuses a foreign-chain signature.
         projected
-            .apply_transaction(&tx, next_height)
+            .apply_verified(&tx, next_height)
             .map_err(|err| format!("Transaction not applicable: {}", err))?;
 
         pending.push(tx.clone());
@@ -1433,7 +1439,8 @@ fn plan_block(
         if tx.verify_for_block(&validator).is_err() {
             continue;
         }
-        if post_state.apply_transaction(tx, next_index).is_err() {
+        // Verified on the line above.
+        if post_state.apply_verified(tx, next_index).is_err() {
             continue;
         }
         transactions.push(
@@ -1445,7 +1452,7 @@ fn plan_block(
 
     let reward = Transaction::new_reward(&validator, next_index);
     post_state
-        .apply_transaction(&reward, next_index)
+        .apply_verified(&reward, next_index)
         .map_err(|err| format!("Failed to apply reward: {}", err))?;
     transactions.push(
         serde_json::to_string(&reward)
@@ -2835,7 +2842,10 @@ async fn receive_protocol_message(
                 let mut pending = state.pending_transactions.lock().await;
                 let next_height = chain.next_index();
                 let mut projected = project_pending_state(&chain.state, &pending, next_height);
-                if projected.apply_transaction(&transaction, next_height).is_err() {
+                // Verified a few lines above; the network check still runs
+                // inside `apply_verified`, so a peer cannot gossip us a
+                // transaction signed for a different chain.
+                if projected.apply_verified(&transaction, next_height).is_err() {
                     drop(pending);
                     drop(chain);
                     penalize_peer(&state, &node_id).await;
@@ -3177,6 +3187,20 @@ async fn get_pending_transactions_structured(State(state): State<AppState>) -> J
 
 #[cfg(test)]
 mod tests {
+    /// A transaction scoped to this test network.
+    ///
+    /// Every real transaction names the network it is for, and the state
+    /// machine refuses one that does not match. Tests build transactions by
+    /// hand, so they use this instead of `Transaction::new` directly.
+    fn test_tx(
+        from: Option<String>,
+        to: String,
+        amount: u64,
+        kind: TransactionType,
+    ) -> Transaction {
+        Transaction::new(from, to, amount, kind)
+            .for_chain(crate::blockchain::state::DEFAULT_CHAIN_ID)
+    }
     use super::*;
     use crate::blockchain::chain::dev_genesis_private_key;
     use crate::blockchain::transaction::BLOCK_REWARD;
@@ -3754,7 +3778,7 @@ mod tests {
         let t = treasury_key();
 
         let nonce = 1;
-        let mut tx = Transaction::new(
+        let mut tx = test_tx(
             Some(t.address.clone()),
             "hkm010123456789abcdef0123456789abcdef012345".to_string(),
             25,
@@ -3834,7 +3858,7 @@ tx.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
         // Three malformed (unsigned-body / not-applicable) gossiped txs from
         // the same signed node identity trip the ban threshold.
         for i in 0..3 {
-            let mut forged = Transaction::new(
+            let mut forged = test_tx(
                 Some("hkm063456789abcdef0123456789abcdef012345678".to_string()),
                 "hkm05cdef0123456789abcdef0123456789abcdef01".to_string(),
                 9_999_999,
@@ -3874,7 +3898,7 @@ tx.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
         {
             let mut pending = state.pending_transactions.lock().await;
             for i in 0..MAX_PENDING_TXS {
-                let mut filler = Transaction::new(
+                let mut filler = test_tx(
                     Some("hkmfiller".to_string()),
                     "hkm05cdef0123456789abcdef0123456789abcdef01".to_string(),
                     1,

@@ -95,9 +95,15 @@ are byte-for-byte the same:
 
 ```
 address   = "hkm" + hex(SHA256(uncompressed secp256k1 pubkey)[..20])
+message   = "<chain_id>:<canonical message>"
 digest    = SHA256("\x19Hikmalayer Signed Message:\n" + <UTF-8 byte length> + message)
 signature = hex(compact ECDSA r||s), low-S normalized
 ```
+
+The extension signs the message it is handed; the dapp builds it with the
+network prefix. That prefix is visible in the approval screen, so a user can
+see which network a signature is for — which is the point of putting it in
+the message rather than hiding it in the digest.
 
 The crypto is imported from `dashboard/src/lib/wallet.js` — one implementation,
 one place to audit, no drift between the wallet, the dashboard, and the CLI.

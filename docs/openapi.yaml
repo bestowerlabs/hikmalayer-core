@@ -1,0 +1,1119 @@
+openapi: 3.1.0
+
+info:
+  title: Hikmalayer Node API
+  version: "3.2"
+  summary: REST API for a Hikmalayer node — accounts, staking, native tokens, and the AMM DEX.
+  description: |
+    Hikmalayer is a sovereign hybrid Layer-1: stake-weighted VRF leader
+    selection (PoS) with proof-of-work block finalization by the selected
+    validator.
+
+    ## Two things to read before writing a client
+
+    **Amounts are integer base units, and may be sent as strings.** HKM has 6
+    decimals and a 100-billion supply, so the largest legitimate amount is
+    10^17 base units — past IEEE-754's exact-integer range (2^53−1 ≈
+    9.007×10^15). A JavaScript client that routes an amount through `Number`
+    loses its low digits.
+
+    That is not only a display problem. Signatures cover the exact decimal
+    text of the amount, so a rounded value produces a request that no longer
+    matches what was signed: the node rejects an honest transaction and the
+    error names nothing useful. Every amount field therefore accepts a JSON
+    string of digits as well as a number. Send strings. A number that is
+    fractional, negative, or beyond 2^53−1 is rejected rather than truncated.
+
+    **Every signature names its network.** Canonical messages are prefixed
+    with the chain id — `hikmalayer-mainnet:hikmalayer-transfer:…` — read from
+    `chain_id` on `GET /blockchain/state`. The node stamps its own id on
+    submission, so a signature made for another network fails verification.
+
+    **Submitting is not executing.** A value-bearing request is validated,
+    signature-checked and *queued*. It changes state only when mined into a
+    block. Read `GET /tokens/balance/{account}` to see settled state.
+
+    ## Authorization
+
+    Signatures authorize value; tokens authorize operations.
+
+    - Value-bearing calls carry `public_key` + `signature` over a canonical
+      message (see each endpoint). The node never accepts a private key.
+    - Operational endpoints require `x-admin-token`; peer endpoints require
+      `x-p2p-token`. Both are deny-by-default: an unset token rejects every
+      request.
+
+    ## Errors
+
+    Domain failures are reported with HTTP 200 and `{"status":"error"}`. A
+    client that only checks the HTTP status will read a rejected transaction
+    as an accepted one.
+
+  license:
+    name: MIT
+    identifier: MIT
+
+servers:
+  - url: http://127.0.0.1:3000
+    description: Local devnet (see ops/devnet.sh)
+  - url: "{scheme}://{host}"
+    description: Any node
+    variables:
+      scheme: { default: https, enum: [https, http] }
+      host: { default: node.example.com }
+
+tags:
+  - name: Chain
+    description: Blocks, state and validation.
+  - name: Explorer
+    description: Read-only views shaped for a block explorer UI.
+  - name: Accounts
+    description: Native HKM balances, nonces and transfers.
+  - name: Staking
+    description: Validator stake, unbonding and the validator set.
+  - name: Vesting
+    description: On-chain cliff-and-linear lockups.
+  - name: Assets
+    description: Native token standard (HTS).
+  - name: DEX
+    description: Constant-product HKM pools.
+  - name: Mining
+    description: Block production.
+  - name: Credentials
+    description: Certificates and verifiable credentials.
+  - name: Governance
+    description: Parameters and slashing.
+  - name: Operations
+    description: Metrics, snapshots and checkpoints.
+  - name: P2P
+    description: Node-to-node endpoints. Not for application clients.
+
+security: []
+
+components:
+  securitySchemes:
+    adminToken:
+      type: apiKey
+      in: header
+      name: x-admin-token
+      description: Operational authority. Deny-by-default when unset on the node.
+    p2pToken:
+      type: apiKey
+      in: header
+      name: x-p2p-token
+      description: Peer authority, for node-to-node traffic only.
+
+  parameters:
+    account:
+      name: account
+      in: path
+      required: true
+      description: Native address.
+      schema: { $ref: "#/components/schemas/Address" }
+    tokenId:
+      name: token_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/TokenId" }
+
+  schemas:
+    Address:
+      type: string
+      pattern: "^hkm[0-9a-f]{40}$"
+      description: |
+        `hkm` + hex(SHA-256(uncompressed secp256k1 public key)[..20]) — 43
+        characters. There is no checksum: a mistyped address is a different
+        account, and crediting it puts funds where nobody holds a key, so the
+        chain rejects any recipient that is not well-formed.
+      examples: ["hkm13320761030a4c59d96060708e2377bc4e936dee"]
+
+    TokenId:
+      type: string
+      pattern: "^hkt[0-9a-f]{40}$"
+      description: Derived from creator, symbol and nonce at creation.
+
+    Amount:
+      description: |
+        An integer number of base units. Accepts a JSON string of digits or a
+        JSON number; **prefer the string**, since the full supply exceeds the
+        range a JSON number represents exactly.
+      oneOf:
+        - type: string
+          pattern: "^[0-9]+$"
+        - type: integer
+          format: int64
+          minimum: 0
+      examples: ["1500000", "100000000000000000"]
+
+    PublicKey:
+      type: string
+      pattern: "^04[0-9a-f]{128}$"
+      description: Uncompressed secp256k1 public key (65 bytes, hex).
+
+    Signature:
+      type: string
+      pattern: "^[0-9a-f]{128}$"
+      description: |
+        Compact ECDSA `r||s`, low-S normalized, over
+        `SHA256("\x19Hikmalayer Signed Message:\n" + <UTF-8 byte length> + message)`
+        where `message` is `<chain_id>:<canonical message>`.
+
+        The network prefix is mandatory: without it a signature is valid on
+        every Hikmalayer network at once, and a transaction signed while
+        testing replays against real funds. The length is the UTF-8 **byte**
+        length, not the character count.
+
+    Nonce:
+      type: integer
+      format: int64
+      minimum: 0
+      description: Must equal the account's stored nonce + 1 (`GET /tokens/nonce/{account}`).
+
+    SignedFields:
+      type: object
+      properties:
+        nonce: { $ref: "#/components/schemas/Nonce" }
+        public_key: { $ref: "#/components/schemas/PublicKey" }
+        signature: { $ref: "#/components/schemas/Signature" }
+      required: [public_key, signature]
+
+    ApiResponse:
+      type: object
+      description: |
+        `status` is `"success"` or `"error"`. Both are returned with HTTP 200 —
+        check this field, not the status code.
+      properties:
+        status: { type: string, enum: [success, error] }
+        message: { type: string }
+      required: [status, message]
+
+    BalanceResponse:
+      type: object
+      properties:
+        account: { $ref: "#/components/schemas/Address" }
+        balance: { $ref: "#/components/schemas/Amount" }
+
+    NonceResponse:
+      type: object
+      properties:
+        account: { $ref: "#/components/schemas/Address" }
+        next_nonce: { $ref: "#/components/schemas/Nonce" }
+
+    Stats:
+      type: object
+      properties:
+        total_blocks: { type: integer }
+        pending_transactions: { type: integer }
+        difficulty: { type: integer }
+        is_valid: { type: boolean }
+        latest_hash: { type: string }
+        finalized_height: { type: integer }
+        finality_depth: { type: integer }
+        state_root: { type: string }
+        total_supply: { $ref: "#/components/schemas/Amount" }
+        burned: { $ref: "#/components/schemas/Amount" }
+        base_fee: { $ref: "#/components/schemas/Amount" }
+
+    StateSummary:
+      type: object
+      properties:
+        chain_id:
+          type: string
+          description: |
+            The network these transactions must be signed for. Read it once
+            and prefix every canonical message with it.
+          examples: ["hikmalayer-mainnet"]
+        height: { type: integer }
+        state_root:
+          type: string
+          description: SHA-256 over the canonical serialization of the whole state.
+        total_supply: { $ref: "#/components/schemas/Amount" }
+        burned: { $ref: "#/components/schemas/Amount" }
+        staked: { $ref: "#/components/schemas/Amount" }
+        validators: { type: integer }
+        accounts: { type: integer }
+
+    Asset:
+      type: object
+      properties:
+        token_id: { $ref: "#/components/schemas/TokenId" }
+        symbol: { type: string, maxLength: 12 }
+        name: { type: string, maxLength: 64 }
+        decimals: { type: integer, minimum: 0, maximum: 18 }
+        total_supply: { $ref: "#/components/schemas/Amount" }
+        creator: { $ref: "#/components/schemas/Address" }
+        created_at_height: { type: integer }
+
+    Pool:
+      type: object
+      description: |
+        A constant-product (x·y=k) pool pairing HKM with one native token.
+        Swaps charge 0.30%, retained by the pool for liquidity providers.
+      properties:
+        token_id: { $ref: "#/components/schemas/TokenId" }
+        reserve_hkm: { $ref: "#/components/schemas/Amount" }
+        reserve_token: { $ref: "#/components/schemas/Amount" }
+        total_shares: { $ref: "#/components/schemas/Amount" }
+
+    LpPosition:
+      type: object
+      properties:
+        token_id: { $ref: "#/components/schemas/TokenId" }
+        account: { $ref: "#/components/schemas/Address" }
+        shares: { $ref: "#/components/schemas/Amount" }
+        total_shares: { $ref: "#/components/schemas/Amount" }
+
+    SwapQuote:
+      type: object
+      description: Read-only; runs the arithmetic consensus will apply.
+      properties:
+        token_id: { $ref: "#/components/schemas/TokenId" }
+        hkm_to_token: { type: boolean }
+        amount_in: { $ref: "#/components/schemas/Amount" }
+        amount_out: { $ref: "#/components/schemas/Amount" }
+        reserve_hkm: { $ref: "#/components/schemas/Amount" }
+        reserve_token: { $ref: "#/components/schemas/Amount" }
+
+    Validator:
+      type: object
+      properties:
+        address: { $ref: "#/components/schemas/Address" }
+        stake: { $ref: "#/components/schemas/Amount" }
+        public_key: { $ref: "#/components/schemas/PublicKey" }
+
+  responses:
+    Queued:
+      description: |
+        Accepted and queued, or rejected. Check `status` — a rejection is
+        reported here with HTTP 200.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+    Unauthorized:
+      description: Missing or invalid token.
+
+paths:
+  # ------------------------------------------------------------------ Chain
+  /blockchain/stats:
+    get:
+      operationId: getBlockchainStats
+      tags: [Chain]
+      summary: Chain tip, difficulty and fee market
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Stats" }
+
+  /blockchain/state:
+    get:
+      operationId: getBlockchainState
+      tags: [Chain]
+      summary: State root, supply and validator count
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StateSummary" }
+
+  /blocks:
+    get:
+      operationId: getBlocks
+      tags: [Chain]
+      summary: Every block
+      responses: { "200": { description: OK } }
+
+  /blocks/{index}:
+    get:
+      operationId: getBlocksByIndex
+      tags: [Chain]
+      summary: One block by height
+      parameters:
+        - { name: index, in: path, required: true, schema: { type: integer } }
+      responses: { "200": { description: OK } }
+
+  /blocks/{index}/validate:
+    get:
+      operationId: getBlocksByIndexValidate
+      tags: [Chain]
+      summary: Validate one block
+      parameters:
+        - { name: index, in: path, required: true, schema: { type: integer } }
+      responses: { "200": { description: OK } }
+
+  /blockchain/validate:
+    get:
+      operationId: getBlockchainValidate
+      tags: [Chain]
+      summary: Validate the whole chain
+      responses: { "200": { description: OK } }
+
+  /transactions/pending:
+    get:
+      operationId: getTransactionsPending
+      tags: [Chain]
+      summary: Queued transactions not yet mined
+      responses: { "200": { description: OK } }
+
+  /fees:
+    get:
+      operationId: getFees
+      tags: [Chain]
+      summary: Current base fee and fee-market parameters
+      responses: { "200": { description: OK } }
+
+  /validate:
+    get:
+      operationId: getValidate
+      tags: [Chain]
+      summary: Validate the chain (tutorial-compatible alias)
+      description: Kept for older tutorials; `GET /blockchain/validate` is the current form.
+      deprecated: true
+      responses: { "200": { description: OK } }
+
+  # --------------------------------------------------------------- Explorer
+  /explorer/overview:
+    get:
+      operationId: getExplorerOverview
+      tags: [Explorer]
+      summary: Headline chain figures for a block explorer
+      responses: { "200": { description: OK } }
+
+  /explorer/blocks:
+    get:
+      operationId: getExplorerBlocks
+      tags: [Explorer]
+      summary: Blocks, newest first, paginated
+      parameters:
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, default: 20 } }
+      responses: { "200": { description: OK } }
+
+  /explorer/blocks/index/{index}:
+    get:
+      operationId: getExplorerBlocksIndexByIndex
+      tags: [Explorer]
+      summary: One block by height, in explorer form
+      parameters:
+        - { name: index, in: path, required: true, schema: { type: integer } }
+      responses: { "200": { description: OK } }
+
+  /explorer/blocks/hash/{hash}:
+    get:
+      operationId: getExplorerBlocksHashByHash
+      tags: [Explorer]
+      summary: One block by hash
+      parameters:
+        - { name: hash, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: OK } }
+
+  /explorer/search/{query}:
+    get:
+      operationId: getExplorerSearchByQuery
+      tags: [Explorer]
+      summary: Search by block height, hash, transaction id or address
+      parameters:
+        - { name: query, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: OK } }
+
+  /explorer/transactions/pending:
+    get:
+      operationId: getExplorerTransactionsPending
+      tags: [Explorer]
+      summary: Queued transactions, structured for display
+      responses: { "200": { description: OK } }
+
+  # --------------------------------------------------------------- Accounts
+  /tokens/balance/{account}:
+    get:
+      operationId: getTokensBalanceByAccount
+      tags: [Accounts]
+      summary: Settled native HKM balance
+      parameters: [{ $ref: "#/components/parameters/account" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BalanceResponse" }
+
+  /tokens/nonce/{account}:
+    get:
+      operationId: getTokensNonceByAccount
+      tags: [Accounts]
+      summary: Nonce the next transaction must carry
+      parameters: [{ $ref: "#/components/parameters/account" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NonceResponse" }
+
+  /tokens/transfer:
+    post:
+      operationId: postTokensTransfer
+      tags: [Accounts]
+      summary: Move native HKM
+      description: |
+        Signs `hikmalayer-transfer:{from}:{to}:{amount}:{nonce}`, with `amount`
+        in base units. The recipient must be a well-formed address.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/SignedFields"
+                - type: object
+                  properties:
+                    from: { $ref: "#/components/schemas/Address" }
+                    to: { $ref: "#/components/schemas/Address" }
+                    amount: { $ref: "#/components/schemas/Amount" }
+                  required: [from, to, amount]
+            examples:
+              oneAndAHalfHkm:
+                summary: Send 1.5 HKM
+                value:
+                  from: hkm13320761030a4c59d96060708e2377bc4e936dee
+                  to: hkm010123456789abcdef0123456789abcdef012345
+                  amount: "1500000"
+                  nonce: 1
+                  public_key: "04c354c229224f85066cd0d7daa1f6c387e53511a349374294f385a83587ddd93e00055895a42b4de120fec7932537d22490aeb7de63c8d3b7f8bc790271962bbb"
+                  signature: "d1d05399750fb32b17b3a7175e55d7205e10861029ce103ca3dd3efd78df2d6f302162500702cc57c4c93dbfece7d461dd2ad502d39f8ae61f1d0265c566735e"
+      responses:
+        "200": { $ref: "#/components/responses/Queued" }
+
+  /tokens/faucet:
+    post:
+      operationId: postTokensFaucet
+      tags: [Accounts]
+      summary: Send HKM from the node's treasury (development)
+      description: Enabled only when the node holds the treasury key.
+      security: [{ adminToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                to: { $ref: "#/components/schemas/Address" }
+                amount: { $ref: "#/components/schemas/Amount" }
+              required: [to, amount]
+      responses:
+        "200": { $ref: "#/components/responses/Queued" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ---------------------------------------------------------------- Staking
+  /staking/deposit:
+    post:
+      operationId: postStakingDeposit
+      tags: [Staking]
+      summary: Bond stake to become or remain a validator
+      description: |
+        Signs `hikmalayer-stake:{address}:{amount}:{nonce}:{vrf_public_key}` —
+        the VRF key is part of the signed message so it cannot be substituted
+        in transit. The resulting stake must be at least the minimum
+        (10,000 HKM).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/SignedFields"
+                - type: object
+                  properties:
+                    address: { $ref: "#/components/schemas/Address" }
+                    amount: { $ref: "#/components/schemas/Amount" }
+                    vrf_public_key: { type: string }
+                  required: [address, amount, vrf_public_key]
+      responses:
+        "200": { $ref: "#/components/responses/Queued" }
+
+  /staking/withdraw:
+    post:
+      operationId: postStakingWithdraw
+      tags: [Staking]
+      summary: Begin unbonding
+      description: |
+        Signs `hikmalayer-withdraw:{address}:{amount}:{nonce}`. Must leave the
+        validator at zero (a full exit) or at or above the minimum stake.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/SignedFields"
+                - type: object
+                  properties:
+                    address: { $ref: "#/components/schemas/Address" }
+                    amount: { $ref: "#/components/schemas/Amount" }
+                  required: [address, amount]
+      responses:
+        "200": { $ref: "#/components/responses/Queued" }
+
+  /staking/validators:
+    get:
+      operationId: getStakingValidators
+      tags: [Staking]
+      summary: The active validator set
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Validator" }
+
+  /staking/unbonding/{address}:
+    get:
+      operationId: getStakingUnbondingByAddress
+      tags: [Staking]
+      summary: Pending unbonding entries
+      parameters:
+        - { name: address, in: path, required: true, schema: { $ref: "#/components/schemas/Address" } }
+      responses: { "200": { description: OK } }
+
+  # ---------------------------------------------------------------- Vesting
+  /tokens/vest:
+    post:
+      operationId: postTokensVest
+      tags: [Vesting]
+      summary: Lock a grant with a cliff and linear release
+      description: |
+        Signs
+        `hikmalayer-vest:{from}:{to}:{amount}:{cliff}:{duration}:{nonce}`.
+        Funds move to the vesting pool and release to the beneficiary as
+        blocks pass; nothing releases before the cliff.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/SignedFields"
+                - type: object
+                  properties:
+                    from: { $ref: "#/components/schemas/Address" }
+                    to: { $ref: "#/components/schemas/Address" }
+                    amount: { $ref: "#/components/schemas/Amount" }
+                    cliff_blocks: { type: integer }
+                    duration_blocks: { type: integer, minimum: 1 }
+                  required: [from, to, amount, cliff_blocks, duration_blocks]
+      responses:
+        "200": { $ref: "#/components/responses/Queued" }
+
+  /vesting/{address}:
+    get:
+      operationId: getVestingByAddress
+      tags: [Vesting]
+      summary: Vesting schedules for an account
+      parameters:
+        - { name: address, in: path, required: true, schema: { $ref: "#/components/schemas/Address" } }
+      responses: { "200": { description: OK } }
+
+  # ----------------------------------------------------------------- Assets
+  /assets:
+    get:
+      operationId: getAssets
+      tags: [Assets]
+      summary: Every native token
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Asset" }
+
+  /assets/{token_id}:
+    get:
+      operationId: getAssetsByTokenId
+      tags: [Assets]
+      summary: One token's metadata
+      description: Returns `null` when the token is unknown.
+      parameters: [{ $ref: "#/components/parameters/tokenId" }]
+      responses:
+        "200":
+          description: OK, or null when unknown
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: "#/components/schemas/Asset" }
+                  - { type: "null" }
+
+  /assets/{token_id}/balance/{account}:
+    get:
+      operationId: getAssetsByTokenIdBalanceByAccount
+      tags: [Assets]
+      summary: Token balance, in that token's base units
+      parameters:
+        - { $ref: "#/components/parameters/tokenId" }
+        - { $ref: "#/components/parameters/account" }
+      responses: { "200": { description: OK } }
+
+  /assets/create:
+    post:
+      operationId: postAssetsCreate
+      tags: [Assets]
+      summary: Issue a native token
+      description: |
+        Signs
+        `hikmalayer-token-create:{symbol}:{name}:{decimals}:{supply}:{nonce}`.
+        The whole supply is minted to the creator; the token id is derived
+        from creator, symbol and nonce.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/SignedFields"
+                - type: object
+                  properties:
+                    creator: { $ref: "#/components/schemas/Address" }
+                    symbol: { type: string, maxLength: 12 }
+                    name: { type: string, maxLength: 64 }
+                    decimals: { type: integer, minimum: 0, maximum: 18 }
+                    initial_supply: { $ref: "#/components/schemas/Amount" }
+                  required: [creator, symbol, decimals, initial_supply]
+      responses:
+        "200": { $ref: "#/components/responses/Queued" }
+
+  /assets/transfer:
+    post:
+      operationId: postAssetsTransfer
+      tags: [Assets]
+      summary: Move token units
+      description: Signs `hikmalayer-token-transfer:{token_id}:{to}:{amount}:{nonce}`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/SignedFields"
+                - type: object
+                  properties:
+                    token_id: { $ref: "#/components/schemas/TokenId" }
+                    from: { $ref: "#/components/schemas/Address" }
+                    to: { $ref: "#/components/schemas/Address" }
+                    amount: { $ref: "#/components/schemas/Amount" }
+                  required: [token_id, from, to, amount]
+      responses:
+        "200": { $ref: "#/components/responses/Queued" }
+
+  /assets/burn:
+    post:
+      operationId: postAssetsBurn
+      tags: [Assets]
+      summary: Destroy the sender's units, reducing supply
+      description: Signs `hikmalayer-token-burn:{token_id}:{amount}:{nonce}`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/SignedFields"
+                - type: object
+                  properties:
+                    token_id: { $ref: "#/components/schemas/TokenId" }
+                    from: { $ref: "#/components/schemas/Address" }
+                    amount: { $ref: "#/components/schemas/Amount" }
+                  required: [token_id, from, amount]
+      responses:
+        "200": { $ref: "#/components/responses/Queued" }
+
+  # -------------------------------------------------------------------- DEX
+  /dex/pools:
+    get:
+      operationId: getDexPools
+      tags: [DEX]
+      summary: Every pool
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Pool" }
+
+  /dex/pool/{token_id}:
+    get:
+      operationId: getDexPoolByTokenId
+      tags: [DEX]
+      summary: One pool's reserves
+      parameters: [{ $ref: "#/components/parameters/tokenId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: "#/components/schemas/Pool" }
+                  - { type: "null" }
+
+  /dex/position/{token_id}/{account}:
+    get:
+      operationId: getDexPositionByTokenIdByAccount
+      tags: [DEX]
+      summary: An account's LP shares in a pool
+      parameters:
+        - { $ref: "#/components/parameters/tokenId" }
+        - { $ref: "#/components/parameters/account" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LpPosition" }
+
+  /dex/quote/{token_id}/{direction}/{amount_in}:
+    get:
+      operationId: getDexQuoteByTokenIdByDirectionByAmountIn
+      tags: [DEX]
+      summary: Quote a swap
+      description: |
+        Runs the same arithmetic consensus applies, so the preview matches
+        execution exactly. Use it to set `min_out`.
+      parameters:
+        - { $ref: "#/components/parameters/tokenId" }
+        - name: direction
+          in: path
+          required: true
+          schema: { type: string, enum: [hkm_to_token, token_to_hkm, buy, sell] }
+        - name: amount_in
+          in: path
+          required: true
+          schema: { type: string, pattern: "^[0-9]+$" }
+      responses:
+        "200":
+          description: OK, or null when the pool has no liquidity
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: "#/components/schemas/SwapQuote" }
+                  - { type: "null" }
+
+  /dex/swap:
+    post:
+      operationId: postDexSwap
+      tags: [DEX]
+      summary: Trade against a pool
+      description: |
+        Signs
+        `hikmalayer-amm-swap:{token_id}:{hkm_to_token}:{amount_in}:{min_out}:{nonce}`,
+        where `hkm_to_token` renders as `true`/`false`.
+
+        `min_out` is the slippage floor and is part of what you sign, so the
+        chain rejects the trade if the pool moved against you before it
+        executed. Submitting `0` means no protection at all.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/SignedFields"
+                - type: object
+                  properties:
+                    token_id: { $ref: "#/components/schemas/TokenId" }
+                    trader: { $ref: "#/components/schemas/Address" }
+                    hkm_to_token: { type: boolean }
+                    amount_in: { $ref: "#/components/schemas/Amount" }
+                    min_out: { $ref: "#/components/schemas/Amount" }
+                  required: [token_id, trader, hkm_to_token, amount_in]
+      responses:
+        "200": { $ref: "#/components/responses/Queued" }
+
+  /dex/add:
+    post:
+      operationId: postDexAdd
+      tags: [DEX]
+      summary: Provide liquidity
+      description: |
+        Signs
+        `hikmalayer-amm-add:{token_id}:{amount_hkm}:{amount_token}:{min_shares}:{nonce}`.
+
+        The first deposit sets the pool's price and mints
+        `sqrt(hkm · token) − 1000` shares (1000 are locked permanently).
+        Later deposits must match the pool ratio: whichever side binds is
+        taken in full and the surplus on the other side stays in your
+        account. `min_shares` bounds the outcome.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/SignedFields"
+                - type: object
+                  properties:
+                    token_id: { $ref: "#/components/schemas/TokenId" }
+                    provider: { $ref: "#/components/schemas/Address" }
+                    amount_hkm: { $ref: "#/components/schemas/Amount" }
+                    amount_token: { $ref: "#/components/schemas/Amount" }
+                    min_shares: { $ref: "#/components/schemas/Amount" }
+                  required: [token_id, provider, amount_hkm, amount_token]
+      responses:
+        "200": { $ref: "#/components/responses/Queued" }
+
+  /dex/remove:
+    post:
+      operationId: postDexRemove
+      tags: [DEX]
+      summary: Withdraw liquidity
+      description: |
+        Signs
+        `hikmalayer-amm-remove:{token_id}:{shares}:{min_hkm}:{min_token}:{nonce}`.
+        Burns shares and returns the pro-rata amount of both reserves, bounded
+        by `min_hkm` and `min_token`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/SignedFields"
+                - type: object
+                  properties:
+                    token_id: { $ref: "#/components/schemas/TokenId" }
+                    provider: { $ref: "#/components/schemas/Address" }
+                    shares: { $ref: "#/components/schemas/Amount" }
+                    min_hkm: { $ref: "#/components/schemas/Amount" }
+                    min_token: { $ref: "#/components/schemas/Amount" }
+                  required: [token_id, provider, shares]
+      responses:
+        "200": { $ref: "#/components/responses/Queued" }
+
+  # ----------------------------------------------------------------- Mining
+  /mine:
+    post:
+      operationId: postMine
+      tags: [Mining]
+      summary: Seal a block with this node's validator key
+      description: Only succeeds when this node's validator is an eligible leader for an open round.
+      security: [{ adminToken: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Queued" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /mine/propose:
+    post:
+      operationId: postMinePropose
+      tags: [Mining]
+      summary: Build an unsealed block template
+      security: [{ adminToken: [] }]
+      responses: { "200": { description: OK } }
+
+  /mine/submit:
+    post:
+      operationId: postMineSubmit
+      tags: [Mining]
+      summary: Submit an externally sealed block
+      security: [{ adminToken: [] }]
+      responses: { "200": { description: OK } }
+
+  /mining/difficulty:
+    get:
+      operationId: getMiningDifficulty
+      tags: [Mining]
+      summary: Current difficulty
+      responses: { "200": { description: OK } }
+    post:
+      operationId: postMiningDifficulty
+      tags: [Mining]
+      summary: Set difficulty (development)
+      security: [{ adminToken: [] }]
+      responses: { "200": { description: OK } }
+
+  # ------------------------------------------------------------ Credentials
+  /certificates/issue:
+    post:
+      operationId: postCertificatesIssue
+      tags: [Credentials]
+      summary: Issue a certificate
+      security: [{ adminToken: [] }]
+      responses: { "200": { description: OK } }
+
+  /certificates/verify:
+    post:
+      operationId: postCertificatesVerify
+      tags: [Credentials]
+      summary: Verify a certificate
+      responses: { "200": { description: OK } }
+
+  /certificates/attest:
+    post:
+      operationId: postCertificatesAttest
+      tags: [Credentials]
+      summary: Attest a certificate
+      security: [{ adminToken: [] }]
+      responses: { "200": { description: OK } }
+
+  /credentials/issue:
+    post:
+      operationId: postCredentialsIssue
+      tags: [Credentials]
+      summary: Write a credential
+      description: Signs `hikmalayer-credential:{id}:{subject}:{data_hash}:{revoke}:{nonce}`.
+      responses: { "200": { description: OK } }
+
+  /credentials/revoke:
+    post:
+      operationId: postCredentialsRevoke
+      tags: [Credentials]
+      summary: Revoke a credential
+      responses: { "200": { description: OK } }
+
+  /credentials/{id}:
+    get:
+      operationId: getCredentialsById
+      tags: [Credentials]
+      summary: Read a credential
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: OK } }
+
+  /credentials/{id}/proof:
+    get:
+      operationId: getCredentialsByIdProof
+      tags: [Credentials]
+      summary: Inclusion proof for a credential
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: OK } }
+
+  # ------------------------------------------------------------- Governance
+  /governance/config:
+    get:
+      operationId: getGovernanceConfig
+      tags: [Governance]
+      summary: Slashing and finality parameters
+      responses: { "200": { description: OK } }
+    post:
+      operationId: postGovernanceConfig
+      tags: [Governance]
+      summary: Update parameters
+      security: [{ adminToken: [] }]
+      responses: { "200": { description: OK } }
+
+  /slashing/evidence:
+    get:
+      operationId: getSlashingEvidence
+      tags: [Governance]
+      summary: Recorded slashing evidence
+      responses: { "200": { description: OK } }
+    post:
+      operationId: postSlashingEvidence
+      tags: [Governance]
+      summary: Submit slashing evidence
+      responses: { "200": { description: OK } }
+
+  /slashing/equivocation:
+    post:
+      operationId: postSlashingEquivocation
+      tags: [Governance]
+      summary: Submit an equivocation proof (two blocks signed at one height)
+      responses: { "200": { description: OK } }
+
+  # ------------------------------------------------------------- Operations
+  /metrics:
+    get:
+      operationId: getMetrics
+      tags: [Operations]
+      summary: Node metrics
+      responses: { "200": { description: OK } }
+
+  /snapshot:
+    get:
+      operationId: getSnapshot
+      tags: [Operations]
+      summary: Full node snapshot
+      responses: { "200": { description: OK } }
+
+  /checkpoint:
+    get:
+      operationId: getCheckpoint
+      tags: [Operations]
+      summary: Checkpoint root at the tip
+      responses: { "200": { description: OK } }
+
+  /checkpoint/bundle:
+    get:
+      operationId: getCheckpointBundle
+      tags: [Operations]
+      summary: Checkpoint bundle for fast-sync
+      description: |
+        Anchor block, state root and forward blocks, letting a new node sync
+        without replaying history from genesis. Exported only when the tip
+        sits on a retarget boundary.
+      responses: { "200": { description: OK } }
+
+  # -------------------------------------------------------------------- P2P
+  /p2p/protocol:
+    post:
+      operationId: postP2pProtocol
+      tags: [P2P]
+      summary: Signed peer message envelope
+      description: Node-to-node only. Application clients should not call this.
+      security: [{ p2pToken: [] }]
+      responses: { "200": { description: OK } }
+
+  /p2p/peers:
+    get:
+      operationId: getP2pPeers
+      tags: [P2P]
+      summary: Known peers
+      security: [{ p2pToken: [] }]
+      responses: { "200": { description: OK } }
+
+  /p2p/peers/register:
+    post:
+      operationId: postP2pPeersRegister
+      tags: [P2P]
+      summary: Register a peer
+      security: [{ p2pToken: [] }]
+      responses: { "200": { description: OK } }
+
+  /p2p/peers/scores:
+    get:
+      operationId: getP2pPeersScores
+      tags: [P2P]
+      summary: Peer reputation scores
+      security: [{ p2pToken: [] }]
+      responses: { "200": { description: OK } }
+
+  /p2p/block:
+    post:
+      operationId: postP2pBlock
+      tags: [P2P]
+      summary: Receive one block from a peer
+      security: [{ p2pToken: [] }]
+      responses: { "200": { description: OK } }
+
+  /p2p/blocks:
+    post:
+      operationId: postP2pBlocks
+      tags: [P2P]
+      summary: Receive a batch of blocks
+      security: [{ p2pToken: [] }]
+      responses: { "200": { description: OK } }
+
+  /p2p/chain:
+    get:
+      operationId: getP2pChain
+      tags: [P2P]
+      summary: This node's chain, for peer comparison
+      security: [{ p2pToken: [] }]
+      responses: { "200": { description: OK } }

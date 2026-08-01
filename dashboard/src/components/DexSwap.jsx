@@ -143,12 +143,15 @@ const DexSwap = ({ refreshTrigger, onUpdate }) => {
       const signedBy = unlocked
         ? { public_key: signerPublicKey, signature: await sign(signingMessages.swap(signParams)) }
         : { public_key: publicKey.trim(), signature: signature.trim() };
+      // Decimal strings, not numbers: base-unit amounts routinely exceed
+      // 2^53, and the signature covers the exact digits, so a rounded value
+      // would no longer match the message the user approved.
       const res = await submitSwap({
         token_id: tokenId,
         trader: account,
         hkm_to_token: hkmToToken,
-        amount_in: Number(amountIn),
-        min_out: Number(minOut),
+        amount_in: signParams.amountIn,
+        min_out: signParams.minOut,
         nonce,
         ...signedBy,
       });

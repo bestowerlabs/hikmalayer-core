@@ -14,9 +14,16 @@ Signing reproduces `src/consensus/pos.rs` exactly:
 
 ```
 address   = "hkm" + hex(SHA256(uncompressed secp256k1 pubkey)[..20])
+message   = "<chain_id>:<canonical message>"
 digest    = SHA256("\x19Hikmalayer Signed Message:\n" + <UTF-8 byte length> + message)
 signature = hex(compact ECDSA r||s), low-S normalized
 ```
+
+The `chain_id` prefix is what stops a signature made on one network being
+replayed on another — addresses come from the key, so the same account exists
+on a testnet and on mainnet. It is a *visible* prefix rather than a hidden
+change to the digest precisely so the confirmation dialog can show the user
+which network they are authorizing.
 
 Signatures are **byte-for-byte identical** to those from the `hikma-wallet`
 CLI — verified across transfer, swap and token-create domains, including a
@@ -56,6 +63,22 @@ Verified in a real browser: the page cannot reach `chrome.storage`, cannot
 invoke `wallet:export`, cannot approve its own request, and sees no accounts
 until connected — yet an approved signature is accepted by a live node.
 
+The extension holds **multiple accounts in one keyring** under a single
+password. Three properties are worth stating plainly, because each closes a
+gap that a naive implementation leaves open:
+
+- **A signature is pinned to the account the approval displayed.** Switching
+  accounts while an approval window is open cannot redirect the signature.
+- **A site only learns about accounts it is connected to.** Switching accounts
+  emits `accountsChanged` to connected origins only — an unconnected page
+  sitting in a background tab learns nothing.
+- **An approval window belongs to its request.** Closing some other browser
+  window does not cancel an approval you are still reading; only closing that
+  approval rejects it.
+
+There is no seed phrase and no HD derivation: each account is an independent
+key, so **each one needs its own backup**.
+
 **Recommendation:** install the extension and use it as the signer. The
 dashboard detects it automatically and prefers it; the in-page wallet remains
 for users who have not installed it.
@@ -76,21 +99,26 @@ exactly this reason: with the wallet locked, every DEX panel shows the precise
 
 1. **Serve over HTTPS** (or localhost). The wallet refuses to operate in an
    insecure context — WebCrypto is unavailable there.
-2. **Send the CSP as an HTTP header**, not only the `<meta>` tag in
-   `dashboard/index.html`. A header additionally enforces `frame-ancestors`,
-   which blocks clickjacking of the confirmation dialog:
+2. **Set `VITE_API_BASE`** to your node's origin before building (see
+   `dashboard/.env.example`). The build bakes it in *and* adds it to the
+   page's `connect-src`, so the dashboard is never blocked by its own policy.
+   To retarget an already-built bundle, serve an inline script setting
+   `window.__HIKMALAYER_NODE__` — it takes precedence.
+3. **Send the CSP as an HTTP header**, not only the `<meta>` tag in
+   `dashboard/index.html`. The meta tag cannot enforce `frame-ancestors`
+   (browsers ignore it there), and that directive is what blocks clickjacking
+   of the confirmation dialog — so the header is not optional:
    ```
    Content-Security-Policy: default-src 'self'; script-src 'self';
      style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;
      connect-src 'self' https://<your-node-host>; object-src 'none';
      base-uri 'none'; form-action 'none'; frame-ancestors 'none'
    ```
-   Update `connect-src` (and the meta tag) to your node's public origin.
-3. **Set `CORS_ALLOWED_ORIGINS`** on the node to the dashboard's origin — it is
+4. **Set `CORS_ALLOWED_ORIGINS`** on the node to the dashboard's origin — it is
    an explicit allowlist, never a wildcard.
-4. **Add `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and
+5. **Add `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and
    HSTS** at the web server.
-5. **Review dependencies before each release** (`npm audit`); the wallet's
+6. **Review dependencies before each release** (`npm audit`); the wallet's
    crypto comes from `@noble/curves` and `@noble/hashes`, which are audited and
    dependency-free.
 

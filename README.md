@@ -385,6 +385,43 @@ Why it stands out:
 | Revocation | Contract-specific | Protocol-level, issuer-signed, instant |
 | Trust needed | The RPC node | None — the proof binds to the replicated state root |
 
+## Building on Hikmalayer
+
+Start a local chain — funded, with a registered validator, sealing blocks — in
+one command:
+
+```bash
+ops/devnet.sh
+```
+
+Then talk to it with the SDK:
+
+```js
+import { HikmalayerClient, LocalSigner, parseUnits } from "@hikmalayer/sdk";
+
+const client = HikmalayerClient.withPrivateKey(process.env.HIKMALAYER_KEY);
+await client.transfer({ to: "hkm…", amount: parseUnits("1.5") });
+await client.swap({ tokenId, amountIn: parseUnits("100") });  // slippage-bounded
+```
+
+| Tool | Where | What it is |
+|---|---|---|
+| **SDK** | [`sdk/`](sdk/README.md) | JavaScript client: signing, transactions, tokens, DEX. Signatures proven byte-identical to the Rust signer. |
+| **Devnet** | [`ops/devnet.sh`](ops/devnet.sh) | One-command local chain with a faucet and an auto-miner. |
+| **API reference** | [`docs/openapi.yaml`](docs/openapi.yaml) | OpenAPI 3.1 for all 63 endpoints — generate a client in any language. |
+| **Wallet extension** | [`extension/`](extension/README.md) | MetaMask-style browser wallet; dapps get `window.hikmalayer`. |
+| **Dashboard** | [`dashboard/`](dashboard/) | Explorer, wallet and DEX UI. |
+| **CLI** | `hikma-wallet` | Offline keygen and signing, for keys that must never touch a browser. |
+
+Two rules worth knowing before you write a client, both documented in the
+[SDK README](sdk/README.md):
+
+1. **Amounts are integer base units, and belong on the wire as strings.** The
+   supply exceeds what a JSON number represents exactly, and signatures cover
+   the amount's exact digits — a rounded value stops matching what was signed.
+2. **Submitting is not executing.** Transactions are queued and take effect
+   when mined.
+
 ## Running a node
 
 ```bash

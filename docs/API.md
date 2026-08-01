@@ -14,6 +14,14 @@ Hikmalayer is a hybrid PoS/PoW blockchain platform with REST execution APIs, sta
 Where an example below conflicts with this section, this section is
 authoritative.
 
+**Every signature is bound to a network.** Canonical messages are prefixed
+with the chain's id — `hikmalayer-mainnet:hikmalayer-transfer:…` — and the
+node stamps its own id on submission, so a signature produced for a different
+network simply fails verification. Read the id from `GET /blockchain/state`
+(`chain_id`) and scope every message you build with it. Without this a user
+who signs a transaction on a testnet could have it replayed verbatim against
+their mainnet balance, since their address is the same on both.
+
 **Native identity — no Ethereum.** Addresses are `hkm` + hex(SHA-256(uncompressed
 secp256k1 public key)[..20]) — 43 characters. There is no `0x`/keccak address and
 no `personal_sign`/Ethereum message prefix. All signatures are native compact
@@ -44,15 +52,17 @@ on the node; endpoints gated by an unset token reject every request.
 }
 ```
 
-The signature covers `hikmalayer-transfer:{from}:{to}:{amount}:{nonce}`; the
-`public_key` must derive to `from`. Fetch the next nonce with
+The signature covers
+`{chain_id}:hikmalayer-transfer:{from}:{to}:{amount}:{nonce}` — the network
+prefix is not optional — and the `public_key` must derive to `from`. Fetch the next nonce with
 `GET /tokens/nonce/{account}`, sign offline with `hikma-wallet sign-transfer`.
 
 **Staking is on-chain, signed, and key-bound.** `POST /staking/deposit` submits a
 signed Stake transaction (`public_key`, `nonce`, signature over
-`hikmalayer-stake:{address}:{amount}:{nonce}`; `address` must derive from
-`public_key`). `POST /staking/withdraw` submits a signed Withdraw transaction
-(signature over `hikmalayer-withdraw:{address}:{amount}:{nonce}` by the
+`{chain_id}:hikmalayer-stake:{address}:{amount}:{nonce}:{vrf_public_key}`;
+`address` must derive from `public_key`). `POST /staking/withdraw` submits a
+signed Withdraw transaction (signature over
+`{chain_id}:hikmalayer-withdraw:{address}:{amount}:{nonce}` by the
 validator's on-chain key). Both take effect when mined; the validator set is
 derived from state.
 
@@ -79,6 +89,23 @@ units, 1 HKM = 1,000,000 units. Genesis supply is 30B HKM (30,000,000,000,000,00
 units); ~70B more is mined on the halving schedule (~100B total — a 30/70
 premine/mined split).
 
+**Amounts may be sent as a JSON string, and usually should be.** Every amount
+field (`amount`, `amount_hkm`, `amount_token`, `amount_in`, `initial_supply`,
+`shares`, and the `min_*` bounds) accepts either a JSON number or a decimal
+string of digits.
+
+Use a string from JavaScript. The full supply is 10^17 base units, well past
+`Number.MAX_SAFE_INTEGER` (2^53−1 ≈ 9.007×10^15), so a large amount routed
+through `Number` silently loses its low digits. That is not only a display
+problem: signatures cover the *exact* decimal text of the amount, so a rounded
+value produces a request that no longer matches what the user signed, and the
+node rejects an otherwise honest transaction. Sending `BigInt.toString()` is
+exact by construction.
+
+Numbers keep working for small values. A number that is fractional, negative,
+or beyond 2^53−1 is **rejected** rather than truncated — silently accepting a
+value the client already corrupted would be worse than failing.
+
 **Native token standard (HTS).** First-class fungible tokens as ecosystem
 assets (the DEX foundation), under `/assets/*`:
 `POST /assets/create` issues a token — `{creator, symbol, name, decimals,
@@ -90,7 +117,8 @@ creator; the deterministic `hkt…` token id is derived from
 Read models: `GET /assets` (registry), `GET /assets/{token_id}` (metadata),
 `GET /assets/{token_id}/balance/{account}`. Token amounts are in the token's own
 base units; each operation pays its fee in HKM. Sign offline with
-`hikma-wallet sign-token-create|sign-token-transfer|sign-token-burn`.
+`hikma-wallet sign-token-create|sign-token-transfer|sign-token-burn`, setting
+`HIKMALAYER_CHAIN_ID` to the network's id.
 
 **Native AMM DEX (`/dex/*`).** Constant-product (Uniswap-v2-style) pools, each
 pairing a native token with **HKM**. `POST /dex/add`
@@ -108,7 +136,8 @@ and `GET /dex/quote/{token_id}/{direction}/{amount_in}` — a read-only quote
 (`direction` = `hkm_to_token` or `token_to_hkm`) returning the exact output the
 same math would produce, for setting `min_out`. All amounts are base units;
 each op also pays the HKM base fee. Sign offline with
-`hikma-wallet sign-amm-add|sign-amm-remove|sign-amm-swap`. Pools are for HKM and
+`hikma-wallet sign-amm-add|sign-amm-remove|sign-amm-swap`, setting
+`HIKMALAYER_CHAIN_ID` to the network's id. Pools are for HKM and
 native tokens only — this is not a bridge to external chains.
 
 **Vesting.** `POST /tokens/vest` queues a signed lockup: `amount` moves into

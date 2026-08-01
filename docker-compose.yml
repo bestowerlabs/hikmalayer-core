@@ -8,6 +8,11 @@ x-common-env: &common-env
   RUST_LOG: info
   P2P_ALLOWLIST: ${P2P_ALLOWLIST}
   P2P_REQUIRE_IDENTITY: ${P2P_REQUIRE_IDENTITY}
+  # Every node on a network MUST agree on this: it is baked into the genesis
+  # state root, and every user signature is bound to it. Nodes with different
+  # ids are different networks and will not accept each other's transactions.
+  GENESIS_CHAIN_ID: ${GENESIS_CHAIN_ID}
+  GENESIS_VALIDATOR_ALLOWLIST: ${GENESIS_VALIDATOR_ALLOWLIST}
 
 services:
   bootnode:

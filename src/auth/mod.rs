@@ -12,6 +12,12 @@ pub struct AuthManager {
     pub nonces: HashMap<String, String>,
 }
 
+impl Default for AuthManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AuthManager {
     pub fn new() -> Self {
         Self {
@@ -29,11 +35,11 @@ impl AuthManager {
     pub fn verify_nonce(&self, address: &str, nonce: &str) -> bool {
         self.nonces
             .get(address)
-            .map_or(false, |stored_nonce| stored_nonce == nonce)
+            .is_some_and(|stored_nonce| stored_nonce == nonce)
     }
 
     pub fn create_session(&mut self, address: &str) -> String {
-        let token = format!("{}_{}", uuid::Uuid::new_v4().to_string(), address);
+        let token = format!("{}_{}", uuid::Uuid::new_v4(), address);
         self.sessions.insert(token.clone(), address.to_string());
         // Remove the nonce after successful authentication
         self.nonces.remove(address);

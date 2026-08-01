@@ -1,9 +1,8 @@
 import React, { useState, useEffect } from "react";
 import { useAuthenticatedApi } from "../hooks/useAuthenticatedApi";
+import { API_BASE } from "../api";
 
-const API_BASE = "http://127.0.0.1:3000";
-
-const MiningActions = ({ refreshTrigger, onMiningComplete }) => {
+const MiningActions = ({ refreshTrigger, onUpdate }) => {
   const [difficulty, setDifficulty] = useState(2);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
@@ -56,8 +55,8 @@ const MiningActions = ({ refreshTrigger, onMiningComplete }) => {
         });
 
         // Trigger refresh in parent components
-        if (onMiningComplete) {
-          onMiningComplete();
+        if (onUpdate) {
+          onUpdate();
         }
       } else {
         setMessage(`Mining failed: ${result.message || "Unknown error"}`);

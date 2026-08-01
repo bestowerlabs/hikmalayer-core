@@ -243,6 +243,135 @@ export async function decryptVault(vault, password) {
   return privateKeyHex;
 }
 
+// ===== Multi-account keyring (vault v2) =====
+//
+// A v1 vault holds exactly one key. A keyring holds several, encrypted
+// together under one password, with public-only metadata alongside so the UI
+// can list accounts while locked. One password and one KDF run for the whole
+// set: adding an account must never mean a second thing to remember.
+//
+// `decryptKeyring` also reads a v1 vault, so an existing single-key install
+// keeps working and is upgraded in place the next time it is written.
+
+export const MAX_ACCOUNTS = 20;
+
+const defaultLabel = (index) => `Account ${index + 1}`;
+
+/// Public metadata for one key. Contains nothing secret.
+function accountMetadata(privateKeyHex, label, index) {
+  const publicKey = derivePublicKey(privateKeyHex);
+  return {
+    address: deriveAddress(publicKey),
+    publicKey,
+    label: String(label || defaultLabel(index)).slice(0, 40),
+  };
+}
+
+/// Encrypt a set of private keys under one password.
+export async function encryptKeyring(privateKeys, password, options = {}) {
+  const keys = privateKeys.map(normalizeHex);
+  if (keys.length === 0) throw new Error("A keyring needs at least one key");
+  if (keys.length > MAX_ACCOUNTS) {
+    throw new Error(`At most ${MAX_ACCOUNTS} accounts per wallet`);
+  }
+  if (keys.some((key) => !isValidPrivateKey(key))) {
+    throw new Error("Invalid private key");
+  }
+  if (new Set(keys).size !== keys.length) {
+    throw new Error("That key is already in this wallet");
+  }
+  if (!password || password.length < 8) {
+    throw new Error("Password must be at least 8 characters");
+  }
+
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveVaultKey(password, salt, PBKDF2_ITERATIONS);
+  const ciphertext = await subtle().encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    utf8ToBytes(JSON.stringify(keys))
+  );
+
+  const labels = options.labels || [];
+  const accounts = keys.map((k, i) => accountMetadata(k, labels[i], i));
+  const activeIndex = Math.min(Math.max(options.activeIndex ?? 0, 0), keys.length - 1);
+
+  return {
+    version: 2,
+    kdf: "PBKDF2-SHA256",
+    iterations: PBKDF2_ITERATIONS,
+    salt: b64(salt),
+    iv: b64(iv),
+    ciphertext: b64(ciphertext),
+    accounts,
+    activeIndex,
+  };
+}
+
+/// Decrypt a keyring to its private keys, in account order.
+/// Accepts a v1 (single-key) vault and returns a one-element array.
+export async function decryptKeyring(vault, password) {
+  if (!vault) throw new Error("No wallet on this device");
+  if (vault.version !== 2) {
+    // Legacy single-key vault: reuse its verified path verbatim.
+    return [await decryptVault(vault, password)];
+  }
+
+  const key = await deriveVaultKey(
+    password,
+    unb64(vault.salt),
+    vault.iterations || PBKDF2_ITERATIONS
+  );
+  let plaintext;
+  try {
+    plaintext = await subtle().decrypt(
+      { name: "AES-GCM", iv: unb64(vault.iv) },
+      key,
+      unb64(vault.ciphertext)
+    );
+  } catch {
+    throw new Error("Incorrect password");
+  }
+
+  let keys;
+  try {
+    keys = JSON.parse(new TextDecoder().decode(plaintext));
+  } catch {
+    throw new Error("Vault is corrupt");
+  }
+  if (!Array.isArray(keys) || keys.length === 0) throw new Error("Vault is corrupt");
+  if (keys.some((k) => !isValidPrivateKey(k))) throw new Error("Vault is corrupt");
+
+  // Same defence in depth as v1: the stored public metadata must match what
+  // the decrypted keys actually derive to, so tampering with `accounts`
+  // cannot make the UI show — or sign for — the wrong address.
+  const accounts = vault.accounts || [];
+  if (accounts.length !== keys.length) throw new Error("Vault integrity check failed");
+  keys.forEach((k, i) => {
+    if (deriveAddress(derivePublicKey(k)) !== accounts[i].address) {
+      throw new Error("Vault integrity check failed");
+    }
+  });
+
+  return keys.map(normalizeHex);
+}
+
+/// Index of the active account, clamped into range.
+export function activeAccountIndex(vault) {
+  const count = vault?.accounts?.length ?? 0;
+  if (count === 0) return 0;
+  return Math.min(Math.max(vault.activeIndex ?? 0, 0), count - 1);
+}
+
+/// Read a vault's accounts as public metadata, upgrading a v1 vault's shape
+/// on the fly so callers only ever deal with one format.
+export function vaultAccounts(vault) {
+  if (!vault) return [];
+  if (vault.version === 2) return vault.accounts ?? [];
+  return [{ address: vault.address, publicKey: vault.publicKey, label: defaultLabel(0) }];
+}
+
 // ===== Persistence (ciphertext only) =====
 
 export function loadVault() {

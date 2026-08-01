@@ -1,7 +1,24 @@
 // src/api.js - Complete Hikmalayer API Integration
 import axios from "axios";
 
-const API_BASE = "http://127.0.0.1:3000";
+// Which node this dashboard talks to.
+//
+// Resolution order, first hit wins:
+//   1. `window.__HIKMALAYER_NODE__`  — set by a <script> the operator serves,
+//      so one built bundle can be pointed at different nodes without a rebuild.
+//   2. `VITE_API_BASE`              — baked in at build time.
+//   3. the local devnet default.
+//
+// Whichever origin you choose must also appear in the node's
+// CORS_ALLOWED_ORIGINS and in the dashboard's CSP `connect-src`.
+const resolveApiBase = () => {
+  const runtime =
+    typeof window !== "undefined" ? window.__HIKMALAYER_NODE__ : undefined;
+  const configured = runtime || import.meta.env?.VITE_API_BASE;
+  return String(configured || "http://127.0.0.1:3000").replace(/\/+$/, "");
+};
+
+const API_BASE = resolveApiBase();
 
 // Create axios instance with default config
 const api = axios.create({
@@ -140,6 +157,12 @@ export const addLiquidity = async (data) => {
 
 export const removeLiquidity = async (data) => {
   return api.post("/dex/remove", data);
+};
+
+/// The network this node is on. Every signature must be scoped to it.
+export const getChainId = async () => {
+  const res = await api.get("/blockchain/state");
+  return res.data?.chain_id ?? null;
 };
 
 export const getAccountNonce = async (account) => {

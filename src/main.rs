@@ -2,8 +2,8 @@ use axum::http::Method;
 use hikmalayer::api::routes::{api_routes, AppState, LocalValidatorKey, Metrics};
 use hikmalayer::auth::{routes::auth_routes, AuthManager};
 use hikmalayer::blockchain::chain::{Blockchain, DEFAULT_GENESIS_SUPPLY};
+use hikmalayer::blockchain::state::DEFAULT_CHAIN_ID;
 use hikmalayer::consensus::pos;
-use hikmalayer::contract::contract::ContractExecutor;
 use hikmalayer::p2p::{peerbook::PeerBook, protocol::SeenMessageCache, service::P2PService};
 use hikmalayer::persistence::load_state;
 use std::sync::Arc;
@@ -64,6 +64,14 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
         .ok()
         .filter(|v| !v.is_empty());
 
+    // The network's name. It is part of every signed transaction, so two
+    // networks with different ids cannot replay each other's transactions —
+    // give a testnet and a mainnet different values, always.
+    let chain_id = std::env::var("GENESIS_CHAIN_ID")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_CHAIN_ID.to_string());
+
     // Launch posture: an optional comma-separated validator allowlist,
     // baked into the genesis state root. When set, only listed addresses
     // can register as validators — the honest "permissioned hybrid at
@@ -85,7 +93,8 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
         std::env::var("GENESIS_TREASURY_ADDRESS").ok().filter(|v| !v.is_empty()),
         std::env::var("GENESIS_VALIDATOR_PUBLIC_KEY").ok().filter(|v| !v.is_empty()),
     ) {
-        (Some(treasury), validator_key) => Blockchain::new_with_genesis(
+        (Some(treasury), validator_key) => Blockchain::new_with_genesis_on_chain(
+            chain_id,
             difficulty,
             treasury,
             validator_key,
@@ -95,7 +104,8 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
         ),
         (None, Some(validator_key)) => {
             let treasury = pos::derive_address(&validator_key).unwrap_or_default();
-            Blockchain::new_with_genesis(
+            Blockchain::new_with_genesis_on_chain(
+                chain_id,
                 difficulty,
                 treasury,
                 Some(validator_key),
@@ -111,7 +121,7 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
             );
             // The allowlist is honored on EVERY genesis path — a configured
             // allowlist silently dropped here would launch permissionless.
-            Blockchain::new_dev_with_allowlist(difficulty, allowlist)
+            Blockchain::new_dev_on_chain(chain_id, difficulty, allowlist)
         }
     }
 }
@@ -143,7 +153,7 @@ async fn main() {
         snapshot
             .as_ref()
             .map(|state| state.contracts.clone())
-            .unwrap_or_else(ContractExecutor::new),
+            .unwrap_or_default(),
     ));
     let pending_transactions = Arc::new(Mutex::new(
         snapshot

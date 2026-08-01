@@ -2,7 +2,8 @@ import React, { useState, useEffect } from "react";
 import { WalletProvider, useWallet } from "./hooks/useWallet";
 import { SignerProvider } from "./hooks/useSigner";
 import { ExtensionProvider } from "./hooks/useExtension";
-import { getBlockchainStats } from "./api";
+import { getBlockchainStats, getChainId, API_BASE } from "./api";
+import { setActiveChainId } from "./lib/hts";
 import StatsGrid from "./components/StatsGrid";
 import CertificateManager from "./components/CertificateManager";
 import TokenManager from "./components/TokenManager";
@@ -36,7 +37,7 @@ const AppContent = () => {
     } catch (error) {
       console.error("Error loading stats:", error);
       setError(
-        "Failed to load blockchain statistics. Please check if the server is running on http://127.0.0.1:3000"
+        `Failed to load blockchain statistics. Check that a node is reachable at ${API_BASE}.`
       );
     } finally {
       setLoading(false);
@@ -53,6 +54,15 @@ const AppContent = () => {
     // Auto-refresh stats every 30 seconds
     const interval = setInterval(loadStats, 30000);
     return () => clearInterval(interval);
+  }, []);
+
+  // Learn which network this node is, so every signature is scoped to it.
+  // Until this lands, signing fails closed rather than producing a
+  // signature that would be valid on any Hikmalayer network.
+  useEffect(() => {
+    getChainId()
+      .then(setActiveChainId)
+      .catch(() => setActiveChainId(null));
   }, []);
 
   if (loading) {
@@ -76,6 +86,12 @@ const AppContent = () => {
   }
 
   return (
+    // One wallet identity for the whole page: the extension (preferred) and
+    // the in-page wallet are shared context, so every panel below signs as
+    // the same account rather than each keeping its own idea of who is
+    // connected.
+    <ExtensionProvider>
+    <SignerProvider onUnlock={connectWallet}>
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 relative overflow-hidden">
       {/* Animated Background Elements */}
       <div className="absolute inset-0 overflow-hidden">
@@ -135,7 +151,7 @@ const AppContent = () => {
                 </div>
               }
             >
-              <CertificateManager onUpdate={handleUpdate} />
+              <CertificateManager onUpdate={handleUpdate} refreshTrigger={refreshTrigger} />
             </ProtectedAction>
 
             <ProtectedAction
@@ -154,7 +170,7 @@ const AppContent = () => {
                 </div>
               }
             >
-              <TokenManager onUpdate={handleUpdate} />
+              <TokenManager onUpdate={handleUpdate} refreshTrigger={refreshTrigger} />
             </ProtectedAction>
 
             <ProtectedAction
@@ -173,7 +189,7 @@ const AppContent = () => {
                 </div>
               }
             >
-              <MiningActions onUpdate={handleUpdate} />
+              <MiningActions onUpdate={handleUpdate} refreshTrigger={refreshTrigger} />
             </ProtectedAction>
           </div>
 
@@ -182,8 +198,6 @@ const AppContent = () => {
               signatures, so no auth gate is required here. */}
           {/* Unlocking the wallet also sets the active address for the
               address-based panels, so there is one identity on screen. */}
-          <ExtensionProvider>
-          <SignerProvider onUnlock={connectWallet}>
             <div className="mb-4">
               <h2 className="text-2xl font-bold text-white">
                 Ecosystem{" "}
@@ -203,14 +217,14 @@ const AppContent = () => {
               <DexLiquidity refreshTrigger={refreshTrigger} onUpdate={handleUpdate} />
               <AssetExplorer refreshTrigger={refreshTrigger} onUpdate={handleUpdate} />
             </div>
-          </SignerProvider>
-          </ExtensionProvider>
 
           {/* Blockchain Viewer - No auth required (read-only) */}
           <BlockchainViewer refreshTrigger={refreshTrigger} />
         </div>
       </div>
     </div>
+    </SignerProvider>
+    </ExtensionProvider>
   );
 };
 

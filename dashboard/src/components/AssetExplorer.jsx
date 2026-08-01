@@ -127,7 +127,9 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
         symbol,
         name,
         decimals: Number(decimals),
-        initial_supply: Number(supplyUnits),
+        // Exact digits — a token may declare up to 18 decimals, so its
+        // supply in base units can dwarf the float-safe range.
+        initial_supply: createParams.initialSupply,
         nonce,
         ...signedBy,
       });
@@ -161,7 +163,7 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
         token_id: sendToken,
         from: account,
         to: sendTo.trim(),
-        amount: Number(sendUnits),
+        amount: transferParams.amount,
         nonce,
         ...signedBy,
       });

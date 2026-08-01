@@ -1,5 +1,5 @@
 use super::block::Block;
-use super::state::ChainState;
+use super::state::{ChainState, DEFAULT_CHAIN_ID};
 use super::transaction::{Transaction, TransactionType};
 use crate::consensus::{pos, pow, vrf};
 use chrono::{DateTime, Duration, Utc};
@@ -95,6 +95,9 @@ pub struct Blockchain {
     /// of chain identity: baked into the genesis state root.
     #[serde(default)]
     pub genesis_validator_allowlist: Vec<String>,
+    /// This network's identifier, fixed at genesis (see ChainState::chain_id).
+    #[serde(default = "default_chain_id")]
+    pub genesis_chain_id: String,
     /// Current chain state: derived from the blocks, never persisted.
     /// Rebuilt via `rebuild_state` after deserialization.
     #[serde(skip)]
@@ -144,6 +147,9 @@ pub struct CheckpointBundle {
     pub genesis_supply: u64,
     #[serde(default)]
     pub genesis_validator_allowlist: Vec<String>,
+    /// This network's identifier, fixed at genesis (see ChainState::chain_id).
+    #[serde(default = "default_chain_id")]
+    pub genesis_chain_id: String,
     pub anchor: Block,
     pub checkpoint: CheckpointRoot,
     pub forward_blocks: Vec<Block>,
@@ -174,6 +180,11 @@ impl BlockError {
     }
 }
 
+/// serde default for chains persisted before networks were named.
+fn default_chain_id() -> String {
+    DEFAULT_CHAIN_ID.to_string()
+}
+
 impl Blockchain {
     /// New chain with default (development) genesis parameters.
     pub fn new(difficulty: usize) -> Self {
@@ -185,7 +196,19 @@ impl Blockchain {
     /// configured but an allowlist is — the allowlist must be honored on
     /// EVERY genesis path, never silently dropped.
     pub fn new_dev_with_allowlist(difficulty: usize, allowlist: Vec<String>) -> Self {
-        Self::new_with_genesis(
+        Self::new_dev_on_chain(DEFAULT_CHAIN_ID.to_string(), difficulty, allowlist)
+    }
+
+    /// Dev genesis on a named network. The chain id must be honored on EVERY
+    /// genesis path: a node that falls back to dev parameters while still
+    /// claiming a configured network would accept transactions signed for it.
+    pub fn new_dev_on_chain(
+        chain_id: String,
+        difficulty: usize,
+        allowlist: Vec<String>,
+    ) -> Self {
+        Self::new_with_genesis_on_chain(
+            chain_id,
             difficulty,
             default_genesis_treasury(),
             default_genesis_validator_public_key(),
@@ -203,8 +226,31 @@ impl Blockchain {
         genesis_supply: u64,
         genesis_validator_allowlist: Vec<String>,
     ) -> Self {
+        Self::new_with_genesis_on_chain(
+            DEFAULT_CHAIN_ID.to_string(),
+            difficulty,
+            genesis_treasury,
+            genesis_validator_public_key,
+            genesis_validator_vrf_public_key,
+            genesis_supply,
+            genesis_validator_allowlist,
+        )
+    }
+
+    /// Genesis for a named network.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_genesis_on_chain(
+        genesis_chain_id: String,
+        difficulty: usize,
+        genesis_treasury: String,
+        genesis_validator_public_key: Option<String>,
+        genesis_validator_vrf_public_key: Option<String>,
+        genesis_supply: u64,
+        genesis_validator_allowlist: Vec<String>,
+    ) -> Self {
         let difficulty = pow::clamp_difficulty(difficulty);
-        let state = ChainState::genesis(
+        let state = ChainState::genesis_for_chain(
+            &genesis_chain_id,
             &genesis_treasury,
             genesis_validator_public_key.as_deref(),
             genesis_validator_vrf_public_key.as_deref(),
@@ -223,6 +269,7 @@ impl Blockchain {
             genesis_validator_vrf_public_key,
             genesis_supply,
             genesis_validator_allowlist,
+            genesis_chain_id,
             state,
             randomness,
             current_difficulty: difficulty,
@@ -246,7 +293,7 @@ impl Blockchain {
     /// RETARGET_INTERVAL blocks' timestamps (excluding genesis when rooted at
     /// it). `blocks` is the prefix ending at the just-produced block.
     fn retarget(blocks: &[Block], produced_abs: u64, base_height: u64, current: usize) -> usize {
-        if (produced_abs + 1) % RETARGET_INTERVAL != 0 {
+        if !(produced_abs + 1).is_multiple_of(RETARGET_INTERVAL) {
             return current;
         }
         let mut start = blocks.len().saturating_sub(RETARGET_INTERVAL as usize);
@@ -271,7 +318,7 @@ impl Blockchain {
         checkpoint: CheckpointRoot,
         forward_blocks: Vec<Block>,
     ) -> Result<Self, String> {
-        if anchor.index % RETARGET_INTERVAL != 0 {
+        if !anchor.index.is_multiple_of(RETARGET_INTERVAL) {
             return Err("Checkpoint anchor must sit on a retarget boundary".to_string());
         }
         if anchor.state_root != checkpoint.state.state_root() {
@@ -281,6 +328,7 @@ impl Blockchain {
         blocks.push(anchor.clone());
         blocks.extend(forward_blocks);
         let mut chain = Blockchain {
+            genesis_chain_id: checkpoint.state.chain_id.clone(),
             blocks,
             difficulty: pow::clamp_difficulty(difficulty),
             finalized_height: anchor.index,
@@ -300,7 +348,8 @@ impl Blockchain {
     }
 
     fn genesis_state(&self) -> ChainState {
-        ChainState::genesis(
+        ChainState::genesis_for_chain(
+            &self.genesis_chain_id,
             &self.genesis_treasury,
             self.genesis_validator_public_key.as_deref(),
             self.genesis_validator_vrf_public_key.as_deref(),
@@ -536,8 +585,10 @@ impl Blockchain {
                 .map_err(|_| BlockError::slashable("Block contains malformed transaction"))?;
             tx.verify_for_block(validator)
                 .map_err(BlockError::slashable)?;
+            // Verified immediately above, so use the already-verified path
+            // rather than checking every signature twice per block.
             post_state
-                .apply_transaction(&tx, block.index)
+                .apply_verified(&tx, block.index)
                 .map_err(BlockError::slashable)?;
             if tx.transaction_type == TransactionType::Reward {
                 reward_count += 1;
@@ -849,6 +900,7 @@ impl Blockchain {
         // Never trust the candidate's own genesis parameters: replay its
         // blocks under our network configuration and checkpoint root.
         let mut replay = Blockchain {
+            genesis_chain_id: self.genesis_chain_id.clone(),
             blocks: candidate.blocks.clone(),
             difficulty: self.difficulty,
             finalized_height: self.base_height,
@@ -877,7 +929,7 @@ impl Blockchain {
     /// Export a checkpoint bundle at the current tip so another node can
     /// fast-sync from here (the tip must be a retarget boundary).
     pub fn export_checkpoint(&self) -> Result<(Block, CheckpointRoot), String> {
-        if self.tip_index() == 0 || self.tip_index() % RETARGET_INTERVAL != 0 {
+        if self.tip_index() == 0 || !self.tip_index().is_multiple_of(RETARGET_INTERVAL) {
             return Err(format!(
                 "Checkpoints can only be exported when the tip height is a positive multiple of {}",
                 RETARGET_INTERVAL
@@ -918,6 +970,7 @@ impl Blockchain {
 
         let forward_blocks = self.blocks[(boundary_local + 1)..].to_vec();
         Ok(CheckpointBundle {
+            genesis_chain_id: self.genesis_chain_id.clone(),
             difficulty: self.difficulty,
             genesis_treasury: self.genesis_treasury.clone(),
             genesis_validator_public_key: self.genesis_validator_public_key.clone(),
@@ -960,6 +1013,20 @@ pub struct SlashEvidence {
 
 #[cfg(test)]
 mod tests {
+    /// A transaction scoped to this test network.
+    ///
+    /// Every real transaction names the network it is for, and the state
+    /// machine refuses one that does not match. Tests build transactions by
+    /// hand, so they use this instead of `Transaction::new` directly.
+    fn test_tx(
+        from: Option<String>,
+        to: String,
+        amount: u64,
+        kind: TransactionType,
+    ) -> Transaction {
+        Transaction::new(from, to, amount, kind)
+            .for_chain(crate::blockchain::state::DEFAULT_CHAIN_ID)
+    }
     use super::*;
     use crate::blockchain::state::STAKING_POOL_ACCOUNT;
     use crate::blockchain::transaction::SlashProof;
@@ -1005,7 +1072,7 @@ mod tests {
         let mut txs = Vec::new();
         for tx in &extra {
             tx.verify_for_block(&validator)?;
-            post.apply_transaction(tx, next_height)?;
+            post.apply_verified(tx, next_height)?;
             txs.push(serde_json::to_string(tx).unwrap());
         }
         let reward = Transaction::new_reward(&validator, next_height);
@@ -1044,7 +1111,7 @@ mod tests {
         amount: u64,
         nonce: u64,
     ) -> Transaction {
-        let mut tx = Transaction::new(
+        let mut tx = test_tx(
             Some(from.0.to_string()),
             to.to_string(),
             amount,
@@ -1053,7 +1120,14 @@ mod tests {
         tx.nonce = nonce;
         tx.public_key = Some(from.1.to_string());
         let message = Transaction::transfer_signing_message(from.0, to, amount, nonce);
-        tx.signature = Some(pos::sign_message(&message, from.2).unwrap());
+tx.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
+                tx.signature = Some(pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            from.2,
+        ).unwrap());
         tx
     }
 
@@ -1098,7 +1172,7 @@ mod tests {
         let fund = signed_transfer((&t_addr, &t_pub, &t_key), &v_addr, funded, 1);
         mine_block_with(&mut chain, vec![fund]).unwrap();
 
-        let mut stake = Transaction::new(
+        let mut stake = test_tx(
             Some(v_addr.clone()),
             STAKING_POOL_ACCOUNT.to_string(),
             stake_amount,
@@ -1109,7 +1183,14 @@ mod tests {
         let v_vrf = vrf::derive_vrf_public_key(&v_key).unwrap();
         stake.vrf_public_key = Some(v_vrf.clone());
         let message = Transaction::stake_signing_message(&v_addr, stake_amount, 1, &v_vrf);
-        stake.signature = Some(pos::sign_message(&message, &v_key).unwrap());
+stake.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
+                stake.signature = Some(pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &v_key,
+        ).unwrap());
         mine_block_with(&mut chain, vec![stake]).unwrap();
 
         assert_eq!(chain.state.validator_set().len(), 2);
@@ -1189,7 +1270,7 @@ mod tests {
         let funded = stake_amount + stake_amount / 2;
         let fund = signed_transfer((&t_addr, &t_pub, &t_key), &v_addr, funded, 1);
         mine_block_with(&mut chain, vec![fund]).unwrap();
-        let mut stake = Transaction::new(
+        let mut stake = test_tx(
             Some(v_addr.clone()),
             STAKING_POOL_ACCOUNT.to_string(),
             stake_amount,
@@ -1200,7 +1281,14 @@ mod tests {
         let v_vrf = vrf::derive_vrf_public_key(&v_key).unwrap();
         stake.vrf_public_key = Some(v_vrf.clone());
         let message = Transaction::stake_signing_message(&v_addr, stake_amount, 1, &v_vrf);
-        stake.signature = Some(pos::sign_message(&message, &v_key).unwrap());
+stake.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
+                stake.signature = Some(pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &v_key,
+        ).unwrap());
         mine_block_with(&mut chain, vec![stake]).unwrap();
         assert_eq!(chain.state.validator_set().len(), 2);
 
@@ -1736,7 +1824,7 @@ mod tests {
         assert_ne!(block_a.hash, block_b.hash);
 
         // Build the slash transaction and mine it into the chain.
-        let mut slash = Transaction::new(None, t_addr.clone(), 0, TransactionType::Slash);
+        let mut slash = test_tx(None, t_addr.clone(), 0, TransactionType::Slash);
         slash.slash_proof = Some(SlashProof { block_a, block_b });
         slash.verify_for_block("anyone").unwrap();
 

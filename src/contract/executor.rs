@@ -16,6 +16,12 @@ pub struct ContractExecutor {
     pub certificates: HashMap<String, Certificate>,
 }
 
+impl Default for ContractExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ContractExecutor {
     pub fn new() -> Self {
         ContractExecutor {

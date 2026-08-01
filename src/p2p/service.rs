@@ -62,7 +62,7 @@ impl P2PService {
     }
 
     pub fn block_envelope(&self, block: Block) -> P2PEnvelope {
-        self.finalize(P2PEnvelope::new(self.node_id.clone(), P2PPayload::Block(block)))
+        self.finalize(P2PEnvelope::new(self.node_id.clone(), P2PPayload::Block(Box::new(block))))
     }
 
     pub async fn broadcast_block(&self, peers: Vec<String>, block: Block) -> (u64, u64) {
@@ -78,7 +78,7 @@ impl P2PService {
     ) -> (u64, u64) {
         let envelope = self.finalize(P2PEnvelope::new(
             self.node_id.clone(),
-            P2PPayload::Transaction(transaction),
+            P2PPayload::Transaction(Box::new(transaction)),
         ));
         self.broadcast_envelope(peers, envelope).await
     }

@@ -105,6 +105,7 @@ pub struct VerifyCertificateRequest {
 pub struct TokenTransferRequest {
     pub from: String,
     pub to: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount: u64,
     #[serde(default)]
     pub nonce: u64,
@@ -116,6 +117,7 @@ pub struct TokenTransferRequest {
 pub struct VestRequest {
     pub from: String,
     pub to: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount: u64,
     pub cliff_blocks: u64,
     pub duration_blocks: u64,
@@ -133,6 +135,7 @@ pub struct TokenCreateRequest {
     pub name: String,
     pub decimals: u32,
     /// Initial supply in the token's own base units (all minted to creator).
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub initial_supply: u64,
     #[serde(default)]
     pub nonce: u64,
@@ -145,6 +148,7 @@ pub struct TokenSendRequest {
     pub token_id: String,
     pub from: String,
     pub to: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount: u64,
     #[serde(default)]
     pub nonce: u64,
@@ -156,6 +160,7 @@ pub struct TokenSendRequest {
 pub struct TokenBurnRequest {
     pub token_id: String,
     pub from: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount: u64,
     #[serde(default)]
     pub nonce: u64,
@@ -174,9 +179,11 @@ pub struct TokenBalanceResponse {
 pub struct AddLiquidityRequest {
     pub token_id: String,
     pub provider: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount_hkm: u64,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount_token: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::amount::deserialize_default")]
     pub min_shares: u64,
     #[serde(default)]
     pub nonce: u64,
@@ -188,10 +195,11 @@ pub struct AddLiquidityRequest {
 pub struct RemoveLiquidityRequest {
     pub token_id: String,
     pub provider: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub shares: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::amount::deserialize_default")]
     pub min_hkm: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::amount::deserialize_default")]
     pub min_token: u64,
     #[serde(default)]
     pub nonce: u64,
@@ -205,8 +213,9 @@ pub struct SwapRequest {
     pub trader: String,
     /// true = HKM in / token out; false = token in / HKM out.
     pub hkm_to_token: bool,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount_in: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::amount::deserialize_default")]
     pub min_out: u64,
     #[serde(default)]
     pub nonce: u64,
@@ -235,6 +244,7 @@ pub struct SwapQuoteResponse {
 #[derive(Deserialize)]
 pub struct FaucetRequest {
     pub to: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount: u64,
 }
 
@@ -262,6 +272,7 @@ pub struct DifficultyRequest {
 #[derive(Deserialize)]
 pub struct StakeRequest {
     pub address: String,
+    #[serde(deserialize_with = "crate::api::amount::deserialize")]
     pub amount: u64,
     pub public_key: Option<String>,
     pub vrf_public_key: Option<String>,
@@ -434,6 +445,8 @@ pub struct NonceStateResponse {
 
 #[derive(Serialize)]
 pub struct StateSummaryResponse {
+    /// The network these transactions must be signed for.
+    pub chain_id: String,
     pub height: u64,
     pub state_root: String,
     pub total_supply: u64,
@@ -598,7 +611,11 @@ fn project_pending_state(
 ) -> ChainState {
     let mut projected = chain_state.clone();
     for tx in pending {
-        let _ = projected.apply_transaction(tx, next_height);
+        // Already verified at admission (`queue_transaction`). Re-verifying
+        // here would cost one signature check per pooled transaction on
+        // EVERY submission — O(n) work per request, n requests, all of it
+        // attacker-triggerable, and none of it adding safety.
+        let _ = projected.apply_verified(tx, next_height);
     }
     projected
 }
@@ -606,10 +623,24 @@ fn project_pending_state(
 /// Validate and queue a transaction into the pending pool, then gossip it.
 /// The transaction must be statelessly valid AND apply cleanly on top of the
 /// chain state plus everything already queued.
-async fn queue_transaction(state: &AppState, tx: Transaction) -> Result<(), String> {
+async fn queue_transaction(state: &AppState, mut tx: Transaction) -> Result<(), String> {
     if tx.transaction_type == TransactionType::Reward {
         return Err("Reward transactions cannot be submitted".to_string());
     }
+
+    // Stamp THIS node's network onto the transaction before verifying.
+    //
+    // The chain id is part of the signed message, so a client that signed for
+    // a different network simply fails verification below — there is nothing
+    // to trust in a client-supplied chain id, and nothing to check, because
+    // the only value that can produce a valid signature here is this one. It
+    // is what stops a transaction signed while testing from being replayed
+    // against real funds.
+    tx.chain_id = {
+        let chain = state.chain.lock().await;
+        chain.state.chain_id.clone()
+    };
+
     tx.verify_for_block("__queue__")
         .map_err(|err| format!("Invalid transaction: {}", err))?;
 
@@ -626,8 +657,10 @@ async fn queue_transaction(state: &AppState, tx: Transaction) -> Result<(), Stri
 
         let next_height = chain.blocks.len() as u64;
         let mut projected = project_pending_state(&chain.state, &pending, next_height);
+        // `verify_for_block` ran above; the network check is inside
+        // `apply_verified`, so this still refuses a foreign-chain signature.
         projected
-            .apply_transaction(&tx, next_height)
+            .apply_verified(&tx, next_height)
             .map_err(|err| format!("Transaction not applicable: {}", err))?;
 
         pending.push(tx.clone());
@@ -1048,8 +1081,20 @@ async fn faucet_tokens(
         projected.nonce_of(&treasury.address) + 1
     };
 
-    let message =
-        Transaction::transfer_signing_message(&treasury.address, &payload.to, payload.amount, nonce);
+    // Scoped to this node's network, exactly as any other client would.
+    let chain_id = {
+        let chain = state.chain.lock().await;
+        chain.state.chain_id.clone()
+    };
+    let message = Transaction::scoped_signing_message(
+        &chain_id,
+        &Transaction::transfer_signing_message(
+            &treasury.address,
+            &payload.to,
+            payload.amount,
+            nonce,
+        ),
+    );
     let signature = match pos::sign_message(&message, &treasury.private_key) {
         Ok(value) => value,
         Err(err) => {
@@ -1173,6 +1218,7 @@ async fn get_state_summary(State(state): State<AppState>) -> Json<StateSummaryRe
         .state
         .balance_of(crate::blockchain::state::STAKING_POOL_ACCOUNT);
     Json(StateSummaryResponse {
+        chain_id: chain.state.chain_id.clone(),
         height: chain.tip_index(),
         state_root: chain.state.state_root(),
         total_supply: chain.state.total_supply,
@@ -1329,10 +1375,18 @@ fn plan_block(
     pending: &[Transaction],
     producer: Option<&str>,
 ) -> Result<BlockPlan, String> {
-    let has_only_genesis = chain.blocks.len() == 1;
-    if pending.is_empty() && !has_only_genesis {
-        return Err("No pending transactions to mine".to_string());
-    }
+    // Empty blocks ARE produced.
+    //
+    // Refusing them would tie block height to user traffic, and height is
+    // what drives the chain's clock: the emission schedule is defined per
+    // height (a halving every 9,500,000 blocks assumes ~15s blocks, not
+    // "whenever someone transacts"), vesting releases per block, unbonding
+    // completes per block, and the slashing window is measured in blocks. On
+    // a quiet chain none of that would advance — locked funds would never
+    // release and emission would silently fall behind schedule.
+    //
+    // Producing a reward-only block also keeps the validator's incentive
+    // aligned: there is always a reason to build the next block.
 
     let next_index = chain.next_index();
     // Slot seeds come from the VRF randomness beacon: unbiasable by grinding.
@@ -1385,7 +1439,8 @@ fn plan_block(
         if tx.verify_for_block(&validator).is_err() {
             continue;
         }
-        if post_state.apply_transaction(tx, next_index).is_err() {
+        // Verified on the line above.
+        if post_state.apply_verified(tx, next_index).is_err() {
             continue;
         }
         transactions.push(
@@ -1397,7 +1452,7 @@ fn plan_block(
 
     let reward = Transaction::new_reward(&validator, next_index);
     post_state
-        .apply_transaction(&reward, next_index)
+        .apply_verified(&reward, next_index)
         .map_err(|err| format!("Failed to apply reward: {}", err))?;
     transactions.push(
         serde_json::to_string(&reward)
@@ -2787,7 +2842,10 @@ async fn receive_protocol_message(
                 let mut pending = state.pending_transactions.lock().await;
                 let next_height = chain.next_index();
                 let mut projected = project_pending_state(&chain.state, &pending, next_height);
-                if projected.apply_transaction(&transaction, next_height).is_err() {
+                // Verified a few lines above; the network check still runs
+                // inside `apply_verified`, so a peer cannot gossip us a
+                // transaction signed for a different chain.
+                if projected.apply_verified(&transaction, next_height).is_err() {
                     drop(pending);
                     drop(chain);
                     penalize_peer(&state, &node_id).await;
@@ -2798,7 +2856,7 @@ async fn receive_protocol_message(
                         message: "Gossiped transaction not applicable".to_string(),
                     });
                 }
-                pending.push(transaction);
+                pending.push(*transaction);
             }
 
             reward_peer(&state, &node_id).await;
@@ -2817,7 +2875,7 @@ async fn receive_protocol_message(
                 let governance = state.governance.lock().await;
                 governance.finality_depth
             };
-            match accept_peer_block(&state, block, finality_depth).await {
+            match accept_peer_block(&state, *block, finality_depth).await {
                 Ok(_) => {
                     reward_peer(&state, &node_id).await;
                     let mut metrics = state.metrics.lock().await;
@@ -3129,6 +3187,20 @@ async fn get_pending_transactions_structured(State(state): State<AppState>) -> J
 
 #[cfg(test)]
 mod tests {
+    /// A transaction scoped to this test network.
+    ///
+    /// Every real transaction names the network it is for, and the state
+    /// machine refuses one that does not match. Tests build transactions by
+    /// hand, so they use this instead of `Transaction::new` directly.
+    fn test_tx(
+        from: Option<String>,
+        to: String,
+        amount: u64,
+        kind: TransactionType,
+    ) -> Transaction {
+        Transaction::new(from, to, amount, kind)
+            .for_chain(crate::blockchain::state::DEFAULT_CHAIN_ID)
+    }
     use super::*;
     use crate::blockchain::chain::dev_genesis_private_key;
     use crate::blockchain::transaction::BLOCK_REWARD;
@@ -3269,7 +3341,13 @@ mod tests {
             .0
             .next_nonce;
         let message = Transaction::transfer_signing_message(&from.0, to, amount, nonce);
-        let signature = pos::sign_message(&message, &from.2).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &from.2,
+        ).unwrap();
         transfer_tokens(
             State(state.clone()),
             Json(TokenTransferRequest {
@@ -3309,7 +3387,13 @@ mod tests {
         let vrf_public_key = vrf::derive_vrf_public_key(&private_key).unwrap();
         let message =
             Transaction::stake_signing_message(&address, stake, nonce, &vrf_public_key);
-        let signature = pos::sign_message(&message, &private_key).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &private_key,
+        ).unwrap();
         let response = stake_tokens(
             State(state.clone()),
             Json(StakeRequest {
@@ -3336,8 +3420,8 @@ mod tests {
         let response = transfer_tokens(
             State(state),
             Json(TokenTransferRequest {
-                from: "hkmnobody".to_string(),
-                to: "hkmsomeone".to_string(),
+                from: "hkm063456789abcdef0123456789abcdef012345678".to_string(),
+                to: "hkm02789abcdef0123456789abcdef0123456789abc".to_string(),
                 amount: 10,
                 nonce: 1,
                 public_key: None,
@@ -3359,31 +3443,37 @@ mod tests {
         let t = treasury_key();
         let from = (t.address.clone(), t.public_key.clone(), t.private_key.clone());
 
-        let response = signed_transfer_request(&state, &from, "hkmrecipient", 40).await;
+        let response = signed_transfer_request(&state, &from, "hkm010123456789abcdef0123456789abcdef012345", 40).await;
         assert_eq!(response.0.status, "success", "{}", response.0.message);
 
         // Balance is unchanged until the transfer is mined.
-        let balance = get_token_balance(State(state.clone()), Path("hkmrecipient".to_string()))
+        let balance = get_token_balance(State(state.clone()), Path("hkm010123456789abcdef0123456789abcdef012345".to_string()))
             .await
             .0
             .balance;
         assert_eq!(balance, 0);
 
         mine_next(&state, &base_keyring()).await;
-        let balance = get_token_balance(State(state.clone()), Path("hkmrecipient".to_string()))
+        let balance = get_token_balance(State(state.clone()), Path("hkm010123456789abcdef0123456789abcdef012345".to_string()))
             .await
             .0
             .balance;
         assert_eq!(balance, 40);
 
         // Replaying the identical signed payload (same nonce) is rejected.
-        let message = Transaction::transfer_signing_message(&from.0, "hkmrecipient", 40, 1);
-        let signature = pos::sign_message(&message, &from.2).unwrap();
+        let message = Transaction::transfer_signing_message(&from.0, "hkm010123456789abcdef0123456789abcdef012345", 40, 1);
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &from.2,
+        ).unwrap();
         let replay = transfer_tokens(
             State(state.clone()),
             Json(TokenTransferRequest {
                 from: from.0.clone(),
-                to: "hkmrecipient".to_string(),
+                to: "hkm010123456789abcdef0123456789abcdef012345".to_string(),
                 amount: 40,
                 nonce: 1,
                 public_key: Some(from.1.clone()),
@@ -3401,13 +3491,19 @@ mod tests {
         let attacker = test_wallet(12);
         let (victim, ..) = test_wallet(13);
 
-        let message = Transaction::transfer_signing_message(&victim, "hkmattacker", 40, 1);
-        let signature = pos::sign_message(&message, &attacker.2).unwrap();
+        let message = Transaction::transfer_signing_message(&victim, "hkm03ef0123456789abcdef0123456789abcdef0123", 40, 1);
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &attacker.2,
+        ).unwrap();
         let response = transfer_tokens(
             State(state),
             Json(TokenTransferRequest {
                 from: victim,
-                to: "hkmattacker".to_string(),
+                to: "hkm03ef0123456789abcdef0123456789abcdef0123".to_string(),
                 amount: 40,
                 nonce: 1,
                 public_key: Some(attacker.1),
@@ -3448,7 +3544,13 @@ mod tests {
             .0
             .next_nonce;
         let message = Transaction::withdraw_signing_message(&address, stake, nonce);
-        let signature = pos::sign_message(&message, &private_key).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &private_key,
+        ).unwrap();
         let response = withdraw_stake(
             State(state.clone()),
             Json(StakeRequest {
@@ -3581,7 +3683,7 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Json(FaucetRequest {
-                to: "hkmuser".to_string(),
+                to: "hkm0456789abcdef0123456789abcdef0123456789a".to_string(),
                 amount: 10,
             }),
         )
@@ -3592,7 +3694,7 @@ mod tests {
             State(state.clone()),
             admin_headers(),
             Json(FaucetRequest {
-                to: "hkmuser".to_string(),
+                to: "hkm0456789abcdef0123456789abcdef0123456789a".to_string(),
                 amount: 10,
             }),
         )
@@ -3600,7 +3702,7 @@ mod tests {
         assert_eq!(response.0.status, "success", "{}", response.0.message);
 
         mine_next(&state, &base_keyring()).await;
-        let balance = get_token_balance(State(state.clone()), Path("hkmuser".to_string()))
+        let balance = get_token_balance(State(state.clone()), Path("hkm0456789abcdef0123456789abcdef0123456789a".to_string()))
             .await
             .0
             .balance;
@@ -3613,7 +3715,7 @@ mod tests {
             State(no_treasury),
             admin_headers(),
             Json(FaucetRequest {
-                to: "hkmuser".to_string(),
+                to: "hkm0456789abcdef0123456789abcdef0123456789a".to_string(),
                 amount: 10,
             }),
         )
@@ -3676,21 +3778,28 @@ mod tests {
         let t = treasury_key();
 
         let nonce = 1;
-        let mut tx = Transaction::new(
+        let mut tx = test_tx(
             Some(t.address.clone()),
-            "hkmrecipient".to_string(),
+            "hkm010123456789abcdef0123456789abcdef012345".to_string(),
             25,
             TransactionType::Transfer,
         );
         tx.nonce = nonce;
         tx.public_key = Some(t.public_key.clone());
         let message =
-            Transaction::transfer_signing_message(&t.address, "hkmrecipient", 25, nonce);
-        tx.signature = Some(pos::sign_message(&message, &t.private_key).unwrap());
+            Transaction::transfer_signing_message(&t.address, "hkm010123456789abcdef0123456789abcdef012345", 25, nonce);
+tx.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
+                tx.signature = Some(pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &t.private_key,
+        ).unwrap());
 
         let envelope = P2PEnvelope::new(
             "node-b".to_string(),
-            P2PPayload::Transaction(tx.clone()),
+            P2PPayload::Transaction(Box::new(tx.clone())),
         );
         let response =
             receive_protocol_message(State(state.clone()), p2p_headers(), Json(envelope)).await;
@@ -3702,7 +3811,7 @@ mod tests {
         forged.id = "forged".to_string();
         forged.amount = 9999;
         let envelope =
-            P2PEnvelope::new("node-b".to_string(), P2PPayload::Transaction(forged));
+            P2PEnvelope::new("node-b".to_string(), P2PPayload::Transaction(Box::new(forged)));
         let response =
             receive_protocol_message(State(state.clone()), p2p_headers(), Json(envelope)).await;
         assert_eq!(response.0.status, "error");
@@ -3715,7 +3824,7 @@ mod tests {
         assert_eq!(fees.base_fee, crate::blockchain::state::TX_FEE);
         assert_eq!(fees.target_txs, crate::blockchain::state::BASE_FEE_TARGET_TXS);
 
-        let nonce = get_account_nonce(State(state.clone()), Path("hkmx".to_string()))
+        let nonce = get_account_nonce(State(state.clone()), Path("hkm07abcdef0123456789abcdef0123456789abcdef".to_string()))
             .await
             .0;
         assert_eq!(nonce.base_fee, crate::blockchain::state::TX_FEE);
@@ -3749,16 +3858,16 @@ mod tests {
         // Three malformed (unsigned-body / not-applicable) gossiped txs from
         // the same signed node identity trip the ban threshold.
         for i in 0..3 {
-            let mut forged = Transaction::new(
-                Some("hkmnobody".to_string()),
-                "hkmsink".to_string(),
+            let mut forged = test_tx(
+                Some("hkm063456789abcdef0123456789abcdef012345678".to_string()),
+                "hkm05cdef0123456789abcdef0123456789abcdef01".to_string(),
                 9_999_999,
                 TransactionType::Transfer,
             );
             forged.id = format!("forged-{}", i);
             forged.nonce = 1;
             // no signature → verify_for_block fails → penalized
-            let envelope = P2PEnvelope::new("x".to_string(), P2PPayload::Transaction(forged))
+            let envelope = P2PEnvelope::new("x".to_string(), P2PPayload::Transaction(Box::new(forged)))
                 .signed(&attacker)
                 .unwrap();
             let node_id = envelope.node_id.clone();
@@ -3789,9 +3898,9 @@ mod tests {
         {
             let mut pending = state.pending_transactions.lock().await;
             for i in 0..MAX_PENDING_TXS {
-                let mut filler = Transaction::new(
+                let mut filler = test_tx(
                     Some("hkmfiller".to_string()),
-                    "hkmsink".to_string(),
+                    "hkm05cdef0123456789abcdef0123456789abcdef01".to_string(),
                     1,
                     TransactionType::Transfer,
                 );
@@ -3801,13 +3910,19 @@ mod tests {
         }
         let t = treasury_key();
         let from = (t.address.clone(), t.public_key.clone(), t.private_key.clone());
-        let message = Transaction::transfer_signing_message(&from.0, "hkmx", 1, 1);
-        let signature = pos::sign_message(&message, &from.2).unwrap();
+        let message = Transaction::transfer_signing_message(&from.0, "hkm07abcdef0123456789abcdef0123456789abcdef", 1, 1);
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &from.2,
+        ).unwrap();
         let response = transfer_tokens(
             State(state.clone()),
             Json(TokenTransferRequest {
                 from: from.0.clone(),
-                to: "hkmx".to_string(),
+                to: "hkm07abcdef0123456789abcdef0123456789abcdef".to_string(),
                 amount: 1,
                 nonce: 1,
                 public_key: Some(from.1.clone()),
@@ -3849,7 +3964,13 @@ mod tests {
             revoke: false,
         };
         let message = Transaction::credential_signing_message(&action, 1);
-        let signature = pos::sign_message(&message, &issuer.2).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &issuer.2,
+        ).unwrap();
         let response = issue_credential(
             State(state.clone()),
             Json(CredentialWriteRequest {
@@ -3889,7 +4010,13 @@ mod tests {
             revoke: true,
         };
         let message = Transaction::credential_signing_message(&revoke_action, 1);
-        let signature = pos::sign_message(&message, &stranger.2).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &stranger.2,
+        ).unwrap();
         let response = revoke_credential(
             State(state.clone()),
             Json(CredentialWriteRequest {
@@ -3908,7 +4035,13 @@ mod tests {
 
         // The real issuer revokes (nonce 2).
         let message = Transaction::credential_signing_message(&revoke_action, 2);
-        let signature = pos::sign_message(&message, &issuer.2).unwrap();
+        let signature = pos::sign_message(
+            &Transaction::scoped_signing_message(
+                crate::blockchain::state::DEFAULT_CHAIN_ID,
+                &message,
+            ),
+            &issuer.2,
+        ).unwrap();
         let response = revoke_credential(
             State(state.clone()),
             Json(CredentialWriteRequest {

@@ -20,3 +20,19 @@ extension/dist/
 
 # Devnet working directory (ops/devnet.sh)
 .devnet/
+
+# Python SDK
+python-sdk/build/
+python-sdk/dist/
+python-sdk/*.egg-info/
+python-sdk/.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Python SDK
+python-sdk/build/
+python-sdk/dist/
+python-sdk/*.egg-info/
+python-sdk/.pytest_cache/
+__pycache__/
+*.py[cod]

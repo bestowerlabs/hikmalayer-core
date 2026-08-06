@@ -59,18 +59,28 @@ const AMOUNT_FIELDS = new Set([
 
 /// Parse JSON, turning amount fields into BigInt without losing digits.
 ///
-/// `JSON.parse` would coerce a 10^17 balance to a float and drop the low
-/// digits before any reviver could see the original text, so the digits are
-/// recovered from the source with `context.source` (Node 20+) where
-/// available, and from the number otherwise.
+/// `JSON.parse` coerces large integers to float before any reviver can see
+/// the original text. `context.source` (added in Node 21.7 / V8 12.4) would
+/// fix this, but the package targets Node 20 LTS where it is unavailable.
+///
+/// Fix: pre-process the raw text with a regex that quotes every bare integer
+/// adjacent to a known amount field name, so JSON.parse never sees them as
+/// numbers at all. The reviver then converts the quoted strings to BigInt.
+///
+/// The regex is anchored to field names so it cannot accidentally touch
+/// unrelated numeric literals elsewhere in the response.
+const AMOUNT_RE = new RegExp(
+  `"(${[...AMOUNT_FIELDS].join("|")})"\\s*:\\s*(-?\\d+)(?=[,}\\s])`,
+  "g"
+);
 function parseAmounts(text) {
-  return JSON.parse(text, function reviver(key, value, context) {
+  // Quote bare integers for known amount fields before JSON.parse sees them.
+  const safe = text.replace(AMOUNT_RE, (_, key, digits) => `"${key}":"${digits}"`);
+  return JSON.parse(safe, function reviver(key, value) {
     if (!AMOUNT_FIELDS.has(key)) return value;
     if (typeof value === "bigint") return value;
-    const raw = context?.source;
-    if (typeof raw === "string" && /^-?\d+$/.test(raw)) return BigInt(raw);
-    if (typeof value === "number" && Number.isSafeInteger(value)) return BigInt(value);
     if (typeof value === "string" && /^-?\d+$/.test(value)) return BigInt(value);
+    if (typeof value === "number" && Number.isSafeInteger(value)) return BigInt(value);
     return value;
   });
 }

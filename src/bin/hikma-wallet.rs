@@ -22,7 +22,7 @@
 
 use hikmalayer::blockchain::transaction::{CredentialAction, Transaction};
 use hikmalayer::blockchain::state::DEFAULT_CHAIN_ID;
-use hikmalayer::consensus::{pos, vrf};
+use hikmalayer::consensus::{hybrid, pos, pq, vrf};
 use rand::RngCore;
 use secp256k1::SecretKey;
 
@@ -42,12 +42,33 @@ fn keygen() -> Result<(), String> {
     let public_key = pos::derive_public_key(&private_key)?;
     let address = pos::derive_address(&public_key)?;
     let vrf_public_key = vrf::derive_vrf_public_key(&private_key)?;
-    println!("private_key:    {}", private_key);
-    println!("public_key:     {}", public_key);
-    println!("vrf_public_key: {}", vrf_public_key);
-    println!("address:        {}", address);
+    // One secret, two identities. The post-quantum key is DERIVED from the
+    // same 32 bytes, so there is still exactly one thing to back up.
+    let identity = hybrid::derive_identity(&private_key)?;
+    println!("private_key:     {}", private_key);
+    println!("public_key:      {}", public_key);
+    println!("vrf_public_key:  {}", vrf_public_key);
+    println!("address:         {}", address);
     println!();
-    println!("Keep the private key offline. Only the public keys and address are shared.");
+    println!("Quantum-ready (hybrid) identity from the SAME private key:");
+    println!("pq_public_key:   {}", identity.pq_public_key);
+    println!("hybrid_address:  {}", identity.address);
+    println!();
+    println!("Keep the private key offline. Only the public keys and addresses are shared.");
+    println!("The hkq address requires BOTH signatures, so an attacker must break");
+    println!("secp256k1 AND ML-DSA-65 to spend from it. Sign for it with HIKMALAYER_HYBRID=1.");
+    Ok(())
+}
+
+/// Show the identities for a private key you already hold.
+fn show_identity(private_key: &str) -> Result<(), String> {
+    let public_key = pos::derive_public_key(private_key)?;
+    let identity = hybrid::derive_identity(private_key)?;
+    println!("public_key:      {}", public_key);
+    println!("vrf_public_key:  {}", vrf::derive_vrf_public_key(private_key)?);
+    println!("address:         {}", pos::derive_address(&public_key)?);
+    println!("pq_public_key:   {}", identity.pq_public_key);
+    println!("hybrid_address:  {}", identity.address);
     Ok(())
 }
 
@@ -57,6 +78,15 @@ fn keygen() -> Result<(), String> {
 /// It is part of what gets signed, so a signature produced for one network
 /// is inert on every other — set it to match the chain you are signing for,
 /// or the node will reject the signature.
+/// Whether to emit the post-quantum half, set with `HIKMALAYER_HYBRID=1`.
+///
+/// Opt-in rather than always: an ML-DSA signature is ~6.6 KB of hex, and a
+/// classical account has no use for one — the chain rejects a classical
+/// transaction that carries it.
+fn hybrid_output() -> bool {
+    std::env::var("HIKMALAYER_HYBRID").map(|v| v == "1").unwrap_or(false)
+}
+
 fn sign_and_print(message: &str, private_key: &str) -> Result<(), String> {
     let chain_id = std::env::var("HIKMALAYER_CHAIN_ID")
         .ok()
@@ -69,15 +99,30 @@ fn sign_and_print(message: &str, private_key: &str) -> Result<(), String> {
     println!("message:    {}", message);
     println!("public_key: {}", public_key);
     println!("signature:  {}", signature);
+
+    // A hybrid (hkq) account needs both halves. Emitted on request rather
+    // than always, because the post-quantum signature is ~3.3 KB of hex and
+    // a classical account has no use for it — the chain rejects a classical
+    // transaction that carries one.
+    if hybrid_output() {
+        let identity = hybrid::derive_identity(private_key)?;
+        println!("pq_public_key: {}", identity.pq_public_key);
+        println!("pq_signature:  {}", pq::sign_message(message, private_key)?);
+        println!("hybrid_address: {}", identity.address);
+    }
     Ok(())
 }
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "Commands:\n  keygen\n  address <public_key_hex>\n  sign-block <block_hash_hex> <private_key_hex>\n  vrf-prove <slot_input> <private_key_hex>\n  sign-transfer <from> <to> <amount> <nonce> <private_key_hex>\n  sign-stake <address> <amount> <nonce> <private_key_hex>\n  sign-withdraw <address> <amount> <nonce> <private_key_hex>\n  sign-vest <from> <to> <amount> <cliff_blocks> <duration_blocks> <nonce> <private_key_hex>\n  sign-token-create <symbol> <name> <decimals> <initial_supply> <nonce> <private_key_hex>\n  sign-token-transfer <token_id> <to> <amount> <nonce> <private_key_hex>\n  sign-token-burn <token_id> <amount> <nonce> <private_key_hex>\n  sign-amm-add <token_id> <amount_hkm> <amount_token> <min_shares> <nonce> <private_key_hex>\n  sign-amm-remove <token_id> <shares> <min_hkm> <min_token> <nonce> <private_key_hex>\n  sign-amm-swap <token_id> <hkm_to_token> <amount_in> <min_out> <nonce> <private_key_hex>\n  sign-credential <id> <subject> <data_hash> <revoke> <nonce> <private_key_hex>";
+    let usage = "Commands:\n  keygen\n  address <public_key_hex>\n  identity <private_key_hex>\n  sign-block <block_hash_hex> <private_key_hex>\n  vrf-prove <slot_input> <private_key_hex>\n  sign-transfer <from> <to> <amount> <nonce> <private_key_hex>\n  sign-stake <address> <amount> <nonce> <private_key_hex>\n  sign-withdraw <address> <amount> <nonce> <private_key_hex>\n  sign-vest <from> <to> <amount> <cliff_blocks> <duration_blocks> <nonce> <private_key_hex>\n  sign-token-create <symbol> <name> <decimals> <initial_supply> <nonce> <private_key_hex>\n  sign-token-transfer <token_id> <to> <amount> <nonce> <private_key_hex>\n  sign-token-burn <token_id> <amount> <nonce> <private_key_hex>\n  sign-amm-add <token_id> <amount_hkm> <amount_token> <min_shares> <nonce> <private_key_hex>\n  sign-amm-remove <token_id> <shares> <min_hkm> <min_token> <nonce> <private_key_hex>\n  sign-amm-swap <token_id> <hkm_to_token> <amount_in> <min_out> <nonce> <private_key_hex>\n  sign-credential <id> <subject> <data_hash> <revoke> <nonce> <private_key_hex>";
 
     match args.first().map(String::as_str) {
         Some("keygen") => keygen(),
+        Some("identity") => {
+            let private_key = args.get(1).ok_or(usage)?;
+            show_identity(private_key)
+        }
         Some("address") => {
             let public_key = args.get(1).ok_or(usage)?;
             println!("address: {}", pos::derive_address(public_key)?);
@@ -89,6 +134,12 @@ fn run() -> Result<(), String> {
             let signature = pos::sign_block_hash(block_hash, private_key)?;
             println!("block_hash: {}", block_hash);
             println!("signature:  {}", signature);
+            // A validator registered under a hybrid (hkq) account must sign
+            // blocks under both schemes: its key sits in the on-chain staker
+            // set permanently, which is the most exposed key on the chain.
+            if hybrid_output() {
+                println!("pq_signature: {}", pq::sign_message(block_hash, private_key)?);
+            }
             Ok(())
         }
         Some("sign-transfer") => {

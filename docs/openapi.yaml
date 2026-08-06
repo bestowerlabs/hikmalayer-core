@@ -119,13 +119,27 @@ components:
   schemas:
     Address:
       type: string
-      pattern: "^hkm[0-9a-f]{40}$"
+      pattern: "^(hkm|hkq)[0-9a-f]{40}$"
       description: |
-        `hkm` + hex(SHA-256(uncompressed secp256k1 public key)[..20]) — 43
-        characters. There is no checksum: a mistyped address is a different
-        account, and crediting it puts funds where nobody holds a key, so the
-        chain rejects any recipient that is not well-formed.
-      examples: ["hkm13320761030a4c59d96060708e2377bc4e936dee"]
+        43 characters, in one of two forms:
+
+        * `hkm` + hex(SHA-256(uncompressed secp256k1 public key)[..20]) —
+          a **classical** account, authorized by an ECDSA signature.
+        * `hkq` + hex(SHA-256("hikmalayer-hybrid-address-v1" ‖ secp256k1
+          public key ‖ ML-DSA-65 public key)[..20]) — a **quantum-ready**
+          account, authorized by an ECDSA signature *and* an ML-DSA-65 one.
+
+        The prefix decides what the owner must present to spend; anyone may
+        pay either. A hybrid address commits to both public keys, so neither
+        can be substituted without naming a different account — which is what
+        keeps the account safe if secp256k1 is broken.
+
+        There is no checksum: a mistyped address is a different account, and
+        crediting it puts funds where nobody holds a key, so the chain rejects
+        any recipient that is not well-formed.
+      examples:
+        - "hkm13320761030a4c59d96060708e2377bc4e936dee"
+        - "hkq7603b3319fcbdaed1124a3310f7c2e571459c603"
 
     TokenId:
       type: string
@@ -163,6 +177,28 @@ components:
         testing replays against real funds. The length is the UTF-8 **byte**
         length, not the character count.
 
+    PostQuantumPublicKey:
+      type: string
+      pattern: "^[0-9a-f]{3904}$"
+      description: |
+        ML-DSA-65 public key (FIPS 204, NIST security category 3) — 1,952
+        bytes as hex. Required for a `hkq…` sender and **rejected** for a
+        `hkm…` one: the extra fields fall outside what a classical signature
+        covers, so accepting them would give one authorized transaction more
+        than one valid encoding.
+
+    PostQuantumSignature:
+      type: string
+      pattern: "^[0-9a-f]{6618}$"
+      description: |
+        ML-DSA-65 signature (3,309 bytes as hex) over the SAME scoped message
+        as `signature`, with FIPS 204 context string `hikmalayer`. Both
+        signatures must verify; either alone is refused.
+
+        Deterministic: the signing randomness is derived from the key and the
+        message rather than drawn fresh, so any conforming implementation
+        produces identical bytes and a broken RNG cannot leak the key.
+
     Nonce:
       type: integer
       format: int64
@@ -171,10 +207,17 @@ components:
 
     SignedFields:
       type: object
+      description: |
+        Authorization for a value-bearing call. A classical (`hkm…`) sender
+        supplies `public_key` + `signature`. A quantum-ready (`hkq…`) sender
+        supplies all four: both are required, and a request that omits the
+        post-quantum half is rejected rather than downgraded.
       properties:
         nonce: { $ref: "#/components/schemas/Nonce" }
         public_key: { $ref: "#/components/schemas/PublicKey" }
         signature: { $ref: "#/components/schemas/Signature" }
+        pq_public_key: { $ref: "#/components/schemas/PostQuantumPublicKey" }
+        pq_signature: { $ref: "#/components/schemas/PostQuantumSignature" }
       required: [public_key, signature]
 
     ApiResponse:

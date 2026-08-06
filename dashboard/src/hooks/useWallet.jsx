@@ -18,8 +18,10 @@ export const useWallet = () => {
   return context;
 };
 
+/// Both account types are addresses this UI can operate as: `hkm…` is
+/// classical, `hkq…` is the quantum-ready hybrid account (see lib/hybrid.js).
 const isNativeAddress = (value) =>
-  typeof value === "string" && /^hkm[0-9a-fA-F]{40}$/.test(value.trim());
+  typeof value === "string" && /^(hkm|hkq)[0-9a-fA-F]{40}$/.test(value.trim());
 
 export const WalletProvider = ({ children }) => {
   const [account, setAccount] = useState(null);
@@ -35,7 +37,7 @@ export const WalletProvider = ({ children }) => {
     const candidate = (address || "").trim();
     if (!isNativeAddress(candidate)) {
       setError(
-        "Enter a native Hikmalayer address (hkm… from `hikma-wallet keygen`)."
+        "Enter a native Hikmalayer address (hkm… or hkq… from `hikma-wallet keygen`)."
       );
       return;
     }

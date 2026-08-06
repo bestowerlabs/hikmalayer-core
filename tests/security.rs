@@ -20,7 +20,7 @@ use hikmalayer::blockchain::state::{
 use hikmalayer::blockchain::transaction::{
     AmmAction, Transaction, TransactionType, UNITS_PER_HKM,
 };
-use hikmalayer::consensus::{pos, vrf};
+use hikmalayer::consensus::{hybrid, pos, pq, vrf};
 
 const SUPPLY: u64 = 100_000_000 * UNITS_PER_HKM;
 
@@ -896,4 +896,345 @@ fn a_block_cannot_carry_a_transaction_from_another_network() {
     );
     assert_eq!(mainnet.balance_of(&treasury.address), before);
     assert_eq!(mainnet.balance_of(&attacker.address), 0);
+}
+
+// ===================================================================
+// Hybrid (quantum-ready) accounts
+// ===================================================================
+//
+// The premise of every test below: assume the attacker has ALREADY broken
+// secp256k1 and holds the victim's classical private key. In each case they
+// hold a genuine ECDSA signature over the exact message they want executed —
+// which is game over for a classical account. A hybrid (`hkq…`) account must
+// survive it, and the chain must never offer a way to downgrade one.
+
+/// A hybrid account, and its ML-DSA key, from the same 32-byte secret.
+struct HybridAccount {
+    address: String,
+    public_key: String,
+    pq_public_key: String,
+    private_key: String,
+    vrf_public_key: String,
+}
+
+fn hybrid_account(seed: u8) -> HybridAccount {
+    let private_key = hex::encode([seed; 32]);
+    let identity = hybrid::derive_identity(&private_key).unwrap();
+    HybridAccount {
+        address: identity.address,
+        public_key: identity.public_key,
+        pq_public_key: identity.pq_public_key,
+        vrf_public_key: vrf::derive_vrf_public_key(&private_key).unwrap(),
+        private_key,
+    }
+}
+
+/// A transfer out of a hybrid account, signed under both schemes.
+fn hybrid_transfer(from: &HybridAccount, to: &str, amount: u64, nonce: u64) -> Transaction {
+    let chain_id = hikmalayer::blockchain::state::DEFAULT_CHAIN_ID;
+    let mut tx = Transaction::new(
+        Some(from.address.clone()),
+        to.to_string(),
+        amount,
+        TransactionType::Transfer,
+    )
+    .for_chain(chain_id);
+    tx.nonce = nonce;
+    let message = Transaction::scoped_signing_message(
+        chain_id,
+        &Transaction::transfer_signing_message(&from.address, to, amount, nonce),
+    );
+    let signed = hybrid::sign_message(&message, &from.private_key).unwrap();
+    tx.public_key = Some(from.public_key.clone());
+    tx.signature = Some(signed.signature);
+    tx.pq_public_key = Some(from.pq_public_key.clone());
+    tx.pq_signature = Some(signed.pq_signature);
+    tx
+}
+
+#[test]
+fn a_hybrid_account_spends_normally_when_both_signatures_are_present() {
+    let (mut state, treasury) = chain();
+    let alice = hybrid_account(9);
+    let bob = account(3);
+    fund(&mut state, &treasury, &alice.address, 100 * UNITS_PER_HKM, 1);
+
+    let tx = hybrid_transfer(&alice, &bob.address, 10 * UNITS_PER_HKM, 1);
+    state
+        .apply_transaction(&tx, 2)
+        .expect("a correctly signed hybrid transfer should succeed");
+    assert_eq!(state.balance_of(&bob.address), 10 * UNITS_PER_HKM);
+}
+
+/// The core claim. A working ECDSA signature — everything a broken
+/// secp256k1 hands an attacker — must not move a hybrid account.
+#[test]
+fn a_broken_secp256k1_alone_cannot_spend_a_hybrid_account() {
+    let (mut state, treasury) = chain();
+    let victim = hybrid_account(9);
+    let attacker = account(2);
+    fund(&mut state, &treasury, &victim.address, 100 * UNITS_PER_HKM, 1);
+    let before = state.balance_of(&victim.address);
+
+    // The attacker signs with the victim's classical key, which they now
+    // have, and simply omits the post-quantum half.
+    let mut tx = hybrid_transfer(&victim, &attacker.address, 50 * UNITS_PER_HKM, 1);
+    tx.pq_signature = None;
+    tx.pq_public_key = None;
+
+    assert!(
+        state.apply_transaction(&tx, 2).is_err(),
+        "a hybrid account was drained with a classical signature alone"
+    );
+    assert_eq!(state.balance_of(&victim.address), before);
+    assert_eq!(state.balance_of(&attacker.address), 0);
+}
+
+/// Same attacker, now supplying an ML-DSA key of their own alongside the
+/// victim's classical key. The address commits to both keys, so this names a
+/// different account entirely.
+#[test]
+fn substituting_a_post_quantum_key_does_not_reach_the_victims_account() {
+    let (mut state, treasury) = chain();
+    let victim = hybrid_account(9);
+    let attacker = hybrid_account(10);
+    fund(&mut state, &treasury, &victim.address, 100 * UNITS_PER_HKM, 1);
+    let before = state.balance_of(&victim.address);
+
+    let chain_id = hikmalayer::blockchain::state::DEFAULT_CHAIN_ID;
+    let mut tx = Transaction::new(
+        Some(victim.address.clone()),
+        attacker.address.clone(),
+        50 * UNITS_PER_HKM,
+        TransactionType::Transfer,
+    )
+    .for_chain(chain_id);
+    tx.nonce = 1;
+    let message = Transaction::scoped_signing_message(
+        chain_id,
+        &Transaction::transfer_signing_message(
+            &victim.address,
+            &attacker.address,
+            50 * UNITS_PER_HKM,
+            1,
+        ),
+    );
+    // Victim's classical key (broken, so the attacker has it) + attacker's
+    // own post-quantum key. Both signatures are genuine for their own keys.
+    tx.public_key = Some(victim.public_key.clone());
+    tx.signature = Some(pos::sign_message(&message, &victim.private_key).unwrap());
+    tx.pq_public_key = Some(attacker.pq_public_key.clone());
+    tx.pq_signature = Some(pq::sign_message(&message, &attacker.private_key).unwrap());
+
+    assert!(
+        state.apply_transaction(&tx, 2).is_err(),
+        "a substituted post-quantum key was accepted for the victim's address"
+    );
+    assert_eq!(state.balance_of(&victim.address), before);
+}
+
+/// And the converse: a broken ML-DSA is not enough either. The account is
+/// safe while EITHER scheme holds, which is the whole point of hybrid.
+#[test]
+fn a_broken_ml_dsa_alone_cannot_spend_a_hybrid_account() {
+    let (mut state, treasury) = chain();
+    let victim = hybrid_account(9);
+    let attacker = account(2);
+    fund(&mut state, &treasury, &victim.address, 100 * UNITS_PER_HKM, 1);
+    let before = state.balance_of(&victim.address);
+
+    let mut tx = hybrid_transfer(&victim, &attacker.address, 50 * UNITS_PER_HKM, 1);
+    // Genuine ML-DSA signature; the classical half is garbage.
+    tx.signature = Some("00".repeat(64));
+
+    assert!(state.apply_transaction(&tx, 2).is_err());
+    assert_eq!(state.balance_of(&victim.address), before);
+}
+
+/// A classical account must not be able to carry post-quantum fields. They
+/// are outside what its signature covers, so accepting them would give one
+/// authorized transaction more than one valid encoding — and a different
+/// transaction id for the same intent.
+#[test]
+fn a_classical_transaction_carrying_post_quantum_fields_is_refused() {
+    let (mut state, treasury) = chain();
+    let alice = account(4);
+    let bob = account(5);
+    fund(&mut state, &treasury, &alice.address, 100 * UNITS_PER_HKM, 1);
+
+    let mut tx = signed_transfer(&alice, &bob.address, 10 * UNITS_PER_HKM, 1);
+    tx.pq_public_key = Some(hybrid_account(9).pq_public_key);
+    tx.pq_signature = Some("00".repeat(3309));
+
+    assert!(
+        state.apply_transaction(&tx, 2).is_err(),
+        "a classical transaction smuggled post-quantum fields past verification"
+    );
+    assert_eq!(state.balance_of(&bob.address), 0);
+}
+
+/// A validator's key is the longest-lived key on the chain: it sits in
+/// `StakeInfo` in public for as long as the stake does. Unbonding must
+/// therefore need the post-quantum half too, or a broken secp256k1 takes the
+/// whole stake even though it could not touch the balance.
+#[test]
+fn a_broken_secp256k1_alone_cannot_unbond_a_hybrid_validators_stake() {
+    let (mut state, treasury) = chain();
+    let validator = hybrid_account(9);
+    let stake = MIN_VALIDATOR_STAKE + 10 * UNITS_PER_HKM;
+    fund(&mut state, &treasury, &validator.address, stake + TX_FEE * 4, 1);
+
+    // Bond, signed properly under both schemes.
+    let chain_id = hikmalayer::blockchain::state::DEFAULT_CHAIN_ID;
+    let mut bond = Transaction::new(
+        Some(validator.address.clone()),
+        STAKING_POOL_ACCOUNT.to_string(),
+        stake,
+        TransactionType::Stake,
+    )
+    .for_chain(chain_id);
+    bond.nonce = 1;
+    bond.vrf_public_key = Some(validator.vrf_public_key.clone());
+    let message = Transaction::scoped_signing_message(
+        chain_id,
+        &Transaction::stake_signing_message(
+            &validator.address,
+            stake,
+            1,
+            &validator.vrf_public_key,
+        ),
+    );
+    let signed = hybrid::sign_message(&message, &validator.private_key).unwrap();
+    bond.public_key = Some(validator.public_key.clone());
+    bond.signature = Some(signed.signature);
+    bond.pq_public_key = Some(validator.pq_public_key.clone());
+    bond.pq_signature = Some(signed.pq_signature);
+    state.apply_transaction(&bond, 2).expect("bonding should succeed");
+
+    // The chain must have recorded the post-quantum key with the stake.
+    assert_eq!(
+        state.stakers[&validator.address].pq_public_key,
+        validator.pq_public_key,
+        "the validator's post-quantum key was not registered on chain"
+    );
+
+    // Attacker holds the broken classical key and signs a full withdrawal.
+    let mut exit = Transaction::new(
+        Some(validator.address.clone()),
+        validator.address.clone(),
+        stake,
+        TransactionType::Withdraw,
+    )
+    .for_chain(chain_id);
+    exit.nonce = 2;
+    let exit_message = Transaction::scoped_signing_message(
+        chain_id,
+        &Transaction::withdraw_signing_message(&validator.address, stake, 2),
+    );
+    exit.public_key = Some(validator.public_key.clone());
+    exit.signature = Some(pos::sign_message(&exit_message, &validator.private_key).unwrap());
+    // No post-quantum signature: this is exactly what a quantum adversary
+    // can produce.
+
+    assert!(
+        state.apply_transaction(&exit, 3).is_err(),
+        "a hybrid validator's stake was unbonded with a classical signature alone"
+    );
+    assert_eq!(state.stakers[&validator.address].stake, stake);
+
+    // With both halves, the same withdrawal goes through — the check is a
+    // real gate, not a blanket refusal.
+    let both = hybrid::sign_message(&exit_message, &validator.private_key).unwrap();
+    exit.signature = Some(both.signature);
+    exit.pq_signature = Some(both.pq_signature);
+    state
+        .apply_transaction(&exit, 3)
+        .expect("a fully signed hybrid withdrawal should succeed");
+    assert_eq!(state.stakers[&validator.address].stake, 0);
+}
+
+/// A hybrid address must not be spendable by the classical account derived
+/// from the same key: they are two different accounts.
+#[test]
+fn the_classical_twin_of_a_hybrid_key_cannot_spend_it() {
+    let (mut state, treasury) = chain();
+    let hybrid_side = hybrid_account(9);
+    let classical_side = account(9);
+    assert_ne!(hybrid_side.address, classical_side.address);
+    fund(&mut state, &treasury, &hybrid_side.address, 100 * UNITS_PER_HKM, 1);
+
+    // Spend from the hybrid address using the classical account's encoding.
+    let mut tx = signed_transfer(&classical_side, &account(2).address, 10 * UNITS_PER_HKM, 1);
+    tx.from = Some(hybrid_side.address.clone());
+
+    assert!(state.apply_transaction(&tx, 2).is_err());
+    assert_eq!(state.balance_of(&hybrid_side.address), 100 * UNITS_PER_HKM);
+}
+
+/// Both signatures must cover the SAME message. Signing one amount
+/// classically and another post-quantum must not authorize either.
+#[test]
+fn the_two_signatures_must_cover_the_same_message() {
+    let (mut state, treasury) = chain();
+    let alice = hybrid_account(9);
+    let bob = account(3);
+    fund(&mut state, &treasury, &alice.address, 100 * UNITS_PER_HKM, 1);
+
+    let mut tx = hybrid_transfer(&alice, &bob.address, 10 * UNITS_PER_HKM, 1);
+    // Post-quantum signature over a much larger transfer.
+    let other = Transaction::scoped_signing_message(
+        hikmalayer::blockchain::state::DEFAULT_CHAIN_ID,
+        &Transaction::transfer_signing_message(&alice.address, &bob.address, 90 * UNITS_PER_HKM, 1),
+    );
+    tx.pq_signature = Some(pq::sign_message(&other, &alice.private_key).unwrap());
+
+    assert!(state.apply_transaction(&tx, 2).is_err());
+    assert_eq!(state.balance_of(&bob.address), 0);
+}
+
+/// Network scoping applies to the post-quantum half too: a hybrid
+/// transaction signed for a testnet must be inert on mainnet, both halves.
+#[test]
+fn a_hybrid_signature_does_not_replay_across_networks() {
+    let (mut mainnet, treasury) = chain_named("hikmalayer-mainnet");
+    let alice = hybrid_account(9);
+    let bob = account(3);
+    let fund_tx = signed_transfer_on(
+        "hikmalayer-mainnet",
+        &treasury,
+        &alice.address,
+        100 * UNITS_PER_HKM,
+        1,
+    );
+    mainnet.apply_transaction(&fund_tx, 1).unwrap();
+
+    // Signed for a different network, everything else identical.
+    let chain_id = "hikmalayer-testnet";
+    let mut tx = Transaction::new(
+        Some(alice.address.clone()),
+        bob.address.clone(),
+        10 * UNITS_PER_HKM,
+        TransactionType::Transfer,
+    )
+    .for_chain(chain_id);
+    tx.nonce = 1;
+    let message = Transaction::scoped_signing_message(
+        chain_id,
+        &Transaction::transfer_signing_message(&alice.address, &bob.address, 10 * UNITS_PER_HKM, 1),
+    );
+    let signed = hybrid::sign_message(&message, &alice.private_key).unwrap();
+    tx.public_key = Some(alice.public_key.clone());
+    tx.signature = Some(signed.signature);
+    tx.pq_public_key = Some(alice.pq_public_key.clone());
+    tx.pq_signature = Some(signed.pq_signature);
+
+    assert!(
+        tx.verify_authorization().is_ok(),
+        "test setup: the transaction should be valid on its own network"
+    );
+    assert!(
+        mainnet.apply_verified(&tx, 2).is_err(),
+        "a hybrid transaction replayed onto another network"
+    );
+    assert_eq!(mainnet.balance_of(&bob.address), 0);
 }

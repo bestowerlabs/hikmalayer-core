@@ -20,7 +20,7 @@ import {
 /// consensus will apply, so the preview matches execution exactly.
 const DexSwap = ({ refreshTrigger, onUpdate }) => {
   const { account } = useWallet();
-  const { canSign: unlocked, sign, publicKey: signerPublicKey } = useActiveSigner();
+  const { canSign: unlocked, authorize } = useActiveSigner();
   const [pools, setPools] = useState([]);
   const [assets, setAssets] = useState([]);
   const [tokenId, setTokenId] = useState("");
@@ -141,7 +141,7 @@ const DexSwap = ({ refreshTrigger, onUpdate }) => {
     setMessage(null);
     try {
       const signedBy = unlocked
-        ? { public_key: signerPublicKey, signature: await sign(signingMessages.swap(signParams)) }
+        ? await authorize(signingMessages.swap(signParams))
         : { public_key: publicKey.trim(), signature: signature.trim() };
       // Decimal strings, not numbers: base-unit amounts routinely exceed
       // 2^53, and the signature covers the exact digits, so a rounded value

@@ -61,8 +61,13 @@ export function deriveAddress(publicKeyHex) {
   return ADDRESS_PREFIX + bytesToHex(hash.slice(0, 20));
 }
 
+/// Either account type is a payable destination.
+///
+/// `hkm…` is classical (ECDSA), `hkq…` is hybrid (ECDSA *and* ML-DSA-65 —
+/// see lib/hybrid.js). The prefix decides what the OWNER must present to
+/// spend, not who may pay in. Mirrors `hybrid::scheme_of` in the node.
 export function isValidAddress(value) {
-  return /^hkm[0-9a-f]{40}$/i.test(String(value ?? "").trim());
+  return /^(hkm|hkq)[0-9a-f]{40}$/i.test(String(value ?? "").trim());
 }
 
 // ===== Native signing =====

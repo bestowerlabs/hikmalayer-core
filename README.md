@@ -330,6 +330,14 @@ Key consensus rules:
 - **Sovereign native identity.** `hkm…` addresses and a native signing domain — no reliance
   on Ethereum or any other chain's address/signature format. secp256k1 is used purely as a
   cryptographic primitive.
+- **Quantum-ready hybrid accounts.** A `hkq…` account is authorized by **two** signatures
+  over the same message — secp256k1 ECDSA *and* ML-DSA-65 (FIPS 204) — so forging one
+  requires breaking both schemes, and the account is safe while either holds. The address
+  commits to both public keys, so neither can be substituted. Enforced on transfers,
+  tokens, the DEX, staking, unbonding and block production; a network can require it at
+  genesis with `GENESIS_REQUIRE_HYBRID=1`. Opt-in per account, because it costs ~5.4 KB per
+  transaction against ~130 bytes. See [docs/quantum_readiness.md](docs/quantum_readiness.md)
+  — including what is *not* covered (the sr25519 VRF is still classical).
 - **No private keys on the node.** Validators keep keys offline (`hikma-wallet`) or in the
   node's local environment (`VALIDATOR_PRIVATE_KEY` — the node's *own* identity only).
   The API never accepts a private key.

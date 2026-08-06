@@ -44,3 +44,20 @@ export {
   messages,
   scoped,
 } from "./messages.js";
+
+// Quantum-ready accounts. Both signatures required; see src/hybrid.js.
+export {
+  HYBRID_ADDRESS_PREFIX,
+  HybridSigner,
+  PQ_PUBLIC_KEY_LEN,
+  PQ_SIGNATURE_LEN,
+  derivePqPublicKey,
+  derivePqSeed,
+  deriveHybridAddress,
+  deriveHybridIdentity,
+  isHybridAddress,
+  isValidPqPublicKey,
+  pqSignMessage,
+  pqVerifyMessage,
+  verifyHybrid,
+} from "./hybrid.js";

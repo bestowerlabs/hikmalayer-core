@@ -10,6 +10,7 @@
 // large integers intact.
 
 import { messages, scoped } from "./messages.js";
+import { HybridSigner } from "./hybrid.js";
 import { LocalSigner, isValidAddress } from "./signer.js";
 import { applySlippage, encodeAmount, isqrt, toBaseUnits } from "./units.js";
 
@@ -21,7 +22,8 @@ import { applySlippage, encodeAmount, isqrt, toBaseUnits } from "./units.js";
 function requireAddress(value, field) {
   if (!isValidAddress(value)) {
     throw new TypeError(
-      `${field} must be a native address (hkm + 40 hex characters), got ${JSON.stringify(value)}`
+      `${field} must be a native address (hkm/hkq + 40 hex characters), ` +
+        `got ${JSON.stringify(value)}`
     );
   }
   return value;
@@ -118,6 +120,14 @@ export class HikmalayerClient {
 
   static withPrivateKey(privateKeyHex, options = {}) {
     return new HikmalayerClient({ ...options, signer: new LocalSigner(privateKeyHex) });
+  }
+
+  /// Same private key, the quantum-ready (`hkq…`) account it controls.
+  ///
+  /// Note this is a *different account* from `withPrivateKey` on the same
+  /// key, with its own balance — the two addresses are not interchangeable.
+  static withHybridPrivateKey(privateKeyHex, options = {}) {
+    return new HikmalayerClient({ ...options, signer: new HybridSigner(privateKeyHex) });
   }
 
   // ---------------------------------------------------------------- transport
@@ -270,9 +280,28 @@ export class HikmalayerClient {
     // Everything is signed scoped to a network. A signature made for one
     // chain must never be usable on another.
     const scopedMessage = scoped(await this.resolveChainId(), message);
+    const result = await this.signer.sign(scopedMessage);
+
+    // A classical signer returns the signature as a string; a hybrid one
+    // returns both halves. Both shapes are handled here rather than in every
+    // write method, so adding a hybrid signer changes nothing else.
+    if (typeof result === "string") {
+      return { public_key: this.signer.publicKey, signature: result };
+    }
+    if (!result?.signature || !result?.pqSignature) {
+      throw new Error("Signer returned neither a signature nor a hybrid pair");
+    }
+    if (!this.signer.pqPublicKey) {
+      throw new Error("Hybrid signer has no post-quantum public key");
+    }
+    // The node rejects a classical (hkm…) transaction that carries these
+    // fields, so sending them for the wrong account type fails loudly rather
+    // than silently ignoring the post-quantum half.
     return {
       public_key: this.signer.publicKey,
-      signature: await this.signer.sign(scopedMessage),
+      signature: result.signature,
+      pq_public_key: this.signer.pqPublicKey,
+      pq_signature: result.pqSignature,
     };
   }
 

@@ -102,6 +102,33 @@ key on a machine that browses the web — sign those offline with
 Any object with `address`, `publicKey` and `sign(message)` works as a signer,
 so an HSM or remote signer drops straight in.
 
+### Quantum-ready (hybrid) accounts
+
+A `hkq…` account is authorized by **two** signatures over the same message —
+secp256k1 ECDSA *and* ML-DSA-65 (FIPS 204). An attacker must break both to
+forge one transaction, so the account survives a quantum break of secp256k1.
+
+```js
+import { HikmalayerClient, HybridSigner } from "@hikmalayer/sdk";
+
+const client = HikmalayerClient.withHybridPrivateKey(process.env.HIKMALAYER_KEY);
+await client.transfer({ to: "hkq…", amount: parseUnits("1.5") });
+```
+
+The API is identical; every write additionally carries `pq_public_key` and
+`pq_signature`. Note two things before you switch:
+
+* **The hybrid account is a different account from the classical one**, even
+  though both come from the same private key. They hold separate balances, and
+  moving between them is an ordinary transfer.
+* **It costs ~5.4 KB per transaction** instead of ~130 bytes, and ~11 ms to
+  sign instead of well under one. That is the honest price of post-quantum
+  signatures today.
+
+The chain rejects a classical transaction that carries post-quantum fields and
+a hybrid one that omits them, so the two can never be silently confused. See
+[docs/quantum_readiness.md](../docs/quantum_readiness.md).
+
 ## Reads
 
 Amount fields come back as `BigInt`, parsed from the raw response so large

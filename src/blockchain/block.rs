@@ -24,6 +24,16 @@ pub struct Block {
     pub validator: Option<String>,
     pub validator_public_key: Option<String>,
     pub validator_signature: Option<String>,
+    /// ML-DSA-65 signature over the same block hash, for a validator whose
+    /// account is hybrid (`hkq…`).
+    ///
+    /// A validator's key sits permanently in `StakeInfo`, which makes it the
+    /// most exposed key on the chain to a future quantum adversary: there is
+    /// no "spend once and rotate" for it. So a hybrid validator signs blocks
+    /// under both schemes, and a block missing this half is rejected — see
+    /// `Blockchain::validate_block_at`.
+    #[serde(default)]
+    pub validator_pq_signature: Option<String>,
     /// VRF output for this slot's input, feeding the randomness beacon.
     /// Self-authenticating: for a fixed (key, input) the output is unique,
     /// so it needs no hash commitment — the proof pins it.
@@ -130,6 +140,7 @@ impl Block {
             validator,
             validator_public_key,
             validator_signature,
+            validator_pq_signature: None,
             vrf_output: None,
             vrf_proof: None,
         }

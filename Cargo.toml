@@ -28,6 +28,8 @@ base64 = "0.21"       # For encoding/decoding
 schnorrkel = "0.11"
 hmac = "0.12"         # R-05: HMAC-signed self-expiring admin/P2P tokens
 subtle = "2"          # Constant-time comparisons (timing side channels)
+fips204 = "0.4"
+rand_core = "0.6"
 
 # Release builds keep integer overflow checks ON.
 #

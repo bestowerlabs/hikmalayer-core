@@ -18,7 +18,7 @@ use crate::{
         state::ChainState,
         transaction::{CredentialAction, SlashProof, Transaction, TransactionType},
     },
-    consensus::{pos, vrf},
+    consensus::{pos, pq, vrf},
     contract::contract::ContractExecutor,
     governance::GovernanceConfig,
     p2p::{
@@ -111,6 +111,10 @@ pub struct TokenTransferRequest {
     pub nonce: u64,
     pub public_key: Option<String>,
     pub signature: Option<String>,
+    /// ML-DSA-65 public key (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_public_key: Option<String>,
+    /// ML-DSA-65 signature (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_signature: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -125,6 +129,10 @@ pub struct VestRequest {
     pub nonce: u64,
     pub public_key: Option<String>,
     pub signature: Option<String>,
+    /// ML-DSA-65 public key (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_public_key: Option<String>,
+    /// ML-DSA-65 signature (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_signature: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -141,6 +149,10 @@ pub struct TokenCreateRequest {
     pub nonce: u64,
     pub public_key: Option<String>,
     pub signature: Option<String>,
+    /// ML-DSA-65 public key (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_public_key: Option<String>,
+    /// ML-DSA-65 signature (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_signature: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -154,6 +166,10 @@ pub struct TokenSendRequest {
     pub nonce: u64,
     pub public_key: Option<String>,
     pub signature: Option<String>,
+    /// ML-DSA-65 public key (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_public_key: Option<String>,
+    /// ML-DSA-65 signature (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_signature: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -166,6 +182,10 @@ pub struct TokenBurnRequest {
     pub nonce: u64,
     pub public_key: Option<String>,
     pub signature: Option<String>,
+    /// ML-DSA-65 public key (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_public_key: Option<String>,
+    /// ML-DSA-65 signature (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_signature: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -189,6 +209,10 @@ pub struct AddLiquidityRequest {
     pub nonce: u64,
     pub public_key: Option<String>,
     pub signature: Option<String>,
+    /// ML-DSA-65 public key (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_public_key: Option<String>,
+    /// ML-DSA-65 signature (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_signature: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -205,6 +229,10 @@ pub struct RemoveLiquidityRequest {
     pub nonce: u64,
     pub public_key: Option<String>,
     pub signature: Option<String>,
+    /// ML-DSA-65 public key (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_public_key: Option<String>,
+    /// ML-DSA-65 signature (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_signature: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -221,6 +249,10 @@ pub struct SwapRequest {
     pub nonce: u64,
     pub public_key: Option<String>,
     pub signature: Option<String>,
+    /// ML-DSA-65 public key (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_public_key: Option<String>,
+    /// ML-DSA-65 signature (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_signature: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -262,6 +294,10 @@ pub struct CredentialWriteRequest {
     pub nonce: u64,
     pub public_key: Option<String>,
     pub signature: Option<String>,
+    /// ML-DSA-65 public key (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_public_key: Option<String>,
+    /// ML-DSA-65 signature (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_signature: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -279,6 +315,10 @@ pub struct StakeRequest {
     #[serde(default)]
     pub nonce: u64,
     pub signature: Option<String>,
+    /// ML-DSA-65 public key (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_public_key: Option<String>,
+    /// ML-DSA-65 signature (hex). Required for hybrid (`hkq…`) senders.
+    pub pq_signature: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -923,6 +963,8 @@ async fn queue_credential_action(
     tx.nonce = payload.nonce;
     tx.public_key = payload.public_key.clone();
     tx.signature = payload.signature.clone();
+    tx.pq_public_key = payload.pq_public_key.clone();
+    tx.pq_signature = payload.pq_signature.clone();
     tx.credential = Some(action);
 
     match queue_transaction(state, tx).await {
@@ -1025,6 +1067,8 @@ async fn transfer_tokens(
     tx.nonce = payload.nonce;
     tx.public_key = payload.public_key.clone();
     tx.signature = payload.signature.clone();
+    tx.pq_public_key = payload.pq_public_key.clone();
+    tx.pq_signature = payload.pq_signature.clone();
 
     match queue_transaction(&state, tx).await {
         Ok(()) => Json(ApiResponse {
@@ -1702,6 +1746,31 @@ async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
     };
     block.validator_signature = Some(signature);
 
+    // A hybrid validator signs blocks under both schemes. Whether one is
+    // required is decided by the key registered on chain, so this mirrors
+    // exactly what `validate_block_at` will check.
+    let needs_pq = chain
+        .state
+        .stakers
+        .get(&plan.validator)
+        .map(|info| !info.pq_public_key.is_empty())
+        .unwrap_or(false);
+    if needs_pq {
+        match pq::sign_message(&block.hash, &validator_key.private_key) {
+            Ok(value) => block.validator_pq_signature = Some(value),
+            Err(message) => {
+                drop(chain);
+                drop(pending);
+                return Json(MiningResponse {
+                    status: "error".to_string(),
+                    message: format!("Failed to sign block with the post-quantum key: {}", message),
+                    block_index: 0,
+                    transactions_count: 0,
+                });
+            }
+        }
+    }
+
     let post_state = match chain.validate_block_candidate(&block) {
         Ok(post_state) => post_state,
         Err(message) => {
@@ -1927,6 +1996,8 @@ async fn stake_tokens(
     tx.public_key = payload.public_key.clone();
     tx.vrf_public_key = payload.vrf_public_key.clone();
     tx.signature = payload.signature.clone();
+    tx.pq_public_key = payload.pq_public_key.clone();
+    tx.pq_signature = payload.pq_signature.clone();
 
     match queue_transaction(&state, tx).await {
         Ok(()) => {
@@ -1972,6 +2043,8 @@ async fn withdraw_stake(
     );
     tx.nonce = payload.nonce;
     tx.signature = payload.signature.clone();
+    tx.pq_public_key = payload.pq_public_key.clone();
+    tx.pq_signature = payload.pq_signature.clone();
 
     match queue_transaction(&state, tx).await {
         Ok(()) => {
@@ -2057,6 +2130,8 @@ async fn vest_tokens(
     tx.nonce = payload.nonce;
     tx.public_key = payload.public_key.clone();
     tx.signature = payload.signature.clone();
+    tx.pq_public_key = payload.pq_public_key.clone();
+    tx.pq_signature = payload.pq_signature.clone();
     tx.vesting_cliff_blocks = Some(payload.cliff_blocks);
     tx.vesting_duration_blocks = Some(payload.duration_blocks);
 
@@ -2126,6 +2201,8 @@ async fn create_token(
     tx.nonce = payload.nonce;
     tx.public_key = payload.public_key.clone();
     tx.signature = payload.signature.clone();
+    tx.pq_public_key = payload.pq_public_key.clone();
+    tx.pq_signature = payload.pq_signature.clone();
     tx.token = Some(crate::blockchain::transaction::TokenAction {
         token_id: String::new(),
         symbol: payload.symbol.clone(),
@@ -2176,6 +2253,8 @@ async fn send_token(
     tx.nonce = payload.nonce;
     tx.public_key = payload.public_key.clone();
     tx.signature = payload.signature.clone();
+    tx.pq_public_key = payload.pq_public_key.clone();
+    tx.pq_signature = payload.pq_signature.clone();
     tx.token = Some(crate::blockchain::transaction::TokenAction {
         token_id: payload.token_id.clone(),
         ..Default::default()
@@ -2217,6 +2296,8 @@ async fn burn_token(
     tx.nonce = payload.nonce;
     tx.public_key = payload.public_key.clone();
     tx.signature = payload.signature.clone();
+    tx.pq_public_key = payload.pq_public_key.clone();
+    tx.pq_signature = payload.pq_signature.clone();
     tx.token = Some(crate::blockchain::transaction::TokenAction {
         token_id: payload.token_id.clone(),
         ..Default::default()
@@ -2295,6 +2376,8 @@ async fn add_liquidity(
     tx.nonce = payload.nonce;
     tx.public_key = payload.public_key.clone();
     tx.signature = payload.signature.clone();
+    tx.pq_public_key = payload.pq_public_key.clone();
+    tx.pq_signature = payload.pq_signature.clone();
     let mut action = amm_action(payload.token_id.clone());
     action.amount_hkm = payload.amount_hkm;
     action.amount_token = payload.amount_token;
@@ -2336,6 +2419,8 @@ async fn remove_liquidity(
     tx.nonce = payload.nonce;
     tx.public_key = payload.public_key.clone();
     tx.signature = payload.signature.clone();
+    tx.pq_public_key = payload.pq_public_key.clone();
+    tx.pq_signature = payload.pq_signature.clone();
     let mut action = amm_action(payload.token_id.clone());
     action.shares = payload.shares;
     action.min_hkm = payload.min_hkm;
@@ -2374,6 +2459,8 @@ async fn swap(State(state): State<AppState>, Json(payload): Json<SwapRequest>) -
     tx.nonce = payload.nonce;
     tx.public_key = payload.public_key.clone();
     tx.signature = payload.signature.clone();
+    tx.pq_public_key = payload.pq_public_key.clone();
+    tx.pq_signature = payload.pq_signature.clone();
     let mut action = amm_action(payload.token_id.clone());
     action.amount_in = payload.amount_in;
     action.hkm_to_token = payload.hkm_to_token;
@@ -3357,6 +3444,8 @@ mod tests {
                 nonce,
                 public_key: Some(from.1.clone()),
                 signature: Some(signature),
+                pq_public_key: None,
+                pq_signature: None,
             }),
         )
         .await
@@ -3403,6 +3492,8 @@ mod tests {
                 vrf_public_key: Some(vrf_public_key),
                 nonce,
                 signature: Some(signature),
+                pq_public_key: None,
+                pq_signature: None,
             }),
         )
         .await;
@@ -3426,6 +3517,8 @@ mod tests {
                 nonce: 1,
                 public_key: None,
                 signature: None,
+                pq_public_key: None,
+                pq_signature: None,
             }),
         )
         .await;
@@ -3478,6 +3571,8 @@ mod tests {
                 nonce: 1,
                 public_key: Some(from.1.clone()),
                 signature: Some(signature),
+                pq_public_key: None,
+                pq_signature: None,
             }),
         )
         .await;
@@ -3508,6 +3603,8 @@ mod tests {
                 nonce: 1,
                 public_key: Some(attacker.1),
                 signature: Some(signature),
+                pq_public_key: None,
+                pq_signature: None,
             }),
         )
         .await;
@@ -3533,6 +3630,8 @@ mod tests {
                 vrf_public_key: None,
                 nonce: 99,
                 signature: None,
+                pq_public_key: None,
+                pq_signature: None,
             }),
         )
         .await;
@@ -3560,6 +3659,8 @@ mod tests {
                 vrf_public_key: None,
                 nonce,
                 signature: Some(signature),
+                pq_public_key: None,
+                pq_signature: None,
             }),
         )
         .await;
@@ -3927,6 +4028,8 @@ tx.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
                 nonce: 1,
                 public_key: Some(from.1.clone()),
                 signature: Some(signature),
+                pq_public_key: None,
+                pq_signature: None,
             }),
         )
         .await;
@@ -3951,6 +4054,8 @@ tx.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
                 nonce: 1,
                 public_key: None,
                 signature: None,
+                pq_public_key: None,
+                pq_signature: None,
             }),
         )
         .await;
@@ -3982,6 +4087,8 @@ tx.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
                 nonce: 1,
                 public_key: Some(issuer.1.clone()),
                 signature: Some(signature),
+                pq_public_key: None,
+                pq_signature: None,
             }),
         )
         .await;
@@ -4028,6 +4135,8 @@ tx.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
                 nonce: 1,
                 public_key: Some(stranger.1.clone()),
                 signature: Some(signature),
+                pq_public_key: None,
+                pq_signature: None,
             }),
         )
         .await;
@@ -4053,6 +4162,8 @@ tx.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
                 nonce: 2,
                 public_key: Some(issuer.1.clone()),
                 signature: Some(signature),
+                pq_public_key: None,
+                pq_signature: None,
             }),
         )
         .await;

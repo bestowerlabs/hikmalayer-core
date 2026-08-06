@@ -319,6 +319,14 @@ surprised by them.
   trust with their keys and should be reviewed before it ships.
 - **Admin endpoints are token-gated, not signature-gated.** Anyone holding
   `ADMIN_TOKEN` can drive them. Treat it as a production secret.
+- **Quantum: hybrid accounts are opt-in, and the VRF is still classical.**
+  `hkq…` accounts require an ML-DSA-65 signature alongside the ECDSA one, on
+  transactions, staking, unbonding and block production — see
+  [quantum_readiness.md](quantum_readiness.md). Classical `hkm…` accounts keep
+  the old exposure, deliberately, because a 40× signature-size increase is not
+  a defensible default. Leader election's sr25519 VRF remains classical: a
+  quantum adversary could *predict* a validator's slots, not forge blocks or
+  spend, and there is no standardized post-quantum VRF to move to yet.
 
 ---
 
@@ -332,7 +340,7 @@ can still miss the path that matters.
 ```bash
 cargo test --test security             # adversarial suite, debug
 cargo test --release --test security   # and in the profile validators run
-cargo test                             # full suite (117 unit tests)
+cargo test                             # full suite (138 unit tests)
 cargo clippy --all-targets             # clean
 
 ops/devnet.sh &                        # a live chain

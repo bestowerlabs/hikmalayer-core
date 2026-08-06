@@ -89,6 +89,17 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
         );
     }
 
+    // Quantum posture: when set, this network accepts transactions only from
+    // quantum-ready (`hkq…`) accounts, which carry an ML-DSA-65 signature
+    // alongside the ECDSA one. Baked into the genesis state root, so it is a
+    // property of the network and not something a node can differ on.
+    let require_hybrid = std::env::var("GENESIS_REQUIRE_HYBRID")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if require_hybrid {
+        println!("🛡️  This network requires quantum-ready (hkq) accounts at genesis.");
+    }
+
     match (
         std::env::var("GENESIS_TREASURY_ADDRESS").ok().filter(|v| !v.is_empty()),
         std::env::var("GENESIS_VALIDATOR_PUBLIC_KEY").ok().filter(|v| !v.is_empty()),
@@ -101,6 +112,7 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
             vrf_key,
             supply,
             allowlist,
+            require_hybrid,
         ),
         (None, Some(validator_key)) => {
             let treasury = pos::derive_address(&validator_key).unwrap_or_default();
@@ -112,6 +124,7 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
                 vrf_key,
                 supply,
                 allowlist,
+                require_hybrid,
             )
         }
         (None, None) => {

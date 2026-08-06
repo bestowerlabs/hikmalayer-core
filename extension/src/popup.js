@@ -230,7 +230,7 @@ function renderUnlock(state) {
   const view = el(`
     <div>
       <h1>Hikmalayer Wallet <span class="pill">Locked</span></h1>
-      <p class="muted">${escape(state.address)}</p>
+      <p class="muted">${escape(state.classicalAddress ?? state.address ?? "")}</p>
       <div class="card">
         <input type="password" id="password" placeholder="Password" autofocus />
         <button id="unlock">Unlock</button>
@@ -258,9 +258,26 @@ function renderAccount(state) {
       <p class="muted">Auto-locks after 15 minutes idle.</p>
       <div class="card">
         <p class="muted" style="margin:0 0 6px">Active address</p>
-        <div class="addr" id="address">${escape(state.address)}</div>
+        <div class="addr" id="address">${escape(state.address ?? "")}</div>
         <p class="muted" style="margin:8px 0 0">Balance: <span id="balance">…</span></p>
         <button class="ghost" id="copy" style="margin-top:8px">Copy address</button>
+
+        <!-- One key, two accounts with separate balances. Classical is
+             ECDSA; quantum-ready adds an ML-DSA-65 signature, so an attacker
+             must break both schemes to spend. -->
+        <div class="tabs" style="margin:12px 0 0">
+          <button data-scheme="classical" class="${
+            state.scheme === "hybrid" ? "" : "active"
+          }">Classical</button>
+          <button data-scheme="hybrid" class="${
+            state.scheme === "hybrid" ? "active" : ""
+          }">Quantum-ready</button>
+        </div>
+        <p class="tiny muted" style="margin:6px 0 0">${
+          state.scheme === "hybrid"
+            ? "Signs with ECDSA and ML-DSA-65. Separate account from the classical one."
+            : "Signs with ECDSA only. Quantum-ready is a different account."
+        }</p>
       </div>
 
       <div class="card">
@@ -309,6 +326,17 @@ function renderAccount(state) {
     </div>`);
 
   // ---- Accounts ----
+  view.querySelectorAll("[data-scheme]").forEach((button) => {
+    button.onclick = async () => {
+      try {
+        await send({ type: "wallet:set-scheme", scheme: button.dataset.scheme });
+        renderMain();
+      } catch (error) {
+        showError(view, error.message);
+      }
+    };
+  });
+
   const accounts = view.querySelector("#accounts");
   state.accounts.forEach((account, index) => {
     const isActive = index === state.activeIndex;

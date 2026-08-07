@@ -1,10 +1,48 @@
 # Hikmalayer Core
 
 ## What is Hikmalayer core?
-Hikmalayer Core is a sovereign hybrid Layer‑1 blockchain that combines Proof‑of‑Stake
-(validator selection) with Proof‑of‑Work (block finalization). It has its own native
-cryptographic identity — no dependency on Ethereum or any other chain's address or
-signing conventions. It provides:
+
+Hikmalayer Core is a sovereign **quantum dual-hybrid Layer 1** blockchain. It is
+hybrid in two independent senses:
+
+1. **Hybrid consensus** — stake-weighted VRF selection picks each block's leader
+   (Proof of Stake); that leader then finalizes the block with Proof of Work.
+   Neither stake alone nor hashpower alone produces a block.
+2. **Hybrid cryptography** — an account can be *quantum-ready*, authorized by
+   **two** signatures over the same message: secp256k1 ECDSA **and** ML-DSA-65
+   (FIPS 204, NIST post-quantum category 3). Forging one transaction means
+   breaking **both** schemes.
+
+It has its own native cryptographic identity — no dependency on Ethereum or any
+other chain's address or signing conventions.
+
+**Three things it deliberately is not:** there is **no virtual machine** (no
+user-deployed contracts — every capability is a protocol feature), **no bridge**
+(no wrapped or external asset exists here, and none is planned), and **no
+custody of user keys by the node** (the API never accepts a private key).
+
+| | |
+|---|---|
+| Native coin | **HKM** — fees, staking, block rewards |
+| Native token standard | **HTS** — fungible assets as consensus objects, fixed supply, no mint function |
+| Native exchange | Constant-product **AMM** in the state machine, 0.30% to liquidity providers |
+| Account types | `hkm…` classical · `hkq…` quantum-ready |
+| Flagship | **Proof-of-Credential** — hash-only on-chain credentials, verifiable against the state root |
+
+### Documentation
+
+| | |
+|---|---|
+| [Whitepaper](docs/Whitepaper.md) · [short version](docs/whitepaper_short_version.md) | The system as implemented |
+| [Quantum readiness](docs/quantum_readiness.md) | The dual-hybrid scheme, and what it does *not* cover |
+| [Security assessment](docs/security_assessment.md) | 13 findings, all fixed, each with a regression test |
+| [Threat model](docs/threat_model.md) | Adversaries, mitigations, and what is out of scope |
+| [HKM, HTS and listings](docs/hts_and_listings.md) | What the token layer is, and honest expectations about exchanges |
+| [API](docs/API.md) · [OpenAPI](docs/openapi.yaml) · [SDK](sdk/README.md) | Building on it |
+| [Consensus flow](docs/consensus_flow.md) · [Validator lifecycle](docs/validator_lifecycle.md) · [Key management](docs/key_management.md) | Running a validator |
+| [Wallet security](docs/wallet_security.md) · [Bridge design](docs/bridge_design.md) · [Mainnet readiness](docs/mainnet_readiness.md) | Decisions and their reasoning |
+
+It provides:
 
 - **A replicated on-chain state machine.** Balances, the validator set, per-account
   nonces, and slashing are a deterministic function of the block history. Every block

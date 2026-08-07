@@ -138,7 +138,7 @@ fn run() -> Result<(), String> {
             // blocks under both schemes: its key sits in the on-chain staker
             // set permanently, which is the most exposed key on the chain.
             if hybrid_output() {
-                println!("pq_signature: {}", pq::sign_message(block_hash, private_key)?);
+                println!("pq_signature: {}", pq::sign_block_hash(block_hash, private_key)?);
             }
             Ok(())
         }

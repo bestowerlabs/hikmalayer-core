@@ -55,6 +55,8 @@ export {
   derivePqSeed,
   deriveHybridAddress,
   deriveHybridIdentity,
+  isCanonicalPqPublicKey,
+  isCanonicalPublicKey,
   isHybridAddress,
   isValidPqPublicKey,
   pqSignMessage,

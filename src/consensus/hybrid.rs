@@ -94,19 +94,17 @@ pub fn derive_hybrid_address(
     classical_public_key_hex: &str,
     pq_public_key_hex: &str,
 ) -> Result<String, String> {
-    let classical = hex::decode(classical_public_key_hex.trim())
-        .map_err(|_| "classical public key is not valid hex".to_string())?;
-    // Round-trip through secp256k1 so a malformed point cannot reach the hash
-    // and produce an address nobody can ever sign for.
-    let parsed = secp256k1::PublicKey::from_slice(&classical)
-        .map_err(|_| "classical public key is not a valid secp256k1 point".to_string())?;
+    // The ONE canonical spelling, for the same reason the classical path
+    // insists on it: a compressed (or upper-case) encoding of the same key
+    // would hash to the same hybrid address, giving one authorization two
+    // valid on-wire forms and two transaction ids. This also rejects a
+    // malformed point, which must never reach the hash and become an address
+    // nobody can ever sign for.
+    let parsed = pos::canonical_public_key(classical_public_key_hex.trim())
+        .map_err(|err| format!("classical public key is not canonical: {}", err))?;
     let uncompressed = parsed.serialize_uncompressed();
 
-    if !pq::is_valid_pq_public_key(pq_public_key_hex) {
-        return Err("post-quantum public key is not a valid ML-DSA-65 key".to_string());
-    }
-    let pq_bytes = hex::decode(pq_public_key_hex.trim())
-        .map_err(|_| "post-quantum public key is not valid hex".to_string())?;
+    let pq_bytes = pq::canonical_pq_public_key(pq_public_key_hex.trim())?;
 
     let mut hasher = Sha256::new();
     hasher.update(HYBRID_ADDRESS_DOMAIN);

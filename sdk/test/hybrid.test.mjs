@@ -14,6 +14,9 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { secp256k1 } from "@noble/curves/secp256k1";
+import { bytesToHex } from "@noble/hashes/utils";
+
 import {
   HYBRID_ADDRESS_PREFIX,
   HybridSigner,
@@ -24,6 +27,8 @@ import {
   derivePqSeed,
   deriveHybridAddress,
   deriveHybridIdentity,
+  isCanonicalPqPublicKey,
+  isCanonicalPublicKey,
   isHybridAddress,
   isValidAddress,
   isValidPqPublicKey,
@@ -106,6 +111,24 @@ describe("hybrid identity", () => {
     assert.ok(!isValidPqPublicKey(""));
     assert.ok(!isValidPqPublicKey("aabb"));
     assert.ok(isValidPqPublicKey(id.pqPublicKey));
+  });
+
+  test("a key has exactly one spelling", () => {
+    // A compressed encoding is the SAME key: it verifies the same signatures
+    // and would hash to the same address. Accepting it would give one
+    // authorized transaction two valid encodings, and two transaction ids.
+    const id = deriveHybridIdentity(KEY);
+    const compressed = bytesToHex(
+      secp256k1.ProjectivePoint.fromHex(id.publicKey).toRawBytes(true)
+    );
+    assert.notEqual(compressed, id.publicKey);
+    assert.ok(isCanonicalPublicKey(id.publicKey));
+    assert.ok(!isCanonicalPublicKey(compressed));
+    assert.ok(!isCanonicalPublicKey(id.publicKey.toUpperCase()));
+    assert.throws(() => deriveHybridAddress(compressed, id.pqPublicKey));
+    assert.throws(() => deriveHybridAddress(id.publicKey, id.pqPublicKey.toUpperCase()));
+    assert.ok(!isCanonicalPqPublicKey(id.pqPublicKey.toUpperCase()));
+    assert.ok(isCanonicalPqPublicKey(id.pqPublicKey));
   });
 
   test("rejects a malformed private key", () => {

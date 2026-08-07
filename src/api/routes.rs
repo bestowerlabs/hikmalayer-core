@@ -1756,7 +1756,7 @@ async fn mine_block(State(state): State<AppState>) -> Json<MiningResponse> {
         .map(|info| !info.pq_public_key.is_empty())
         .unwrap_or(false);
     if needs_pq {
-        match pq::sign_message(&block.hash, &validator_key.private_key) {
+        match pq::sign_block_hash(&block.hash, &validator_key.private_key) {
             Ok(value) => block.validator_pq_signature = Some(value),
             Err(message) => {
                 drop(chain);

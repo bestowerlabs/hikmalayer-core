@@ -111,21 +111,47 @@ export function pqVerifyMessage(message, pqPublicKeyHex, pqSignatureHex) {
   }
 }
 
+/// A public key's ONE canonical spelling: uncompressed, 65 bytes, `04`-
+/// prefixed, lower-case hex.
+///
+/// secp256k1 accepts a 33-byte compressed encoding of the same key, and hex
+/// accepts upper case. Both hash to the same address and verify the same
+/// signatures, so allowing them would give one authorized transaction more
+/// than one valid on-wire form — and therefore more than one transaction id.
+/// The node rejects them; mirrors `pos::canonical_public_key`.
+export function isCanonicalPublicKey(value) {
+  const hex = String(value ?? "").trim();
+  if (!/^04[0-9a-f]{128}$/.test(hex)) return false;
+  try {
+    return bytesToHex(secp256k1.ProjectivePoint.fromHex(hex).toRawBytes(false)) === hex;
+  } catch {
+    return false;
+  }
+}
+
+/// The same rule for an ML-DSA key: lower-case hex, exact length.
+export function isCanonicalPqPublicKey(value) {
+  return /^[0-9a-f]+$/.test(String(value ?? "")) && isValidPqPublicKey(value);
+}
+
 /// Derive a hybrid address from both public keys.
 export function deriveHybridAddress(publicKeyHex, pqPublicKeyHex) {
-  // Round-trip through the curve: a malformed point must never reach the
-  // hash and become an address nobody could ever sign for.
-  let uncompressed;
-  try {
-    uncompressed = secp256k1.ProjectivePoint.fromHex(normalizeHex(publicKeyHex)).toRawBytes(false);
-  } catch {
-    throw new Error("Not a valid secp256k1 public key");
+  const publicKey = String(publicKeyHex ?? "").trim();
+  const pqPublicKey = String(pqPublicKeyHex ?? "").trim();
+  // Canonical only — and a malformed point is rejected on the way, so it can
+  // never reach the hash and become an address nobody could ever sign for.
+  if (!isCanonicalPublicKey(publicKey)) {
+    throw new Error("Not a canonical uncompressed secp256k1 public key");
   }
-  if (!isValidPqPublicKey(pqPublicKeyHex)) {
-    throw new Error("Not a valid ML-DSA-65 public key");
+  if (!isCanonicalPqPublicKey(pqPublicKey)) {
+    throw new Error("Not a canonical ML-DSA-65 public key");
   }
   const hash = sha256(
-    concatBytes(HYBRID_ADDRESS_DOMAIN, uncompressed, hexToBytes(normalizeHex(pqPublicKeyHex)))
+    concatBytes(
+      HYBRID_ADDRESS_DOMAIN,
+      secp256k1.ProjectivePoint.fromHex(publicKey).toRawBytes(false),
+      hexToBytes(pqPublicKey)
+    )
   );
   return HYBRID_ADDRESS_PREFIX + bytesToHex(hash.slice(0, 20));
 }

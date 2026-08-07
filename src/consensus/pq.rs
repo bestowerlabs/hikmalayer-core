@@ -62,6 +62,17 @@ const PQ_SIGN_DOMAIN: &[u8] = b"hikmalayer-pq-sign-v1";
 /// protocol that also uses ML-DSA.
 const PQ_CONTEXT: &[u8] = b"hikmalayer";
 
+/// Domain prefix for block signatures.
+///
+/// The classical scheme separates these by construction — `sign_block_hash`
+/// signs the raw 32 bytes while `sign_message` prefixes and re-hashes — so
+/// the post-quantum half must separate them too. Without it, one ML-DSA
+/// signature would be valid as both a block signature and an account
+/// authorization over the same string. Nothing exploits that today because
+/// no canonical account message is a bare 64-character hex string, but that
+/// is an accident of the current message set, not a guarantee.
+const PQ_BLOCK_DOMAIN: &str = "hikmalayer-pq-block-v1:";
+
 /// An RNG that yields exactly one caller-chosen 32-byte value.
 ///
 /// `fips204` asks for randomness through `RngCore`; both keygen and hedged
@@ -175,7 +186,45 @@ pub fn verify_message(message: &str, public_key_hex: &str, signature_hex: &str) 
 
 /// Is this a well-formed ML-DSA-65 public key?
 pub fn is_valid_pq_public_key(value: &str) -> bool {
-    matches!(decode_hex(value, "public key"), Ok(bytes) if bytes.len() == PQ_PUBLIC_KEY_LEN)
+    canonical_pq_public_key(value).is_ok()
+}
+
+/// Decode an ML-DSA public key, insisting on its one canonical spelling.
+///
+/// Lower-case hex of exactly 1,952 bytes. Upper-case hex decodes to the same
+/// key, and allowing both would give one hybrid account two spellings — and
+/// so one authorized transaction two valid encodings, which is the
+/// malleability the classical side also refuses.
+pub fn canonical_pq_public_key(value: &str) -> Result<Vec<u8>, String> {
+    let bytes = decode_hex(value, "post-quantum public key")?;
+    if bytes.len() != PQ_PUBLIC_KEY_LEN {
+        return Err("post-quantum public key is not a valid ML-DSA-65 key".to_string());
+    }
+    if hex::encode(&bytes) != value {
+        return Err(
+            "post-quantum public key must be lower-case hex with no leading or trailing space"
+                .to_string(),
+        );
+    }
+    Ok(bytes)
+}
+
+/// Sign a block hash with the validator's ML-DSA key.
+pub fn sign_block_hash(block_hash: &str, master_secret_hex: &str) -> Result<String, String> {
+    sign_message(&format!("{}{}", PQ_BLOCK_DOMAIN, block_hash), master_secret_hex)
+}
+
+/// Verify a block's ML-DSA signature.
+pub fn verify_block_signature(
+    block_hash: &str,
+    pq_public_key_hex: &str,
+    signature_hex: &str,
+) -> bool {
+    verify_message(
+        &format!("{}{}", PQ_BLOCK_DOMAIN, block_hash),
+        pq_public_key_hex,
+        signature_hex,
+    )
 }
 
 #[cfg(test)]

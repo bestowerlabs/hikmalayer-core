@@ -1238,3 +1238,112 @@ fn a_hybrid_signature_does_not_replay_across_networks() {
     );
     assert_eq!(mainnet.balance_of(&bob.address), 0);
 }
+
+// ===================================================================
+// Encoding canonicality
+// ===================================================================
+
+/// One authorized transaction must have exactly ONE valid on-wire form.
+///
+/// secp256k1 accepts a 33-byte compressed encoding of the same key. It hashes
+/// to the same address and verifies the same signatures, so before this was
+/// fixed a relay could re-encode `public_key` on a transaction it was passing
+/// along and produce a *different* transaction id that was equally valid. The
+/// sender would watch an id that never confirmed while an identical transfer
+/// landed under another. It is the malleability class that caused years of
+/// grief on Bitcoin, and the chain already refuses the same trick with the
+/// post-quantum fields.
+#[test]
+fn a_compressed_public_key_is_not_a_second_spelling_of_an_account() {
+    let (mut state, treasury) = chain();
+    let alice = account(4);
+    let bob = account(5);
+    fund(&mut state, &treasury, &alice.address, 100 * UNITS_PER_HKM, 1);
+
+    let compressed = {
+        let bytes = hex::decode(&alice.public_key).unwrap();
+        hex::encode(secp256k1::PublicKey::from_slice(&bytes).unwrap().serialize())
+    };
+    assert_ne!(compressed, alice.public_key);
+    // It really is the same key: this is why it was dangerous.
+    assert!(pos::verify_message(
+        "probe",
+        &compressed,
+        &pos::sign_message("probe", &alice.private_key).unwrap()
+    ));
+
+    let mut tx = signed_transfer(&alice, &bob.address, 10 * UNITS_PER_HKM, 1);
+    tx.public_key = Some(compressed);
+
+    assert!(
+        state.apply_transaction(&tx, 2).is_err(),
+        "a compressed public key gave the account a second valid encoding"
+    );
+    assert_eq!(state.balance_of(&bob.address), 0);
+
+    // The canonical form still works, so this is a rule about spelling and
+    // not a blanket refusal.
+    let honest = signed_transfer(&alice, &bob.address, 10 * UNITS_PER_HKM, 1);
+    state.apply_transaction(&honest, 2).expect("the canonical form must still work");
+}
+
+/// Upper-case hex decodes to the same bytes, so it is the same problem.
+#[test]
+fn an_upper_case_public_key_is_not_a_second_spelling_of_an_account() {
+    let (mut state, treasury) = chain();
+    let alice = account(4);
+    let bob = account(5);
+    fund(&mut state, &treasury, &alice.address, 100 * UNITS_PER_HKM, 1);
+
+    let mut tx = signed_transfer(&alice, &bob.address, 10 * UNITS_PER_HKM, 1);
+    tx.public_key = Some(alice.public_key.to_uppercase());
+
+    assert!(state.apply_transaction(&tx, 2).is_err());
+    assert_eq!(state.balance_of(&bob.address), 0);
+}
+
+/// The same rule on the hybrid side, where the address hashes both keys.
+#[test]
+fn a_hybrid_address_has_one_spelling_of_each_key() {
+    let victim = hybrid_account(9);
+    let compressed = {
+        let bytes = hex::decode(&victim.public_key).unwrap();
+        hex::encode(secp256k1::PublicKey::from_slice(&bytes).unwrap().serialize())
+    };
+    assert!(
+        hybrid::derive_hybrid_address(&compressed, &victim.pq_public_key).is_err(),
+        "a compressed key produced a hybrid address"
+    );
+    assert!(
+        hybrid::derive_hybrid_address(&victim.public_key, &victim.pq_public_key.to_uppercase())
+            .is_err(),
+        "an upper-case post-quantum key produced a hybrid address"
+    );
+    // And the canonical pair still derives the account it always did.
+    assert_eq!(
+        hybrid::derive_hybrid_address(&victim.public_key, &victim.pq_public_key).unwrap(),
+        victim.address
+    );
+}
+
+/// A validator's post-quantum block signature must not double as an account
+/// authorization, and vice versa. The classical scheme separates the two by
+/// construction (raw digest vs. prefixed message); the post-quantum half has
+/// to separate them explicitly or the separation is only an accident of what
+/// today's canonical messages happen to look like.
+#[test]
+fn a_post_quantum_block_signature_is_not_an_account_authorization() {
+    let validator = hybrid_account(9);
+    let block_hash = "00".repeat(32);
+
+    let block_sig = pq::sign_block_hash(&block_hash, &validator.private_key).unwrap();
+    let message_sig = pq::sign_message(&block_hash, &validator.private_key).unwrap();
+    assert_ne!(block_sig, message_sig, "block and message domains collide");
+
+    // Neither signature is valid in the other's domain.
+    assert!(!pq::verify_message(&block_hash, &validator.pq_public_key, &block_sig));
+    assert!(!pq::verify_block_signature(&block_hash, &validator.pq_public_key, &message_sig));
+    // Each is valid in its own.
+    assert!(pq::verify_block_signature(&block_hash, &validator.pq_public_key, &block_sig));
+    assert!(pq::verify_message(&block_hash, &validator.pq_public_key, &message_sig));
+}

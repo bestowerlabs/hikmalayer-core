@@ -64,6 +64,14 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
         .ok()
         .filter(|v| !v.is_empty());
 
+    // Required when the genesis treasury is a quantum-ready (`hkq…`) address:
+    // without it that account's stake and blocks would still be protected by
+    // ECDSA alone, and the chain refuses to seat it as a validator at all
+    // rather than pretend otherwise.
+    let genesis_pq_key = std::env::var("GENESIS_VALIDATOR_PQ_PUBLIC_KEY")
+        .ok()
+        .filter(|v| !v.is_empty());
+
     // The network's name. It is part of every signed transaction, so two
     // networks with different ids cannot replay each other's transactions —
     // give a testnet and a mainnet different values, always.
@@ -113,6 +121,7 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
             supply,
             allowlist,
             require_hybrid,
+            genesis_pq_key,
         ),
         (None, Some(validator_key)) => {
             let treasury = pos::derive_address(&validator_key).unwrap_or_default();
@@ -125,6 +134,7 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
                 supply,
                 allowlist,
                 require_hybrid,
+                genesis_pq_key,
             )
         }
         (None, None) => {

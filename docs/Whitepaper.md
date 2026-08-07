@@ -1,8 +1,8 @@
-# Hikmalayer: A Multi-Purpose Blockchain Platform for Digital Certificates and Tokenized Assets
+# Hikmalayer: A Quantum Dual-Hybrid Layer 1 for Digital Credentials and Native Assets
 
 **Official Whitepaper**  
-**Version 1.0**  
-**August 2025**  
+**Version 2.0**  
+**August 2026**  
 **License:** Creative Commons Attribution 4.0 International (CC BY 4.0)
 
 **Author:**  
@@ -18,14 +18,57 @@ www.bestowerlabs.com
 
 ## Abstract
 
-Hikmalayer represents a next-generation blockchain platform designed to address the growing demand for secure, verifiable digital credentials and efficient token-based transactions. Built on Rust's performance-oriented architecture, Hikmalayer implements a hybrid proof-of-stake validator selection model with proof-of-work block finalization, enabling seamless certificate management and fungible token operations within a unified ecosystem.
+Hikmalayer is a sovereign Layer 1 blockchain, written in Rust, that is **dual-hybrid
+in two independent senses**:
 
-This whitepaper is released under CC BY 4.0 to encourage broad distribution, translation, and
-academic citation while preserving attribution to Bestower Labs Limited and the Hikmalayer team.
+1. **Hybrid consensus.** Stake-weighted VRF selection chooses each block's
+   leader (Proof of Stake); that leader then finalizes the block with
+   Proof of Work. Neither stake alone nor hashpower alone produces a block.
+2. **Hybrid cryptography.** An account may be *quantum-ready*: authorized by
+   **two** signatures over the same message — secp256k1 ECDSA **and** ML-DSA-65
+   (FIPS 204, NIST post-quantum category 3). Forging one transaction requires
+   breaking **both** schemes, so the account remains secure while *either*
+   holds.
 
-The platform addresses critical challenges in digital credential verification, asset tokenization, and decentralized application development by providing a robust, scalable infrastructure that combines the security of traditional blockchain architectures with the flexibility of modern smart contract systems. Through its comprehensive REST API and modular design, Hikmalayer enables developers and organizations to build trust-based applications with minimal complexity while maintaining enterprise-grade security standards.
+The token layer and the exchange layer are **protocol-native**. HKM is the
+native coin; HTS (Hikmalayer Token Standard) assets and a constant-product
+automated market maker are consensus objects executed by the state machine
+itself — not smart contracts, because Hikmalayer deliberately ships **no
+virtual machine**. There is **no bridge**, and none is planned: no wrapped or
+external asset is or will be tradeable on this chain.
 
-**Keywords:** Blockchain, Digital Certificates, Proof-of-Stake, Proof-of-Work, Hybrid Consensus, Smart Contracts, Token Management, Decentralized Verification
+Its flagship application is Proof-of-Credential: verifiable credentials as
+first-class consensus objects, where only a document *hash* is ever published,
+and any third party can verify a credential against the block-committed state
+root without trusting a node.
+
+This whitepaper is released under CC BY 4.0 to encourage broad distribution,
+translation, and academic citation while preserving attribution to Bestower
+Labs Limited and the Hikmalayer team. It describes the system **as
+implemented**; where something is planned rather than built, it says so.
+
+**Keywords:** Blockchain, Layer 1, Post-Quantum Cryptography, ML-DSA, FIPS 204,
+Hybrid Signatures, Proof-of-Stake, Proof-of-Work, VRF, Verifiable Credentials,
+Native Token Standard, Automated Market Maker
+
+---
+
+## Reader's summary — what Hikmalayer is, in one page
+
+| | |
+|---|---|
+| **Type** | Sovereign Layer 1. Own address format, own signing domain, no dependency on Ethereum or any other chain |
+| **Consensus** | PoS leader selection (stake-weighted, VRF-seeded) + PoW finalization by the selected leader |
+| **Randomness** | sr25519 VRF beacon — validator-unique per slot, nothing to grind |
+| **Native coin** | HKM — pays fees, secures the chain through staking, and is the unit block rewards are paid in |
+| **Native token standard** | HTS — fungible assets as consensus objects, fixed supply at creation, reducible only by burning |
+| **Native exchange** | Constant-product AMM (HKM ↔ HTS) in the state machine, 0.30% fee to liquidity providers |
+| **Smart contracts** | **None.** No VM, no user-deployed bytecode. Capabilities are protocol features (see §4) |
+| **Bridge** | **None, by decision.** No wrapped or external asset exists on this chain |
+| **Account types** | `hkm…` classical (ECDSA) and `hkq…` quantum-ready (ECDSA **+** ML-DSA-65) |
+| **Post-quantum** | Opt-in per account; a network may require it at genesis. Covers transfers, tokens, the AMM, staking, unbonding and block production |
+| **Not post-quantum** | The sr25519 VRF used for leader election — stated plainly in §7.1.5 |
+| **Flagship application** | Proof-of-Credential — hash-only on-chain credentials, verifiable against the state root |
 
 ---
 
@@ -242,77 +285,116 @@ The consensus mechanism encourages network participation through:
 
 ---
 
-## 4. Smart Contract Framework
+## 4. Protocol-Native Capabilities (and why there is no VM)
 
-### 4.1 Contract Architecture
+### 4.1 The design decision, stated plainly
 
-Hikmalayer's smart contract system is built around the ContractExecutor, which provides a secure, efficient environment for executing deterministic business logic on the blockchain.
+**Hikmalayer has no virtual machine.** There is no user-deployable bytecode,
+no Solidity, no WASM runtime, and no `eth_call` equivalent. Everything the
+chain can do is a transaction type the state machine executes directly.
 
-**Design Philosophy:**
+This is a deliberate trade, and it costs something real: you cannot write an
+arbitrary application that runs on Hikmalayer the way you can on Ethereum.
+What it buys:
 
-- **Deterministic Execution**: All contract operations produce predictable, reproducible results
-- **State Isolation**: Contract state is managed separately from blockchain state
-- **Integration Points**: Seamless interaction between contracts, tokens, and blockchain operations
-- **Extensibility**: Modular design supports addition of new contract types
+- **The attack surface is enumerable.** A general VM means every deployed
+  contract is new consensus-adjacent code written by someone with no
+  obligation to be careful, and the majority of value ever stolen from
+  blockchains has been stolen through contract bugs rather than consensus
+  ones. Hikmalayer's surface is the transaction types in this document.
+- **No gas metering, and no gas-metering bugs.** Fees are per-transaction and
+  deterministic, because execution cost is bounded by construction.
+- **Upgrades are protocol changes.** Adding a capability means changing the
+  chain, in the open, with the state root as the arbiter — not deploying an
+  unaudited contract that a user cannot distinguish from a safe one.
 
----
+An earlier version of this document described a "smart contract framework".
+That was inaccurate: the component in question (`ContractExecutor`) is a
+credential registry, not an execution environment. This section replaces it.
 
-### 4.2 Certificate Management Contracts
+### 4.2 What the protocol provides instead
 
-The flagship smart contract implementation focuses on digital certificate management, providing comprehensive functionality for educational institutions, professional organizations, and certification bodies.
+| Capability | Consensus objects | Transaction types |
+|---|---|---|
+| Native value | account balances, nonces | `Transfer` |
+| Staking | `StakeInfo` (stake, secp256k1 key, VRF key, ML-DSA key) | `Stake`, `Withdraw`, `Slash` |
+| Token standard (HTS) | `TokenInfo`, per-token balances | `TokenCreate`, `TokenTransfer`, `TokenBurn` |
+| Exchange (AMM) | `AmmPool` (reserves, LP shares) | `AddLiquidity`, `RemoveLiquidity`, `Swap` |
+| Vesting | vesting schedules | `Vest` |
+| Credentials | credential records | `Certificate` (issue / revoke) |
+| Block economics | fee pot, emission schedule | `Reward` |
 
-**Certificate Data Structure:**
+Each is executed by `ChainState::apply`, committed to by the state root, and
+re-verified by every node. None of them can be redefined by a user.
 
-```rust
-pub struct Certificate {
-    pub id: String,           // Unique certificate identifier
-    pub issued_to: String,    // Recipient identifier
-    pub description: String,  // Certificate details and metadata
-    pub verified: bool,       // Verification status flag
-}
+### 4.3 Proof-of-Credential
+
+The flagship capability, and the reason the chain exists.
+
+**Only a hash goes on chain.** A credential record holds an issuer, a subject,
+a document hash, a revocation flag and a height. The document itself never
+touches the chain, so publishing a credential does not publish its contents.
+
+**Issuance and revocation are both signed transactions** authorized by the
+issuer's key — and revocation is a first-class operation, not a convention.
+An issuer can withdraw a credential it granted, instantly and verifiably; a
+credential that cannot be revoked is not a credential, it is a receipt.
+
+**Verification needs no trusted node.** A verifier receives the credential,
+the height, the state root and the block hash, and checks the record against
+the state root committed in that block. A node that lies about a credential is
+caught by arithmetic, not by reputation.
+
+```bash
+# Issue: only the DOCUMENT HASH is published
+hikma-wallet sign-credential <id> <subject> <sha256-of-document> false <nonce> <key>
+
+# Verify: returns { credential, height, state_root, block_hash }
+curl -s "$NODE/credentials/verify/<id>"
 ```
 
-**Core Contract Operations:**
+### 4.4 HTS — the native token standard
 
-**Certificate Issuance:**
+An HTS token is a consensus object, not a contract:
 
-- Creates new certificates with unique identifiers
-- Records recipient information and certificate metadata
-- Initializes verification status and timestamps
-- Integrates with blockchain transaction system
+- **Deterministic id.** `hkt` + hex(SHA-256(`creator:symbol:nonce`)[..20]).
+- **Fixed supply at creation.** There is no mint operation. Supply moves in
+  one direction only, downward, through `TokenBurn`. No issuer — including the
+  original creator — can inflate a token after the fact.
+- **Up to 18 decimals**, declared at creation and immutable.
+- **The same authorization rules as HKM**, including the hybrid rules: a
+  `hkq…` issuer's token operations need both signatures.
 
-**Certificate Verification:**
+Because there is no contract, there is no such thing as an HTS token with a
+hidden mint function, a blacklist, a transfer hook, a proxy admin, or an
+upgradeable implementation. The properties above are the properties of *every*
+HTS token, guaranteed by consensus rather than by an audit of that particular
+token's code.
 
-- Validates certificate existence and authenticity
-- Updates verification status and timestamps
-- Provides cryptographic proof of verification
-- Enables third-party validation workflows
+The honest trade-off is the same one as §4.1: there is also no way to build an
+HTS token with legitimate custom behaviour — no rebasing, no fee-on-transfer,
+no programmable vesting beyond the protocol's own `Vest`.
 
-**Reward Integration:**
-The contract system seamlessly integrates with the token system to provide automatic rewards for certificate-related activities:
+### 4.5 The native AMM
 
-- **Verification Rewards**: Tokens distributed upon successful certificate verification
-- **Issuance Incentives**: Rewards for institutions issuing verified certificates
-- **Network Participation**: Tokens for mining blocks containing certificate transactions
+A constant-product (`x·y = k`) automated market maker, in the state machine.
 
-### 4.3 Contract Execution Model
+- **Pairs are HKM ↔ HTS token.** Every pool has HKM on one side.
+- **0.30% fee**, retained in the reserves and therefore accruing to liquidity
+  providers pro rata.
+- **`MINIMUM_LIQUIDITY` (1,000 shares) is locked permanently** on a pool's
+  first deposit, which keeps `total_shares` above zero forever and closes the
+  first-depositor share-inflation attack.
+- **Slippage bounds are mandatory in practice.** `Swap` carries `min_out`;
+  `AddLiquidity` carries `min_shares`; `RemoveLiquidity` carries `min_hkm` and
+  `min_token`. The SDK will not build an unbounded trade even if asked, since
+  an unbounded swap is a gift to whoever orders the block.
 
-**Transaction Integration:**
-Smart contract operations are tightly integrated with the blockchain transaction system:
-
-1. **Contract Call**: API request triggers smart contract function
-2. **State Update**: Contract modifies internal state (certificates, verification status)
-3. **Transaction Creation**: Contract operation generates blockchain transaction
-4. **Pending Queue**: Transaction added to pending transaction pool
-5. **Mining Process**: Transaction included in next mined block
-6. **Finalization**: Contract state changes become permanent upon block confirmation
-
-**State Persistence:**
-Contract state is maintained in memory during operation, with persistence achieved through blockchain integration. This hybrid approach provides:
-
-- **Fast Access**: In-memory operations for immediate contract execution
-- **Permanent Record**: Blockchain storage for transaction history and audit trails
-- **Conflict Resolution**: Blockchain serves as authoritative record for dispute resolution
+Because the AMM is consensus code, a trade cannot be front-run *by a contract*,
+there is no router to be tricked into approving, and there is no pool
+implementation to differ from another pool's. Ordering within a block is still
+chosen by the block's producer — that is true of every blockchain, and §7.3
+says what does and does not follow from it.
 
 ---
 
@@ -486,31 +568,176 @@ The platform supports integration with other blockchain networks and traditional
 
 ## 7. Security Analysis
 
-### 7.1 Cryptographic Security
+### 7.1 Cryptographic Architecture
 
-**Hash Function Security:**
-Hikmalayer employs SHA-256 cryptographic hashing throughout the system, providing:
+This section describes what is implemented, not what is intended.
 
-- **Collision Resistance**: Computationally infeasible to find two inputs producing the same hash
-- **Pre-image Resistance**: Cannot determine input data from hash output alone
-- **Avalanche Effect**: Small input changes produce dramatically different hash outputs
-- **Deterministic Output**: Identical inputs always produce identical hash values
+#### 7.1.1 Primitives in use
 
-**Block Integrity:**
-Each block contains cryptographic links ensuring tamper detection:
+| Purpose | Primitive | Quantum status |
+|---|---|---|
+| Account signatures (classical) | secp256k1 ECDSA, low-S normalized | **Broken by Shor's algorithm** |
+| Account signatures (quantum-ready) | secp256k1 ECDSA **+** ML-DSA-65 (FIPS 204) | Safe while *either* holds |
+| Block signatures | as above, per the validator's account type | as above |
+| Leader-election randomness | sr25519 VRF (Ristretto255, schnorrkel) | **Broken by Shor's algorithm** — see §7.1.5 |
+| Hashing, addresses, Merkle roots, PoW | SHA-256 | Sound. Grover halves it; 128-bit effective is out of reach |
+| Wallet storage | AES-256-GCM, PBKDF2-SHA256 (310,000 iterations) | Sound. 128-bit effective post-Grover |
 
-- **Previous Hash Linking**: Each block references the hash of its predecessor
-- **Transaction Merkle Roots**: Future enhancement to efficiently verify transaction inclusion
-- **Nonce Validation**: Proof-of-work solutions verifiable by any network participant
-- **Chain Validation**: Complete blockchain integrity verification through hash chain
+#### 7.1.2 The native signing domain
 
-**Transaction Security:**
-Transaction data integrity is protected through multiple mechanisms:
+Every account signature is over
 
-- **Digital Signatures**: Future implementation of cryptographic transaction signing
-- **Hash Verification**: Transaction content hashed and verified during processing
-- **Replay Protection**: Unique transaction identifiers prevent duplicate processing
-- **State Consistency**: Transaction processing maintains consistent system state
+```
+SHA256( "\x19Hikmalayer Signed Message:\n" ‖ <UTF-8 byte length> ‖ <chain_id> ":" <canonical message> )
+```
+
+Three properties come from that construction:
+
+- **No cross-chain reuse.** There is no `0x`/keccak address and no
+  `personal_sign` prefix, so a Hikmalayer signature is meaningless to another
+  chain's verifier and vice versa.
+- **No cross-*network* replay.** The chain id is inside the signed bytes, and
+  it is a *visible* prefix rather than a hidden digest tweak, so a wallet's
+  confirmation screen can show which network is being authorized. A
+  transaction signed on a testnet is inert on mainnet even though the account
+  exists on both.
+- **No cross-operation reuse.** Each operation has its own message prefix
+  (`hikmalayer-transfer:`, `hikmalayer-stake:`, …), so a transfer signature
+  cannot authorize a stake.
+
+#### 7.1.3 The quantum problem, stated without euphemism
+
+Hikmalayer's classical exposure is **worse than Bitcoin's**, and pretending
+otherwise would be dishonest.
+
+Bitcoin's P2PKH addresses publish only a *hash* of the public key; the key
+appears when a coin is first spent, so a never-spent output is not exposed.
+Hikmalayer publishes the public key with **every** transaction, because
+verification takes it from the request. Worse, a validator's key sits in
+`StakeInfo` in the open for as long as its stake does — there is no "spend once
+and rotate" for it. The longest-lived, most valuable key on the chain is also
+the most exposed.
+
+"Harvest now, decrypt later" therefore applies directly: an adversary can
+archive the chain today and derive private keys the day the hardware exists.
+
+#### 7.1.4 The dual-hybrid answer
+
+```
+hkm…   classical      address = SHA256(secp_pub)[..20]
+                      authorized by:  ECDSA
+
+hkq…   quantum-ready  address = SHA256("hikmalayer-hybrid-address-v1"
+                                        ‖ secp_pub ‖ mldsa_pub)[..20]
+                      authorized by:  ECDSA  AND  ML-DSA-65
+```
+
+**Both signatures are required.** An attacker must break both schemes to forge
+one transaction; the account is safe while either holds. This is why the answer
+is hybrid rather than a replacement: nobody can honestly say when a
+cryptographically relevant quantum computer arrives, and equally ML-DSA is
+young enough that a classical break of *it* would not be shocking. Requiring
+both means neither surprise is fatal.
+
+**The address commits to both public keys.** This is the part that is easy to
+get wrong, and getting it wrong makes the whole exercise decorative. If a
+hybrid address were derived from the classical key alone, an attacker who broke
+secp256k1 could present the victim's classical key alongside an ML-DSA key *of
+their own*, and the "hybrid" account would fall to a single break. Hashing both
+means substituting either names a different account.
+
+**Parameter choice.** ML-DSA-65 (NIST category 3). ML-DSA-44 is category 2 — a
+thinner margin than a chain holding value for decades should accept. ML-DSA-87
+is category 5 and costs another ~1.3 KB per signature against an adversary
+nobody can presently describe.
+
+**Determinism.** Keys derive from FIPS 204's own 32-byte seed ξ, itself derived
+with domain separation from the account's existing private key — so one backup
+still covers both schemes. Signatures use the hedged variant with the
+randomness pinned to a seed derived from (key, message): standards-conforming,
+reproducible across implementations, and proof against a broken RNG on a user's
+machine leaking a key through a signature. Determinism is also what lets the
+Rust node and the browser wallet produce byte-identical signatures, which is
+asserted by test rather than assumed.
+
+**Where it is enforced.** Everywhere a key authorizes value or consensus:
+
+| Path | Classical account | Quantum-ready account |
+|---|---|---|
+| Transfers, HTS tokens, vesting, AMM | ECDSA | ECDSA **+ ML-DSA-65** |
+| Staking | ECDSA | Both; the ML-DSA key is registered on chain |
+| Unbonding stake | ECDSA vs. the on-chain key | **Both**, vs. the on-chain keys |
+| Block production | ECDSA over the block hash | **Both** over the block hash |
+
+In every case **the address decides**, never the transaction — otherwise an
+attacker could downgrade a hybrid account simply by omitting the post-quantum
+half. Symmetrically, a classical transaction carrying post-quantum fields is
+rejected rather than ignored, so one authorized transaction has exactly one
+valid encoding.
+
+**Network-level enforcement.** `GENESIS_REQUIRE_HYBRID=1` makes a network
+accept only `hkq…` senders. The flag is committed to by the genesis state root,
+so it is a property of the network and not a local setting nodes could quietly
+differ on.
+
+**The cost, honestly.**
+
+| | Classical | Quantum-ready |
+|---|---|---|
+| Public key | 65 bytes | 2,017 bytes |
+| Signature | 64 bytes | 3,373 bytes |
+| Per transaction | ~130 bytes | ~5.4 KB (≈40×) |
+| Signing time (browser) | <1 ms | ~11 ms |
+
+This is the real, unavoidable price of post-quantum signatures today. It is why
+hybrid is opt-in per account rather than mandatory on every network.
+
+**Migration is a transfer, not an upgrade.** A key's classical and hybrid
+accounts are *different accounts with separate balances*. There is deliberately
+no mechanism by which a classical signature can claim a hybrid account's funds
+— such a mechanism would be the downgrade attack, shipped as a feature.
+
+#### 7.1.5 What is NOT quantum-protected
+
+Stated here rather than buried:
+
+- **The sr25519 VRF used for leader election remains classical.** A quantum
+  adversary that recovered a validator's VRF key could **predict** that
+  validator's future slots. It could not mint, spend, or produce a block —
+  block signatures are separately hybrid — but slot prediction is a real
+  advantage for a targeted denial-of-service or a grinding-adjacent strategy.
+  There is no standardized post-quantum VRF today; the available options are a
+  hash-based construction with weaker unpredictability guarantees, or waiting
+  for standardization. Hikmalayer waits, and says so.
+- **Classical accounts remain classical.** `hkm…` accounts carry the exposure
+  described in §7.1.3. Hybrid is opt-in.
+- **Nothing here defends against conventional key theft.** Malware, a phished
+  backup, an unlocked wallet — hybrid changes none of it.
+
+#### 7.1.6 Encoding canonicality
+
+One authorized transaction has exactly **one** valid on-wire form. secp256k1
+accepts a 33-byte compressed encoding of the same key and hex accepts upper
+case; both were once accepted, both hashed to the same address, and both
+verified the same signatures — which meant a relay could re-encode a
+transaction in flight and produce a different, equally valid transaction id.
+The chain now accepts only the canonical encoding (uncompressed, 65 bytes,
+`04`-prefixed, lower-case hex; lower-case hex for ML-DSA keys), verified by
+round-trip rather than by pattern match.
+
+#### 7.1.7 Block and chain integrity
+
+- **Merkle-root transaction commitment.** Implemented — a binary tree over the
+  transaction payloads, with odd nodes paired against themselves.
+- **State root.** Every block commits to the full chain state *after* executing
+  it, so a node cannot forge a balance, a credential or a validator set without
+  every other node detecting it by re-execution.
+- **Fork choice by cumulative work**, with finalized history protected. An
+  adopted chain is re-executed under *local* network parameters and its state
+  rebuilt from genesis — a candidate's own claims about its genesis are never
+  trusted.
+- **Bounded difficulty (1–5)**, so a malformed difficulty can neither disable
+  Proof of Work nor stall a node.
 
 ### 7.2 Network Security
 
@@ -530,31 +757,72 @@ The system design promotes continued operation under various failure conditions:
 - **Byzantine Fault Tolerance**: System remains secure with minority malicious actors
 - **Graceful Degradation**: Reduced functionality rather than complete failure under stress
 
-### 7.3 Application Security
+### 7.3 Application and Node Security
 
-**Smart Contract Security:**
-The contract execution environment includes several security features:
+**There is no contract execution environment to secure** (§4.1). The
+application-layer surface is the set of transaction types, each validated
+before any state is touched:
 
-- **Deterministic Execution**: Contract outcomes predictable and reproducible
-- **State Isolation**: Contract state separated from blockchain core functionality
-- **Input Validation**: All contract inputs validated before processing
-- **Error Handling**: Graceful failure modes prevent system compromise
+- **Recipients are validated.** A transfer to a malformed address is rejected
+  rather than executed, because crediting a mistyped address puts funds where
+  nobody holds a key. There is no checksum and no recovery; refusal is the only
+  safe behaviour.
+- **Arithmetic is checked, not wrapping.** Every balance and supply operation
+  uses checked arithmetic, and the release profile enables overflow checks.
+  This is not decoration: an unchecked fee addition once allowed 0.01 HKM to be
+  turned into 184× the total supply.
+- **Authorization is verified where state changes**, not where callers
+  remember to ask. `apply_transaction` verifies the sender's signature itself,
+  so a code path that forgets to check cannot admit a forged transaction.
+- **Nonces are strictly sequential** per account — no reuse, no skipping ahead
+  to reserve a slot.
 
-**API Security:**
-The REST API implements security best practices:
+**Ordering and MEV, honestly.** Within a block, transaction ordering is chosen
+by that block's producer. That is true of every blockchain, and Hikmalayer
+does not claim otherwise. What follows is that AMM trades should carry
+slippage bounds — which the protocol requires as a field and the SDK refuses to
+omit — and what does *not* follow is any claim of front-running immunity.
 
-- **Input Sanitization**: All user inputs validated and sanitized
-- **CORS Configuration**: Cross-origin requests properly controlled
-- **Error Information Disclosure**: Error messages balance debugging with security
-- **Rate Limiting Preparation**: Architecture supports future rate limiting implementation
+**API security:**
 
-**Data Protection:**
-Sensitive data handling follows security principles:
+- **Deny-by-default authorization.** Admin endpoints require `x-admin-token`
+  and P2P endpoints require `x-p2p-token`. An unset token **disables** the
+  endpoint rather than opening it. Tokens support `*_TOKEN_CURRENT` /
+  `*_TOKEN_PREVIOUS` rotation and are compared in constant time.
+- **The node never accepts a private key**, on any endpoint, for any purpose.
+  Signing happens in the wallet, the extension, or the offline CLI.
+- **Cryptographic node identity.** Every gossip envelope is signed by the
+  sender's node key and bound to its derived node id;
+  `P2P_REQUIRE_IDENTITY=true` rejects any unsigned envelope. Peer reputation
+  scoring auto-bans repeat offenders, and an optional `P2P_ALLOWLIST` restricts
+  participation to named node ids.
+- **Bounded resources.** The mempool is capped; explorer inputs are
+  length-limited; difficulty is clamped.
 
-- **Minimal Data Storage**: Only necessary data stored on-chain
-- **Privacy Consideration**: Personal information handling designed for privacy compliance
-- **Access Controls**: Future implementation of role-based access controls
-- **Audit Logging**: Complete audit trails for all system operations
+**Wallet security:**
+
+- Keys are generated in the browser and never leave it — never sent to a node,
+  never placed in a URL, never logged.
+- At rest they exist only as AES-256-GCM ciphertext under a PBKDF2-SHA256 key
+  (310,000 iterations).
+- While unlocked the key is held encrypted under a **non-extractable**
+  per-session WebCrypto key and decrypted to a short-lived buffer only for the
+  instant of signing, then wiped.
+- Every signature requires explicit approval showing the exact canonical
+  message, so a scripted signing spree is visible and refusable.
+- The browser **extension** removes the main residual risk: keys live in the
+  extension's own context, where a website — or an XSS in one — cannot reach
+  them.
+
+Honest limits: none of this defends against malware on the device. Treasury
+and validator keys belong offline. See `docs/wallet_security.md`.
+
+**Data protection:**
+
+- **Minimal on-chain data.** Proof-of-Credential publishes a document *hash*,
+  never the document.
+- **Audit trail.** The chain itself is the log; every state transition is
+  reconstructible from the block history.
 
 ### 7.4 Operational Security
 
@@ -910,17 +1178,32 @@ The platform presents opportunities for various stakeholder engagement:
 ### 11.2 API Specifications
 
 **Authentication and Authorization:**
-Current implementation uses open API access with planned future enhancements:
 
-- **Current**: No authentication required (suitable for development and testing)
-- **Planned**: JWT token-based authentication with role-based access controls
-- **Future**: OAuth2/OpenID Connect integration for enterprise single sign-on
+- **Value-bearing calls are signature-authorized, not session-authorized.**
+  There is no login. A transfer, stake, token operation or trade carries the
+  sender's public key and signature (and, for a `hkq…` sender, an ML-DSA public
+  key and signature as well); the node reconstructs the canonical message from
+  the request fields and verifies against it. A request the signature does not
+  cover is not a request.
+- **Administrative endpoints are token-gated**, deny-by-default: the faucet,
+  mining trigger, difficulty and governance endpoints require `x-admin-token`,
+  and are **disabled** when the token is unset. P2P endpoints require
+  `x-p2p-token` on the same terms.
+- **Token rotation** is supported via `*_TOKEN_CURRENT` / `*_TOKEN_PREVIOUS`,
+  and comparison is constant-time.
+- **The API never accepts a private key.**
+
+Honest limitation: admin tokens are bearer credentials, not signatures. Anyone
+holding `ADMIN_TOKEN` can drive those endpoints, so it must be treated as a
+production secret.
 
 **Rate Limiting:**
 
-- **Current**: No rate limiting implemented
-- **Planned**: Configurable rate limits per client/IP address
-- **Production**: Recommended rate limiting for production deployments to prevent abuse
+- **Implemented structurally**: the mempool is capped, oversized inputs are
+  rejected, and the projected-state check makes an inapplicable transaction
+  cost one verification rather than a scan of the pool.
+- **Not implemented**: per-IP request rate limiting. Deploy behind a reverse
+  proxy that provides it.
 
 **API Versioning:**
 
@@ -1133,12 +1416,44 @@ Hikmalayer commits to responsible technology development through:
 - **Probability**: Low in current centralized context, moderate as network grows
 - **Mitigation**: Distributed mining, monitoring systems, rapid response procedures
 
-**Smart Contract Risks:**
+**Quantum Computing Risk:**
 
-- **Risk**: Contract bugs or exploitation vulnerabilities
-- **Impact**: Medium - could affect certificate integrity or token balances
-- **Probability**: Low due to simple contract logic, but increases with complexity
-- **Mitigation**: Comprehensive testing, code audits, formal verification for critical contracts
+- **Risk**: A cryptographically relevant quantum computer recovers private keys
+  from the public keys this chain publishes with every transaction, and from
+  validator keys that sit permanently in the staker set
+- **Impact**: **Critical** for classical (`hkm…`) accounts — total loss of
+  control. **Low** for quantum-ready (`hkq…`) accounts, which additionally
+  require an ML-DSA-65 signature (§7.1.4)
+- **Probability**: Timing unknowable. "Harvest now, decrypt later" means the
+  archive is already being built, so the decision cannot be deferred to the
+  moment the hardware appears
+- **Mitigation**: Hybrid accounts, available now, enforced across transfers,
+  tokens, the AMM, staking, unbonding and block production; a network may
+  require them at genesis. **Residual**: the sr25519 VRF remains classical
+  (§7.1.5), and accounts that do not migrate keep the classical exposure —
+  migration is a user action, and no protocol can perform it on their behalf
+
+**Post-Quantum Algorithm Risk:**
+
+- **Risk**: A classical break of ML-DSA, which is a much younger scheme than
+  secp256k1
+- **Impact**: Low — hybrid accounts also require ECDSA, so an ML-DSA break
+  alone forges nothing
+- **Probability**: Low but not negligible; lattice cryptanalysis is an active
+  field
+- **Mitigation**: This is precisely why the scheme is hybrid rather than a
+  replacement. Both schemes must fall for an account to fall
+
+**Absence-of-VM Risk (accepted trade):**
+
+- **Risk**: No user-deployable contracts limits what third parties can build,
+  and new capabilities require protocol changes rather than deployments
+- **Impact**: Medium for ecosystem growth
+- **Probability**: Certain — it is a design decision, not a failure mode
+- **Mitigation**: Rich protocol-native primitives (HTS, AMM, vesting,
+  credentials) plus an SDK, REST API and wallet tooling. Accepted deliberately:
+  the majority of value ever stolen from blockchains was stolen through
+  contract bugs, not consensus bugs (§4.1)
 
 **Scalability Risks:**
 

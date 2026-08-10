@@ -1,5 +1,12 @@
 # Local Blockchain Testing Report
 
+> **Historical record.** This is a dated snapshot from the time it was written,
+> retained as provenance. It does **not** describe the current tree — the suite
+> has since grown to 139 unit tests plus 40 adversarial tests, alongside 58 SDK
+> offline tests, 21 live integration tests and a 16-check end-to-end
+> application. For current verification steps see the repository `README.md`
+> and `docs/security_assessment.md`.
+
 Date: 13 July 2026
 Tester: Pratham Chavan
 

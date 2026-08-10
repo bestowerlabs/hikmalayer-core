@@ -237,7 +237,7 @@ Hikmalayer uses deny-by-default admin and P2P authorization headers:
 
 ## API Endpoints
 
-### 🌐 P2P Protocol (Phase-4)
+### 🌐 P2P Protocol
 
 #### Receive Protocol Envelope
 

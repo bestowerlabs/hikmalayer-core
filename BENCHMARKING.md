@@ -1,7 +1,13 @@
-# Benchmarking Hikmalayer (Phase 4)
+# Benchmarking Hikmalayer
 
-This guide provides benchmark commands for local testnet runs using Docker Compose and the
-benchmark harness in `/bench`.
+Benchmark commands for local testnet runs using Docker Compose and the harness
+in `bench/`.
+
+**Read the scope limits first.** These measure the execution and API layer on a
+single host. They are **not** a wide-area consensus benchmark: block propagation
+across real network paths, fork resolution under partition, and validator gossip
+at scale are all unmeasured, and need a public testnet with independent
+operators. Results and their limits: [`docs/benchmark_report.md`](docs/benchmark_report.md).
 
 ## Prerequisites
 

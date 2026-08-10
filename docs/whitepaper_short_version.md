@@ -340,144 +340,252 @@ Full detail: `docs/quantum_readiness.md`.
 
 ## 6. Security and Performance
 
-### 6.1 Security Features
+### 6.1 Security
 
-**Cryptographic Security:**
+**Authorization.** Value-bearing calls are signature-authorized, not
+session-authorized: the node rebuilds each canonical message from the request
+fields and verifies against it, so a request the signature does not cover is not
+a request. Signatures are scoped to a **chain id**, so one made for a testnet is
+inert on mainnet. Each operation has its own message prefix, so a transfer
+signature cannot authorize a stake. Nonces are strictly sequential per account.
+Public keys have exactly one canonical encoding, so a transaction has one valid
+on-wire form and one id.
 
-- SHA-256 hashing for block integrity
-- Proof-of-work prevents unauthorized modifications
-- Input validation prevents injection attacks
-- CORS configuration for secure web integration
+**Consensus.** Fork choice is validator-progress first: **hashrate without stake
+produces nothing and reorganizes nothing.** Finalized blocks are irreversible.
+Equivocation is permissionlessly provable and burns stake on chain, and withdrawn
+stake stays slashable throughout unbonding.
 
-**Operational Security:**
+**Execution.** Checked arithmetic throughout with overflow checks on in release;
+malformed recipients rejected rather than credited; authorization verified where
+state changes rather than where a caller remembers to ask.
 
-- Thread-safe concurrent access
-- Comprehensive error handling
-- API input sanitization
-- Future support for HTTPS and authentication
+**Operations.** Admin and P2P endpoints are deny-by-default — an unset token
+*disables* them. Tokens rotate without downtime and compare in constant time.
+Gossip envelopes are signed and bound to a node id; peer reputation auto-bans
+offenders. The node never accepts a private key.
 
-### 6.2 Performance Characteristics
+**Stated limits.** No independent audit has been performed. Per-IP rate limiting
+is not implemented — deploy behind a proxy. Admin tokens are bearer credentials,
+not signatures. Transaction ordering within a block is chosen by its producer,
+as on every chain, which is why AMM slippage bounds are mandatory in practice.
 
-**Throughput:**
+Detail: `docs/security_assessment.md` (13 findings, all fixed, each with a
+regression test) and `docs/threat_model.md`.
 
-- Fast API response times (sub-millisecond for reads)
-- Efficient in-memory data structures
-- Concurrent request handling via Tokio async runtime
-- Mining performance scales with available CPU power
+### 6.2 Performance
 
-**Scalability:**
+**Measured** — Docker Compose multi-node, single host, 600-second sustained run:
+8,940 transactions, 14.88 TPS average, ~67 ms latency, 0 reorgs, ~4–5 MB per
+node.
 
-- Linear memory growth with blockchain size
-- Horizontal scaling support through API layer
-- Future persistent storage integration planned
-- Load balancing compatible architecture
+**Scope, honestly.** That measures execution and API handling on one host. It is
+**not** a wide-area consensus benchmark — propagation across real network paths,
+fork resolution under partition and gossip at scale are unmeasured, and need a
+public testnet with independent operators.
+
+**Cryptographic costs**, which shape block size more than CPU does:
+
+| | Classical | Quantum-ready |
+|---|---|---|
+| Signing | <1 ms | ~11 ms |
+| Bytes per transaction | ~130 | ~5,400 |
+
+**Storage** is persistent, written atomically and rebuilt by replaying blocks on
+startup — rejected if replay fails rather than trusted. Checkpoint fast-sync
+exists as an opt-in weak-subjectivity assumption; full replay is the default.
+
+**Bounds by design:** mempool 1,000 transactions, 100 per block, 1 MiB bodies,
+difficulty clamped 1–5, 15-second block target retargeted every 10 blocks.
+Throughput is bounded by those parameters rather than by execution speed.
+
+Detail: `docs/benchmark_report.md`.
 
 ---
 
-## 7. Development Roadmap
+## 7. Roadmap
 
-### 7.1 Phase 1: Foundation (Q4 2025)
+Only genuinely undone work is listed. Anything already implemented is described
+above and is not repeated here as a plan.
 
-- **Persistent Storage**: Database backend for blockchain data
-- **Enhanced Security**: Digital signatures and authentication
-- **Performance Optimization**: Database indexing and caching
+### 7.1 Launch blockers
 
-### 7.2 Phase 2: Network Expansion (Q1-Q2 2026)
+1. **Independent external security audit.** Consensus, cryptography, state
+   machine, P2P and node operations. Cannot be self-performed, and **post-quantum
+   expertise must be in scope** — the dual-hybrid scheme is the newest code in
+   the system. Guide: `docs/external_audit_guide.md`.
+2. **Public adversarial testnet** with independent validators and real network
+   conditions — the only setting where wide-area consensus behaviour gets
+   measured.
+3. **Genesis distribution policy**, published as on-chain vesting schedules so
+   it is verifiable rather than promised.
+4. **Production key management** — HSM or remote signer. Real constraint: most
+   cannot produce ML-DSA-65 signatures today, so a hybrid validator's key is a
+   software key.
 
-- **Multi-Node Support**: Distributed blockchain network
-- **Advanced Contracts**: Extended smart contract capabilities
-- **Mobile SDKs**: Native mobile application support
+### 7.2 Known gaps with no current answer
 
-### 7.3 Phase 3: Enterprise Integration (Q3-Q4 2026)
+- **Post-quantum leader election.** The sr25519 VRF is classical; no
+  standardized post-quantum VRF exists. The largest open cryptographic item.
+- **No seed phrase / HD derivation.** Each account key needs its own backup.
+- **Opening the validator set.** Removing the genesis allowlist should follow
+  the adversarial testnet, not precede it.
 
-- **Enterprise Connectors**: Pre-built system integrations
-- **Compliance Tools**: Enhanced audit and reporting features
-- **Cross-Chain Bridges**: Interoperability with other blockchains
+### 7.3 Under consideration, not committed
 
-### 7.4 Future Vision (2027+)
+Threshold or multi-signature accounts; raising throughput bounds against
+public-testnet measurements; credential schema conventions.
 
-- **Decentralized Governance**: Community-driven development
-- **Advanced Privacy**: Zero-knowledge proof integration
-- **IoT Integration**: Blockchain for Internet of Things applications
+### 7.4 Explicitly not pursued
+
+- **A cross-chain bridge.** Hikmalayer will not custody external assets.
+  Bridges are the industry's most-attacked component (Ronin $600M, Wormhole
+  $320M, Nomad $190M). The cost of declining one is stated honestly in
+  `docs/hts_and_listings.md`: a centralized listing requires bespoke
+  integration. Reasoning: `docs/bridge_design.md`.
+- **A general virtual machine.** §2.3 explains the trade.
 
 ---
 
 ## 8. Technical Specifications
 
-### 8.1 System Requirements
+### 8.1 Requirements
 
-- **Server**: Linux/macOS/Windows, 2+ CPU cores, 512MB+ RAM
-- **Development**: Rust 1.70+, Cargo, Tokio runtime
-- **Client**: Any HTTP client with JSON support
-- **Network**: Open HTTP ports, stable internet connection
+- **Node**: Linux/macOS/Windows, 2+ CPU cores, 512 MB+ RAM (2 GB+ for
+  production), open HTTP port
+- **Build**: Rust 1.75+, Cargo. Node.js 20+ for the SDK, dashboard and extension
+- **Client**: any HTTP client with JSON support
 
-### 8.2 Key Dependencies
+### 8.2 Cryptography
 
-- **Axum**: Web framework for REST API
-- **Tokio**: Async runtime for concurrent processing
-- **Serde**: JSON serialization and deserialization
-- **SHA2**: Cryptographic hashing implementation
-- **Chrono**: Date and time handling
+| Purpose | Algorithm | Standard |
+|---|---|---|
+| Hashing, addresses, Merkle roots, PoW | SHA-256 | FIPS 180-4 |
+| Classical signatures | secp256k1 ECDSA, low-S normalized | SEC 1 / SEC 2 |
+| Post-quantum signatures | ML-DSA-65 | **FIPS 204** (NIST category 3) |
+| Leader-election randomness | sr25519 VRF (Ristretto255) | — |
+| Wallet vault | AES-256-GCM | NIST SP 800-38D |
+| Vault key derivation | PBKDF2-HMAC-SHA256, 310,000 iterations | NIST SP 800-132 |
+
+Sizes: secp256k1 65-byte key / 64-byte signature; ML-DSA-65 1,952-byte key /
+3,309-byte signature.
+
+### 8.3 Key dependencies
+
+Axum (HTTP), Tokio (async runtime), Serde (serialization), `secp256k1`,
+`schnorrkel` (VRF), `fips204` (ML-DSA), `sha2`/`sha3`. Clients use `@noble/curves`,
+`@noble/hashes` and `@noble/post-quantum`, chosen so the browser and the node
+produce byte-identical signatures — asserted by test.
+
+### 8.4 Verification
+
+139 Rust unit tests · 40 adversarial tests · 58 SDK offline tests including
+Rust↔JS byte parity · 21 live integration tests · a 16-check end-to-end
+application · `cargo clippy --all-targets -- -D warnings` clean · OpenAPI 3.1
+spec lints clean.
 
 ---
 
 ## 9. Governance and Compliance
 
-### 9.1 Development Model
+### 9.1 Development model
 
-- **Open Source**: Core platform under open source license
-- **Community Input**: Feature decisions based on user feedback
-- **Security Priority**: Immediate implementation of security updates
-- **Backward Compatibility**: Careful API evolution with migration support
+Development is led by Bestower Labs Limited. Protocol changes are published in
+the repository and adopted by operators choosing to run the software — a
+centralized development model, described as one.
 
-### 9.2 Compliance Considerations
+**There is no on-chain governance.** No proposal system, no token-weighted
+voting, no treasury contract. **HKM is not a governance token** and confers no
+voting right; no mechanism exists in the protocol by which it could. With no
+on-chain upgrade mechanism, a consensus change is a hard fork by definition.
 
-- **Data Privacy**: GDPR/CCPA compliance design principles
-- **Educational Privacy**: FERPA compliance for student records
-- **Security Standards**: Implementation follows industry best practices
-- **Audit Support**: Comprehensive logging for compliance verification
+Opening the validator set is the first meaningful decentralization step, and it
+should follow the adversarial testnet.
+
+### 9.2 Data protection
+
+**No personal data goes on chain.** Proof-of-Credential publishes a *hash* of a
+document, never the document. A hash is not the document, and it does not become
+one by being on a blockchain.
+
+On erasure, plainly: a blockchain cannot delete history, and any claim otherwise
+is false. There is nothing on chain to delete — the document lives with the
+issuer or subject under whatever obligations apply there, and **revocation is a
+first-class on-chain operation**, which is the operative remedy. Subject
+identifiers should be pseudonymous.
+
+Addresses are pseudonymous, not anonymous: a chain is a permanent public record
+and analysis can link addresses to identities.
+
+Deployers remain responsible for lawful basis, consent, retention and transfer
+of everything they hold off chain. Nothing here is legal advice.
+
+**Not claimed:** ISO or W3C certification, VC/DID format conformance,
+zero-knowledge proofs, or any third-party attestation.
 
 ---
 
 ## 10. Conclusion
 
-Hikmalayer provides a practical, secure solution for digital credential management through blockchain technology. By combining proof-of-work consensus, smart contract automation, and comprehensive APIs, the platform addresses real-world credentialing challenges while maintaining simplicity and performance.
+Hikmalayer is a Layer 1 built for durability rather than breadth: verifiable
+credentials and native assets, with cryptography chosen to still be standing
+when secp256k1 is not.
 
-The platform's focus on certificate management, combined with integrated token economics and developer-friendly architecture, creates immediate value for educational institutions and organizations while providing a foundation for future blockchain applications.
+**What distinguishes it:**
 
-**Key Benefits:**
+- **Dual-hybrid signatures enforced on every path a key authorizes** — including
+  unbonding and block production, not only transfers
+- **Hybrid consensus where hashrate without stake is worthless**
+- **Capabilities as consensus objects** — no VM, so no contract for a bug to
+  hide in, and no contract to audit before trusting a token
+- **Credentials that publish a hash, not a document**
 
-- **Tamper-proof credentials** through blockchain immutability
-- **Instant verification** eliminating manual processes
-- **Economic incentives** encouraging quality and participation
-- **Easy integration** through comprehensive REST APIs
-- **Scalable architecture** supporting growth and enhancement
+**What it does not claim:** independent review (none yet), quantum-safe leader
+election (the VRF is classical), decentralization today (a launch allowlist may
+gate validators), or exchange listings (no bridge means bespoke integration).
 
-**Target Applications:**
-
-- Academic institutions issuing digital diplomas
-- Professional organizations managing certifications
-- Corporations tracking employee training and compliance
-- Government agencies requiring secure document verification
-
-Hikmalayer represents the next generation of credentialing systems, providing security, efficiency, and trust in an increasingly digital world.
+Every trade-off above has a cost, and the costs were chosen deliberately and
+written down so they can be argued with. The protocol is built and tested; what
+remains before mainnet is external validation rather than missing code. That is
+a good position, and it is not the same as being finished.
 
 ---
 
 ## References
 
-**Technical Resources:**
+**Cryptography:**
 
-- Rust Documentation: https://doc.rust-lang.org/
-- Axum Framework: https://docs.rs/axum/
-- Blockchain Fundamentals: Nakamoto, S. "Bitcoin: A Peer-to-Peer Electronic Cash System"
+- **NIST FIPS 204 (2024): Module-Lattice-Based Digital Signature Standard
+  (ML-DSA)** — the post-quantum scheme implemented here
+- NIST FIPS 180-4: Secure Hash Standard
+- Shor, P.W. (1994). "Algorithms for Quantum Computation: Discrete Logarithms
+  and Factoring" — why secp256k1 is not durable
+- Grover, L.K. (1996). "A Fast Quantum Mechanical Algorithm for Database Search"
+  — why SHA-256 is
+- Bindel, N. et al. (2017). "Transitioning to a Quantum-Resistant Public Key
+  Infrastructure" — hybrid signature combiners
 
-**Standards and Compliance:**
+**Consensus:**
 
-- W3C Verifiable Credentials: https://www.w3.org/TR/vc-data-model/
-- GDPR Compliance: EU 2016/679
-- Educational Privacy: FERPA Guidelines
+- Nakamoto, S. (2008). "Bitcoin: A Peer-to-Peer Electronic Cash System"
+- David, B., Gaži, P., Kiayias, A., Russell, A. (2018). "Ouroboros Praos" —
+  the VRF leader-election and withhold-bias model
+- Micali, S., Rabin, M., Vadhan, S. (1999). "Verifiable Random Functions"
+
+**Implementation:**
+
+- Rust: https://doc.rust-lang.org/ · Axum: https://docs.rs/axum/
+- `fips204` (ML-DSA), `schnorrkel` (sr25519 VRF), `@noble/post-quantum`
+
+**Referenced but not conformed to** (see the full whitepaper §12.3):
+
+- W3C Verifiable Credentials: https://www.w3.org/TR/vc-data-model/ — a VC can be
+  anchored here by hash; the format is not implemented
+- GDPR (EU 2016/679), FERPA — obligations fall on deployers handling documents
+  off chain, not on the protocol, which stores no personal data
 
 ---
 
-_This whitepaper is released under Creative Commons Attribution 4.0 International License. The information provided is for educational and informational purposes only._
+_Released under Creative Commons Attribution 4.0 International (CC BY 4.0).
+Informational only: nothing here is an offer, a solicitation, investment advice
+or legal advice. The full whitepaper is `docs/Whitepaper.md`._

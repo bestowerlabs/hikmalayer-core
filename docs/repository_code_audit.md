@@ -1,77 +1,107 @@
-# Repository Code Audit: Hybrid PoS/PoW and Production Readiness
+# Repository Code Audit
 
-## Question addressed
-"Is this now an industrial-scale hybrid blockchain working on both PoS and PoW?" based on the repository code and files (not README claims).
+An assessment from the **code**, not from claims made about it. Refreshed to
+cover the current tree.
 
-## Verdict (code-based)
-- **Hybrid PoS+PoW logic exists in code:** **YES**
-- **Industrial-scale / production-grade distributed blockchain:** **NOT YET**
+## Questions addressed
 
-## Evidence from implementation
+1. Is this a working hybrid blockchain on both PoS and PoW?
+2. Is it quantum-ready?
+3. Is it production-grade?
 
-### 1) PoS selection + validator signature path is implemented
-- Stake-weighted deterministic validator selection exists via `select_staker_with_seed(seed, stakers)`.
-- Staker set hashing exists (`staker_set_hash`) to bind block data to a staker snapshot.
-- ECDSA signing and signature verification are implemented for block hashes.
-- Slashing logic exists (`slash_staker`) and is used when validation fails.
+## Verdict
 
-Files:
-- `src/consensus/pos.rs`
-- `src/blockchain/chain.rs`
-- `src/api/routes.rs`
+| | |
+|---|---|
+| **Hybrid PoS + PoW implemented in code** | **Yes** |
+| **Quantum-ready hybrid signatures implemented in code** | **Yes** — and enforced on every path where a key authorizes value or consensus |
+| **Production-grade / mainnet-ready** | **Not yet** — one hard gate remains: independent external audit |
 
-### 2) PoW mining/verification path is implemented
-- Mining loops over nonce until hash has `difficulty` leading zeroes.
-- Block verification checks hash recomputation and PoW prefix condition.
+---
 
-Files:
-- `src/consensus/pow.rs`
-- `src/blockchain/block.rs`
-- `src/blockchain/chain.rs`
+## 1. Hybrid consensus — implemented
 
-### 3) Hybrid block admission checks are implemented
-A received/mined block must pass all of:
-- chain tip linkage (`previous_hash`/index)
-- required validator and staker metadata present
-- staker-set hash match
-- deterministic PoS validator match
-- validator signature verification
-- PoW verification
+- Stake-weighted leader selection over the on-chain validator set at the
+  **parent** state (`pos::select_staker_with_seed`), seeded by the VRF beacon.
+- sr25519 VRF proof required per block, verified against the key registered on
+  chain (`consensus::vrf`).
+- Proof-of-Work mined by the selected leader, difficulty deterministic and
+  clamped (`consensus::pow`).
+- Liveness rotation via slot timeouts, with a block required to come from the
+  smallest open round that selects its producer.
+- Fork choice is validator-progress-first with finalized-history protection;
+  adopted chains are re-executed under local genesis parameters.
+- Equivocation slashing, bounded by a slashing window equal to the unbonding
+  period.
 
-Files:
-- `src/blockchain/chain.rs` (`validate_block_candidate`, `is_valid`, `validate_and_slash`)
-- `src/api/routes.rs` (`receive_block`, `receive_blocks`)
+**Where to read it:** `src/blockchain/chain.rs::validate_block_at`,
+`src/consensus/{pos,vrf,pow}.rs`.
 
-### 4) Node/API + persistence + governance primitives exist
-- REST API endpoints for mining, staking, p2p peer registration, governance, metrics.
-- State persistence to disk (`data/state.json`) is implemented.
-- Governance config includes slash percent and finality depth.
+## 2. Dual-hybrid cryptography — implemented
 
-Files:
-- `src/api/routes.rs`
-- `src/persistence.rs`
-- `src/governance.rs`
-- `src/main.rs`
+- ML-DSA-65 (FIPS 204) via `fips204`, with deterministic keygen and signing
+  (`src/consensus/pq.rs`).
+- Hybrid identity where the **address commits to both public keys**
+  (`src/consensus/hybrid.rs`), so neither can be substituted.
+- The **address**, not the transaction, decides which scheme authorizes it
+  (`transaction.rs::verify_sender_signature`) — so a hybrid account cannot be
+  downgraded by omitting the post-quantum half, and a classical transaction
+  carrying post-quantum fields is rejected.
+- Enforced on staking, **unbonding** (against the on-chain key) and **block
+  production**, not only on transfers.
+- Deterministic across implementations: the Rust node and the JavaScript
+  clients produce byte-identical keys and signatures, asserted by test.
 
-## Why this is not yet "industrial-scale" from current code
+**Where to read it:** `src/consensus/{pq,hybrid}.rs`, `sdk/src/hybrid.js`,
+`dashboard/src/lib/hybrid.js`, `sdk/test/hybrid.test.mjs`.
 
-### A) Single-process architecture per node instance
-- The runtime is one Axum process with in-memory mutex state, then persisted to one local JSON file.
-- This is suitable for prototype/testnet workflows, not a hardened distributed storage/consensus stack.
+## 3. State machine and economics — implemented
 
-### B) P2P is HTTP endpoint based, not a full gossip protocol implementation
-- Peers are manually registered and blocks are pushed via REST (`/p2p/block`, `/p2p/blocks`).
-- No separate libp2p-style networking layer, peer scoring, robust transport security, or anti-eclipse mechanisms in code.
+- Replicated state machine with a per-block **state root**, verified by
+  re-execution.
+- Checked arithmetic throughout, `overflow-checks` on in release.
+- HTS token standard with fixed supply at creation; constant-product AMM with
+  `MINIMUM_LIQUIDITY` lock and mandatory slippage bounds; on-chain cliff and
+  linear vesting; Proof-of-Credential registry.
+- Calibrated emission (halving plus perpetual tail) and a dynamic base fee, both
+  consensus-verified per height.
 
-### C) Finality/consensus depth is local policy, not a full Byzantine-finality protocol
-- `finalized_height` is derived from `finality_depth` arithmetic rather than protocol-level validator commit certificates.
+**Where to read it:** `src/blockchain/state.rs`, `src/blockchain/transaction.rs`.
 
-### D) Test coverage is currently unit-level and small
-- Current test suite validates core components but does not demonstrate large-scale network behavior, adversarial scenarios, or sustained distributed consensus under partitions.
+## 4. What is genuinely not there
 
-## Benchmark artifact check in this repository
-- The benchmark files under `bench/results/run_10min/` are present (`json`, `csv`, `md`).
-- JSON values indicate API execution benchmark stats (duration 600s, tx_count 8940, tps ~14.88, reorg_count 0).
+- **No virtual machine.** Deliberate — `ContractExecutor` is a credential
+  registry, not an execution environment. Anyone reading it as a smart-contract
+  engine is misreading it.
+- **No bridge.** No code exists and none is planned.
+- **No per-IP rate limiting.** Deploy behind a proxy.
+- **No post-quantum VRF.** Leader election remains classical.
+- **No multi-signature or threshold accounts.**
+- **No seed phrase / HD derivation.**
 
-## Practical answer
-This repository **does implement a real hybrid PoS+PoW validation flow in code**, so it is not only README text. However, by engineering standards, it is still a **prototype/early-stage execution and orchestration stack**, not yet an industrial-scale production blockchain network.
+## 5. What separates this from production-grade
+
+Not missing protocol code. Specifically:
+
+1. **No independent audit.** The 13 findings in `security_assessment.md` were
+   found by the people who wrote the code. That is the largest open risk in the
+   repository.
+2. **No public adversarial testnet.** All measurement to date is single-host;
+   wide-area consensus behaviour is unmeasured.
+3. **Permissioned launch posture.** A genesis allowlist may gate validator
+   registration.
+4. **Operational gaps.** No bug bounty, security contact process, CI dependency
+   scanning or fuzzing.
+
+## 6. Evidence a reader can run
+
+```bash
+cargo test                             # 139 unit tests
+cargo test --release --test security   # 40 adversarial tests
+cargo clippy --all-targets -- -D warnings
+cd sdk && npm test                     # 58 offline, incl. Rust↔JS byte parity
+```
+
+`tests/security.rs` is the most informative single file for an auditor: each
+test plays an attacker with a specific goal and asserts refusal, and the quantum
+tests assume the attacker already holds the victim's secp256k1 private key.

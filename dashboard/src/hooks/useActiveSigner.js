@@ -18,6 +18,7 @@ export function useActiveSigner() {
       canSign: true,
       source: "extension",
       sign: extension.sign,
+      authorize: extension.authorize,
       publicKey: extension.publicKey,
       account: extension.account,
       extension,
@@ -30,6 +31,7 @@ export function useActiveSigner() {
       canSign: true,
       source: "wallet",
       sign: vault.sign,
+      authorize: vault.authorize,
       publicKey: vault.publicKey,
       account: vault.address,
       extension,
@@ -41,6 +43,9 @@ export function useActiveSigner() {
     canSign: false,
     source: extension.available ? "extension-available" : "none",
     sign: async () => {
+      throw new Error("No signer available");
+    },
+    authorize: async () => {
       throw new Error("No signer available");
     },
     publicKey: null,

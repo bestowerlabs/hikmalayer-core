@@ -24,10 +24,20 @@ import {
   vaultAccounts,
   withProtectedKey,
 } from "../../dashboard/src/lib/wallet.js";
+import {
+  hybridIdentityFromBytes,
+  signHybridFromBytes,
+} from "../../dashboard/src/lib/hybrid.js";
+import { hexToBytes } from "@noble/hashes/utils";
 
 const VAULT_KEY = "hikmalayer.vault.v1"; // storage slot; holds a v1 or v2 vault
 const SITES_KEY = "hikmalayer.sites.v1";
 const NETWORK_KEY = "hikmalayer.network.v1";
+/// Which of each key's two accounts this wallet operates as: the classical
+/// `hkm…` one, or the quantum-ready `hkq…` one that also requires an ML-DSA
+/// signature. A preference, not a secret — but it decides which address a
+/// site sees, so it is stored rather than asked each time.
+const SCHEME_KEY = "hikmalayer.scheme.v1";
 const AUTO_LOCK_MS = 15 * 60 * 1000;
 
 /// Where the popup reads balances from. Signing never needs a node, so this
@@ -41,6 +51,10 @@ let sessionKey = null;
 /// encrypted under a non-extractable session key, decrypted only for the
 /// instant of signing.
 let protectedKeys = [];
+/// The hybrid identity of each account, in account order. Public material,
+/// derived on unlock (~3 ms of ML-DSA keygen per account) and held only in
+/// memory: a key already determines it, so there is nothing to persist.
+let hybridIdentities = [];
 let lastActivity = 0;
 let lockTimer = null;
 
@@ -61,6 +75,7 @@ function touch() {
 function lock() {
   sessionKey = null;
   protectedKeys = [];
+  hybridIdentities = [];
   if (lockTimer) clearTimeout(lockTimer);
   lockTimer = null;
   broadcastToPages({ type: "hikmalayer:locked" });
@@ -93,6 +108,17 @@ async function setSiteConnected(origin, connected) {
   if (connected) sites[origin] = { connectedAt: Date.now() };
   else delete sites[origin];
   await chrome.storage.local.set({ [SITES_KEY]: sites });
+}
+
+async function getScheme() {
+  const stored = await chrome.storage.local.get(SCHEME_KEY);
+  return stored[SCHEME_KEY] === "hybrid" ? "hybrid" : "classical";
+}
+
+async function setScheme(value) {
+  const scheme = value === "hybrid" ? "hybrid" : "classical";
+  await chrome.storage.local.set({ [SCHEME_KEY]: scheme });
+  return scheme;
 }
 
 async function getNodeUrl() {
@@ -128,12 +154,43 @@ function activeAccount(vault) {
   return accounts[activeAccountIndex(vault)] ?? accounts[0];
 }
 
+/// The account a site actually deals with, under the selected scheme.
+///
+/// One private key controls two DIFFERENT accounts with separate balances:
+/// `hkm…` (ECDSA) and `hkq…` (ECDSA + ML-DSA-65). The hybrid one depends on
+/// the ML-DSA key, which only exists while unlocked — so a locked wallet in
+/// hybrid mode reports no address rather than silently falling back to the
+/// classical one and having a site pay the wrong account.
+function activeIdentity(vault, scheme) {
+  const account = activeAccount(vault);
+  if (!account) return null;
+  if (scheme !== "hybrid") return { ...account, scheme: "classical" };
+  const hybrid = hybridIdentities[activeAccountIndex(vault)];
+  if (!hybrid) return null;
+  return {
+    ...account,
+    scheme: "hybrid",
+    address: hybrid.address,
+    publicKey: hybrid.publicKey,
+    pqPublicKey: hybrid.pqPublicKey,
+  };
+}
+
 /// Load private keys into session memory, each individually protected.
 async function openSession(privateKeys) {
   sessionKey = await createSessionKey();
   protectedKeys = [];
+  hybridIdentities = [];
   for (const key of privateKeys) {
     protectedKeys.push(await protectKey(sessionKey, key));
+    // Derived from the raw bytes, then wiped: the hex string is never a
+    // second long-lived copy of the key.
+    const bytes = hexToBytes(normalizeHex(key));
+    try {
+      hybridIdentities.push(hybridIdentityFromBytes(bytes));
+    } finally {
+      bytes.fill(0);
+    }
   }
   touch();
 }
@@ -153,7 +210,7 @@ async function rewriteKeyring(password, mutate) {
   await setVault(updated);
   await openSession(next.keys);
   notifyPopup();
-  broadcastAccountsChanged(activeAccount(updated)?.address ?? null);
+  broadcastAccountsChanged(activeIdentity(updated, await getScheme())?.address ?? null);
   return updated;
 }
 
@@ -228,13 +285,17 @@ async function broadcastAccountsChanged(address) {
 }
 
 // ---- Signing ------------------------------------------------------------
-async function signWithVault(message, accountIndex) {
+async function signWithVault(message, accountIndex, scheme = "classical") {
   if (!isUnlocked()) throw new Error("Wallet is locked");
   const protectedKey = protectedKeys[accountIndex];
   if (!protectedKey) throw new Error("That account is not available");
   touch();
+  // A hybrid account gets both signatures in one pass over the key bytes,
+  // so the key is decrypted once rather than twice.
   return withProtectedKey(sessionKey, protectedKey, (keyBytes) =>
-    signMessageFromBytes(message, keyBytes)
+    scheme === "hybrid"
+      ? signHybridFromBytes(message, keyBytes)
+      : { signature: signMessageFromBytes(message, keyBytes) }
   );
 }
 
@@ -246,11 +307,22 @@ async function handlePageRequest(method, params, origin) {
   const vault = await getVault();
   const sites = await getSites();
   const connected = !!sites[origin];
-  const account = activeAccount(vault);
+  const scheme = await getScheme();
+  const account = activeIdentity(vault, scheme);
 
   switch (method) {
     case "hikma_chainInfo":
-      return { name: "Hikmalayer", ticker: "HKM", decimals: 6, addressPrefix: "hkm" };
+      return {
+        name: "Hikmalayer",
+        ticker: "HKM",
+        decimals: 6,
+        addressPrefix: "hkm",
+        // Both account types exist on one chain; `scheme` tells a dApp which
+        // one it is talking to, so it knows whether to expect post-quantum
+        // fields on the signature it gets back.
+        addressPrefixes: ["hkm", "hkq"],
+        scheme,
+      };
 
     case "hikma_accounts":
       // Never reveals anything to an unconnected site.
@@ -258,7 +330,11 @@ async function handlePageRequest(method, params, origin) {
 
     case "hikma_requestAccounts": {
       if (!account) {
-        throw new Error("No wallet set up. Open the Hikmalayer Wallet extension first.");
+        throw new Error(
+          scheme === "hybrid"
+            ? "Unlock the Hikmalayer Wallet extension to use its quantum-ready account."
+            : "No wallet set up. Open the Hikmalayer Wallet extension first."
+        );
       }
       if (connected) return [account.address];
       await requestApproval({
@@ -300,8 +376,20 @@ async function handlePageRequest(method, params, origin) {
         message,
       });
 
-      const signature = await signWithVault(message, index);
-      return { signature, publicKey: account.publicKey, address: account.address };
+      const signed = await signWithVault(message, index, account.scheme);
+      const result = {
+        signature: signed.signature,
+        publicKey: account.publicKey,
+        address: account.address,
+      };
+      // Present only for a hybrid account, and then always both: a caller
+      // that sees `pqSignature` must send `pqPublicKey` with it, because the
+      // node checks that the pair derives to the sending address.
+      if (account.scheme === "hybrid") {
+        result.pqSignature = signed.pqSignature;
+        result.pqPublicKey = account.pqPublicKey;
+      }
+      return result;
     }
 
     default:
@@ -320,16 +408,38 @@ async function handlePopupRequest(message) {
       const vault = await getVault();
       const accounts = vaultAccounts(vault);
       const active = activeAccountIndex(vault);
+      const scheme = await getScheme();
+      const identity = activeIdentity(vault, scheme);
       return {
         hasWallet: accounts.length > 0,
         unlocked: isUnlocked(),
-        accounts,
+        // Each entry carries its quantum-ready address too, when known, so
+        // the account list can show which address a site would actually see.
+        accounts: accounts.map((entry, index) => ({
+          ...entry,
+          hybridAddress: hybridIdentities[index]?.address ?? null,
+        })),
         activeIndex: active,
-        address: accounts[active]?.address ?? null,
-        publicKey: accounts[active]?.publicKey ?? null,
+        scheme,
+        // The address for the SELECTED scheme. Null in hybrid mode while
+        // locked, because the ML-DSA key it depends on is not in memory.
+        address: identity?.address ?? null,
+        publicKey: identity?.publicKey ?? null,
+        classicalAddress: accounts[active]?.address ?? null,
+        hybridAddress: hybridIdentities[active]?.address ?? null,
         sites: Object.keys(await getSites()),
         nodeUrl: await getNodeUrl(),
       };
+    }
+
+    case "wallet:set-scheme": {
+      const scheme = await setScheme(message.scheme);
+      const vault = await getVault();
+      // Switching scheme changes which account a connected site is talking
+      // to, so it is an account change and must be announced as one.
+      broadcastAccountsChanged(activeIdentity(vault, scheme)?.address ?? null);
+      notifyPopup();
+      return { scheme };
     }
 
     case "wallet:create": {
@@ -360,7 +470,12 @@ async function handlePopupRequest(message) {
         await setVault(await encryptKeyring(keys, message.password));
       }
       notifyPopup();
-      return { address: activeAccount(await getVault())?.address ?? null };
+      // Unlocking makes the hybrid identity available, so the address a
+      // connected site sees can change here too.
+      const unlockedAddress =
+        activeIdentity(await getVault(), await getScheme())?.address ?? null;
+      broadcastAccountsChanged(unlockedAddress);
+      return { address: unlockedAddress };
     }
 
     case "wallet:lock":
@@ -436,9 +551,11 @@ async function handlePopupRequest(message) {
       await setVault(vault);
       notifyPopup();
       // Connected sites learn the address changed, exactly as they would
-      // from a wallet they already understand.
-      broadcastAccountsChanged(accounts[index].address);
-      return { address: accounts[index].address };
+      // from a wallet they already understand. Under the hybrid scheme that
+      // is the `hkq…` address, not the classical one.
+      const selected = activeIdentity(vault, await getScheme())?.address ?? null;
+      broadcastAccountsChanged(selected);
+      return { address: selected };
     }
 
     case "wallet:set-node": {

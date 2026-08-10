@@ -4,7 +4,9 @@
 AMM DEX, and the developer SDK.
 **Method:** code review plus an adversarial test suite (`tests/security.rs`)
 that plays an attacker against the real interfaces, and live verification
-against a running chain.
+against a running chain. The quantum-related findings assume an attacker who
+**already holds the victim's secp256k1 private key** — that is, secp256k1 is
+taken as broken, and the question is what survives.
 **Status:** every finding below is **fixed**, with a regression test that fails
 on the pre-fix code.
 
@@ -27,6 +29,10 @@ what was found, and what changed.
 | 7 | Liquidity provision shipped without slippage bounds | **Medium** | Fixed |
 | 8 | Network check missed the block-validation path | **High** | Fixed |
 | 9 | Mempool projection re-verified every pooled signature | **Medium** | Fixed |
+| 10 | Public keys had several valid spellings — transaction malleability | **Medium** | Fixed |
+| 11 | A hybrid validator's stake and blocks were protected by ECDSA alone | **High** | Fixed |
+| 12 | Post-quantum block and account signatures shared one domain | **Low** | Fixed |
+| 13 | A hybrid genesis validator could be seated with no post-quantum key | **Medium** | Fixed |
 
 Verified as **sound** and left unchanged: sender/key binding, nonce replay
 protection, cross-domain signature separation, the constant-product invariant,
@@ -271,6 +277,127 @@ path (see finding 8), so none of this weakens replay protection.
 
 ---
 
+## 10. Public keys had several valid spellings — **Medium**
+
+**Where:** `pos::derive_address` and `hybrid::derive_hybrid_address`.
+
+secp256k1 accepts a 33-byte **compressed** encoding of the same public key,
+and hex accepts upper case. Both were accepted: they parsed to the same point,
+hashed to the same address, and verified the same signatures.
+
+```text
+uncompressed  04c354…bbb   →  hkm13320761030a4c59d96060708e2377bc4e936dee
+compressed    02c354…3e0   →  hkm13320761030a4c59d96060708e2377bc4e936dee   ← same account
+verify with uncompressed: true
+verify with compressed:   true                                              ← same signature
+```
+
+So one authorized transaction had more than one valid on-wire form. Since the
+transaction id is a field of the transaction, a relay passing a transaction
+along could re-encode `public_key` and produce a **different id that was
+equally valid**. The sender would watch an id that never confirmed while an
+identical transfer landed under another — the malleability class that caused
+years of grief on Bitcoin, and exactly the property the post-quantum fields
+were already written to refuse ("one authorization, one encoding").
+
+Not a theft: the nonce still admits only one of the variants, so funds move
+once and only as authorized. It is an integrity and client-correctness defect,
+and it undermined the transaction id as a stable handle.
+
+**Fix.** `pos::canonical_public_key` accepts only the encoding the chain
+itself produces — uncompressed, 65 bytes, `04`-prefixed, lower-case hex —
+checked by round-tripping rather than pattern-matching, so nothing else can
+slip through. `derive_address` and `derive_hybrid_address` both go through it,
+and ML-DSA keys get the same lower-case rule. The JavaScript clients mirror it
+so they cannot build a request the node will reject.
+
+**Regression tests.** `a_compressed_public_key_is_not_a_second_spelling_of_an_account`,
+`an_upper_case_public_key_is_not_a_second_spelling_of_an_account`,
+`a_hybrid_address_has_one_spelling_of_each_key`.
+
+---
+
+## 11. A hybrid validator's stake and blocks were protected by ECDSA alone — **High**
+
+**Where:** `ChainState::apply` (the `Withdraw` arm) and
+`Blockchain::validate_block_at`.
+
+Found while reviewing the first cut of the hybrid scheme. Account transactions
+correctly required both signatures — but **unbonding** was verified against
+`StakeInfo.public_key` with `pos::verify_message` only, and **block
+production** against the same key with `pos::verify_block_signature` only.
+
+That left the most valuable case unprotected. A quantum adversary holding a
+hybrid validator's secp256k1 key could not touch its balance, but could unbond
+its **entire stake**, and could sign blocks in its name. And a validator's key
+is the longest-lived key on the chain: it sits in `StakeInfo`, in public, for
+as long as the stake does. There is no "spend once and rotate" for it.
+
+**Fix.** `StakeInfo` gained `pq_public_key`, registered at bonding time from a
+key that `verify_hybrid` has already bound to the sender's address — so it is
+the key the address commits to, not merely one the sender claimed. Unbonding
+and block validation both require the post-quantum half whenever that field is
+set, and **reject** it when it is not, so neither can be downgraded or padded.
+`Block` gained `validator_pq_signature`; the miner produces it whenever the
+selected validator's registered key calls for one.
+
+**Regression tests.**
+`a_broken_secp256k1_alone_cannot_unbond_a_hybrid_validators_stake` (which then
+completes the same withdrawal with both halves, so the check is a gate and not
+a blanket refusal), and
+`a_block_from_a_hybrid_validator_without_the_post_quantum_signature_is_rejected`
+(missing, wrong, then correct).
+
+---
+
+## 12. Post-quantum block and account signatures shared one domain — **Low**
+
+**Where:** `consensus::pq`.
+
+The classical scheme separates the two by construction: `sign_block_hash`
+signs the raw 32 bytes of the hash, while `sign_message` prefixes and
+re-hashes. The first post-quantum block signatures reused `pq::sign_message`,
+so one ML-DSA signature was valid as *both* a block signature and an account
+authorization over the same string.
+
+Not exploitable as shipped — no canonical account message is a bare
+64-character hex string, so nothing a validator would sign in one role is
+meaningful in the other. But that is an accident of the current message set,
+not a guarantee, and the next message type added could quietly make it a real
+cross-protocol forgery.
+
+**Fix.** `pq::sign_block_hash` / `pq::verify_block_signature`, domain-prefixed
+with `hikmalayer-pq-block-v1:`. **Regression test.**
+`a_post_quantum_block_signature_is_not_an_account_authorization` — each
+signature valid in its own domain, neither in the other's.
+
+---
+
+## 13. A hybrid genesis validator could be seated with no post-quantum key — **Medium**
+
+**Where:** `Blockchain::new_with_genesis_on_chain`.
+
+Genesis registers the treasury as the bootstrap validator from its secp256k1
+key. Configure a `hkq…` treasury address and you got a quantum-ready account
+whose transactions required two signatures but whose **stake and blocks
+required one** — the gap of finding 11, reopened at the single account that
+starts with the entire supply, and with no transaction anywhere to correct it.
+
+**Fix.** `GENESIS_VALIDATOR_PQ_PUBLIC_KEY`, threaded to genesis and validated:
+the pair must actually derive to the treasury address. If it does not — absent
+key, wrong key — the treasury is **not seated as a validator at all**, and its
+bond is returned so no supply is stranded in the staking pool. The chain then
+produces no blocks until somebody stakes properly, which is a loud failure and
+much better than bootstrapping a validator whose protection is not what its
+address advertises. The same seating runs during replay, so the genesis state
+root is reproduced exactly.
+
+**Regression test.**
+`a_hybrid_genesis_validator_without_its_post_quantum_key_is_not_seated` —
+absent key, wrong key, right key, and a replay state-root comparison.
+
+---
+
 ## What was checked and found sound
 
 **Authorization.** The public key in a transaction must derive to the sender's
@@ -319,21 +446,39 @@ surprised by them.
   trust with their keys and should be reviewed before it ships.
 - **Admin endpoints are token-gated, not signature-gated.** Anyone holding
   `ADMIN_TOKEN` can drive them. Treat it as a production secret.
+- **Quantum: hybrid accounts are opt-in, and the VRF is still classical.**
+  `hkq…` accounts require an ML-DSA-65 signature alongside the ECDSA one, on
+  transactions, staking, unbonding and block production — see
+  [quantum_readiness.md](quantum_readiness.md). Classical `hkm…` accounts keep
+  the old exposure, deliberately, because a 40× signature-size increase is not
+  a defensible default. Leader election's sr25519 VRF remains classical: a
+  quantum adversary could *predict* a validator's slots, not forge blocks or
+  spend, and there is no standardized post-quantum VRF to move to yet.
 
 ---
 
 ## Reproducing
 
-Two of the nine findings (8 and 9) were introduced or exposed by fixing the
-others. That is normal, and it is why the fixes were reviewed as carefully as
-the original code: a fix that looks right from the entry point everyone reads
-can still miss the path that matters.
+Five of the thirteen findings (8, 9, 11, 12 and 13) were introduced or exposed
+by fixing the others. That is normal, and it is why the fixes were reviewed as
+carefully as the original code: a fix that looks right from the entry point
+everyone reads can still miss the path that matters.
+
+Findings 11 and 13 are worth naming for that reason. The hybrid scheme was
+correct on the path everybody looks at — a transfer — and wrong on the two
+paths that hold the most value: unbonding a validator's stake, and producing
+blocks in its name. A quantum adversary could not have taken a hybrid
+account's balance, but could have taken its entire stake. "The signature check
+is right" is not the same claim as "every place a key authorizes something
+checks the right signature", and only the second one is worth anything.
 
 ```bash
-cargo test --test security             # adversarial suite, debug
+cargo test --test security             # adversarial suite (40), debug
 cargo test --release --test security   # and in the profile validators run
-cargo test                             # full suite (117 unit tests)
+cargo test                             # full suite (139 unit tests)
 cargo clippy --all-targets             # clean
+
+cd sdk && npm test                     # 58 offline, incl. Rust↔JS byte parity
 
 ops/devnet.sh &                        # a live chain
 node examples/token-launch/launch.mjs  # end-to-end application

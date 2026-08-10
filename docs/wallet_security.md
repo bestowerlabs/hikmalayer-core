@@ -95,6 +95,25 @@ The dashboard keeps the **offline signing flow** available at all times for
 exactly this reason: with the wallet locked, every DEX panel shows the precise
 `hikma-wallet` command and canonical message, and accepts a pasted signature.
 
+### Classical or quantum-ready
+
+Both the in-page wallet and the extension expose a **Classical /
+Quantum-ready** switch. Quantum-ready selects the key's `hkq…` account, which
+signs with ML-DSA-65 alongside ECDSA and therefore survives a quantum break of
+secp256k1 — see [quantum_readiness.md](quantum_readiness.md).
+
+Two consequences worth stating to users:
+
+* The two accounts have **separate balances**. Switching does not move funds.
+* The hybrid identity is derived on unlock and held **in memory only**. Nothing
+  extra is written to disk, and a locked wallet does not report a `hkq…`
+  address — a site is told there is no account rather than being quietly
+  handed the classical one, which would have it paying the wrong address.
+
+The dashboard's paste-a-signature flow remains classical-only: an ML-DSA
+signature is ~6.6 KB of hex, which is not something to move through a textarea.
+Use the wallet or the extension for hybrid accounts.
+
 ## 4. Deployment requirements
 
 1. **Serve over HTTPS** (or localhost). The wallet refuses to operate in an

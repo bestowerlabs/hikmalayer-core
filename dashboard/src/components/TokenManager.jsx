@@ -14,7 +14,7 @@ import { HKM_DECIMALS, formatUnits, getActiveChainId, parseUnits, scoped } from 
 /// digits on the wire.
 const TokenManager = ({ refreshTrigger, onUpdate }) => {
   const { account } = useWallet();
-  const { canSign, sign, publicKey: signerPublicKey } = useActiveSigner();
+  const { canSign, authorize } = useActiveSigner();
 
   const [to, setTo] = useState("");
   const [amount, setAmount] = useState("");
@@ -99,7 +99,7 @@ const TokenManager = ({ refreshTrigger, onUpdate }) => {
     setMessage(null);
     try {
       const signedBy = canSign
-        ? { public_key: signerPublicKey, signature: await sign(canonicalMessage) }
+        ? await authorize(canonicalMessage)
         : { public_key: publicKey.trim(), signature: signature.trim() };
       const res = await transferTokens({
         from: account,

@@ -33,7 +33,7 @@ const atLeastOne = (value) => (value > 1n ? value : 1n);
 /// the pool ratio (the chain uses whichever side binds).
 const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
   const { account } = useWallet();
-  const { canSign: unlocked, sign, publicKey: signerPublicKey } = useActiveSigner();
+  const { canSign: unlocked, authorize } = useActiveSigner();
   const [pools, setPools] = useState([]);
   const [assets, setAssets] = useState([]);
   const [mode, setMode] = useState("add");
@@ -164,7 +164,7 @@ const DexLiquidity = ({ refreshTrigger, onUpdate }) => {
           ? signingMessages.addLiquidity(addParams)
           : signingMessages.removeLiquidity(removeParams);
       const signedBy = unlocked
-        ? { public_key: signerPublicKey, signature: await sign(canonical) }
+        ? await authorize(canonical)
         : { public_key: publicKey.trim(), signature: signature.trim() };
       const res =
         mode === "add"

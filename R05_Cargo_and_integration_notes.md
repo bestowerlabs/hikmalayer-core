@@ -1,5 +1,10 @@
 # R-05 Integration Notes — HMAC-signed Token Rotation
 
+> **Status: INTEGRATED.** This feature ships in `src/auth/token.rs` and the
+> `mint_token` binary. These notes are the original integration plan, retained
+> for provenance. For current usage see `docs/key_management.md` §4 and
+> `docs/deployment_guide.md`.
+
 ## 1. Cargo.toml additions
 
 Add to `hikmalayer-core`'s `[dependencies]` (pin exact versions to whatever

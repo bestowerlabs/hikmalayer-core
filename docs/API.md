@@ -28,6 +28,16 @@ no `personal_sign`/Ethereum message prefix. All signatures are native compact
 secp256k1 over the Hikmalayer signing domain. Generate identities and signatures
 with `hikma-wallet`.
 
+**Quantum-ready accounts (`hkq…`).** A second address form,
+`hkq` + hex(SHA-256("hikmalayer-hybrid-address-v1" ‖ secp256k1 key ‖ ML-DSA-65
+key)[..20]), also 43 characters. Requests from one carry `pq_public_key` and
+`pq_signature` in addition to `public_key` and `signature`; **both signatures
+must verify**, over the same scoped message. A `hkq…` request that omits the
+post-quantum fields is rejected — not downgraded — and a `hkm…` request that
+carries them is rejected too, so one authorized transaction has exactly one
+valid encoding. Anyone may pay either address form. See
+[quantum_readiness.md](quantum_readiness.md).
+
 **On-chain state machine.** Balances, the validator set, and per-account nonces
 are chain state — a deterministic function of the blocks. A transfer/stake/withdraw
 is *queued* on submission and only takes effect when mined into a block; `GET
@@ -227,7 +237,7 @@ Hikmalayer uses deny-by-default admin and P2P authorization headers:
 
 ## API Endpoints
 
-### 🌐 P2P Protocol (Phase-4)
+### 🌐 P2P Protocol
 
 #### Receive Protocol Envelope
 

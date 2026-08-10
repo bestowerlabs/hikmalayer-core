@@ -1,5 +1,12 @@
 # Local Docker Testnet Deployment Result
 
+> **Historical record.** This is a dated snapshot from the time it was written,
+> retained as provenance. It does **not** describe the current tree — the suite
+> has since grown to 139 unit tests plus 40 adversarial tests, alongside 58 SDK
+> offline tests, 21 live integration tests and a 16-check end-to-end
+> application. For current verification steps see the repository `README.md`
+> and `docs/security_assessment.md`.
+
 Date: 14 July 2026
 Environment: Windows 11 + WSL2 (Ubuntu 26.04) + Docker Desktop (WSL2 backend)
 

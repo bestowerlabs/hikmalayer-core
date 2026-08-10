@@ -64,6 +64,14 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
         .ok()
         .filter(|v| !v.is_empty());
 
+    // Required when the genesis treasury is a quantum-ready (`hkq…`) address:
+    // without it that account's stake and blocks would still be protected by
+    // ECDSA alone, and the chain refuses to seat it as a validator at all
+    // rather than pretend otherwise.
+    let genesis_pq_key = std::env::var("GENESIS_VALIDATOR_PQ_PUBLIC_KEY")
+        .ok()
+        .filter(|v| !v.is_empty());
+
     // The network's name. It is part of every signed transaction, so two
     // networks with different ids cannot replay each other's transactions —
     // give a testnet and a mainnet different values, always.
@@ -89,6 +97,17 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
         );
     }
 
+    // Quantum posture: when set, this network accepts transactions only from
+    // quantum-ready (`hkq…`) accounts, which carry an ML-DSA-65 signature
+    // alongside the ECDSA one. Baked into the genesis state root, so it is a
+    // property of the network and not something a node can differ on.
+    let require_hybrid = std::env::var("GENESIS_REQUIRE_HYBRID")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if require_hybrid {
+        println!("🛡️  This network requires quantum-ready (hkq) accounts at genesis.");
+    }
+
     match (
         std::env::var("GENESIS_TREASURY_ADDRESS").ok().filter(|v| !v.is_empty()),
         std::env::var("GENESIS_VALIDATOR_PUBLIC_KEY").ok().filter(|v| !v.is_empty()),
@@ -101,6 +120,8 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
             vrf_key,
             supply,
             allowlist,
+            require_hybrid,
+            genesis_pq_key,
         ),
         (None, Some(validator_key)) => {
             let treasury = pos::derive_address(&validator_key).unwrap_or_default();
@@ -112,6 +133,8 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
                 vrf_key,
                 supply,
                 allowlist,
+                require_hybrid,
+                genesis_pq_key,
             )
         }
         (None, None) => {

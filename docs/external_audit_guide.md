@@ -22,6 +22,13 @@ findings have been remediated and re-checked.
 - Scope should cover **consensus, cryptography, state machine, P2P, and node
   operations** — not just "the smart contracts" (this chain has none in the
   EVM sense; the risk lives in the protocol).
+- **Post-quantum expertise is required, not optional.** The chain ships a
+  dual-hybrid signature scheme (secp256k1 + ML-DSA-65, FIPS 204). Reviewing it
+  means reviewing lattice-signature usage, the hybrid *binding* construction,
+  and every downgrade path — not just checking that a library was called. Ask
+  candidate firms specifically about this; several do not yet have the
+  capability, and a review that skips it would miss the newest code in the
+  system.
 
 ---
 
@@ -88,11 +95,13 @@ an adversarial test that tries to violate it.
 |---|------|-------|-------|
 | 1 | **State machine** | `src/blockchain/state.rs` | Every mutation is deterministic; `state_root()` is canonical (BTreeMap ordering); no path mints value except `Reward`; fees conserve supply; unbonding math and slash deduction cannot underflow or double-spend |
 | 2 | **Block validation** | `src/blockchain/chain.rs` (`validate_block_at`, `validate_full`, `try_adopt_chain`) | A block is accepted **iff** index/prev-hash link, PoS slot, on-chain signer key, VRF proof, Merkle root, PoW, difficulty schedule, all tx signatures, exactly-one-reward, timestamp skew, and re-executed `state_root` all hold. Fork choice re-executes under **local** genesis params and never rewrites finalized history |
-| 3 | **Consensus crypto** | `src/consensus/pos.rs`, `src/consensus/vrf.rs`, `src/consensus/pow.rs` | secp256k1 sign/verify used correctly; address derivation is collision-resistant; VRF (schnorrkel) proofs are unique per (key, slot) and verified against the registered key; difficulty bounds prevent PoW-disable and unbounded mining |
+| 3 | **Consensus crypto** | `src/consensus/pos.rs`, `src/consensus/vrf.rs`, `src/consensus/pow.rs` | secp256k1 sign/verify used correctly; address derivation is collision-resistant; public keys accepted in exactly ONE canonical encoding (`canonical_public_key`) so a transaction has one on-wire form; VRF (schnorrkel) proofs are unique per (key, slot) and verified against the registered key; difficulty bounds prevent PoW-disable and unbounded mining |
+| 3b | **Post-quantum / dual-hybrid** | `src/consensus/pq.rs`, `src/consensus/hybrid.rs` | **Highest-value review target after the state machine.** ML-DSA-65 used per FIPS 204, with the deterministic seed and context string applied correctly; the hybrid address commits to **both** public keys so neither can be substituted; the **address** decides which scheme authorizes it (never the transaction), so a hybrid account cannot be downgraded by omitting the post-quantum half; a classical transaction carrying post-quantum fields is rejected; block signatures are domain-separated from account signatures in **both** schemes; the registered on-chain ML-DSA key — not one supplied with the transaction — governs unbonding and block validation. Assume the auditor's attacker **already holds the victim's secp256k1 private key** |
 | 4 | **Transactions** | `src/blockchain/transaction.rs` | Signing messages are unambiguous and domain-separated; `verify_for_block` covers every type; the equivocation `SlashProof` is unforgeable (requires the victim's own signatures on two distinct same-height blocks) |
 | 5 | **P2P** | `src/p2p/*`, envelope handling in `src/api/routes.rs` | Envelope identity signatures bind node_id; replay cache bounds memory; gossip cannot be used to flood or to inject invalid state; `require_identity` actually rejects unsigned envelopes |
 | 6 | **API / auth** | `src/api/routes.rs`, `src/auth/*` | Deny-by-default admin/P2P tokens; constant-time comparison; every mutating endpoint validates + re-executes; mempool/body caps enforced; no endpoint accepts a private key |
-| 7 | **Persistence / bootstrap** | `src/persistence.rs`, `src/main.rs` | Only the chain is persisted; state is rebuilt by replay and rejected if it fails; genesis parameters are part of chain identity; dev keys are clearly dev-only |
+| 7 | **Persistence / bootstrap** | `src/persistence.rs`, `src/main.rs`, `Blockchain::new_with_genesis_on_chain` | Only the chain is persisted; state is rebuilt by replay and rejected if it fails; genesis parameters — chain id, supply, allowlist, `require_hybrid_signatures`, the genesis validator's keys — are all part of chain identity and reproduced exactly on replay; a hybrid genesis validator without a matching ML-DSA key is **refused seating** rather than seated with ECDSA-only protection; dev keys are clearly dev-only |
+| 8 | **Client parity** | `sdk/src/hybrid.js`, `dashboard/src/lib/hybrid.js` | The JavaScript implementations produce **byte-identical** keys and signatures to the Rust node — a drift here does not fail loudly, it produces well-formed signatures the chain silently refuses. `sdk/test/hybrid.test.mjs` asserts this against the real CLI; confirm the assertion is meaningful and not tautological |
 
 ---
 

@@ -105,8 +105,44 @@ network prefix. That prefix is visible in the approval screen, so a user can
 see which network a signature is for — which is the point of putting it in
 the message rather than hiding it in the digest.
 
-The crypto is imported from `dashboard/src/lib/wallet.js` — one implementation,
-one place to audit, no drift between the wallet, the dashboard, and the CLI.
+The crypto is imported from `dashboard/src/lib/{wallet,hybrid}.js` — one
+implementation, one place to audit, no drift between the wallet, the dashboard,
+the SDK and the CLI.
+
+## Quantum-ready accounts
+
+The popup has a **Classical / Quantum-ready** switch. Quantum-ready selects the
+key's `hkq…` account, authorized by **two** signatures over the same message:
+
+```
+address     = "hkq" + hex(SHA256("hikmalayer-hybrid-address-v1"
+                                 ‖ secp256k1 pubkey ‖ ML-DSA-65 pubkey)[..20])
+signature   = ECDSA, as above
+pqSignature = ML-DSA-65 (FIPS 204), same message, context string "hikmalayer"
+```
+
+Both are required, so forging one transaction means breaking both schemes.
+`hikma_signMessage` returns `pqSignature` and `pqPublicKey` alongside the
+classical pair when — and only when — the active account is hybrid; a caller
+that sees one must send both, because the node checks that the pair derives to
+the sending address.
+
+Three things worth knowing:
+
+- **The two accounts hold separate balances.** Switching moves no funds; it
+  changes which account sites are talking to, and connected sites are notified
+  as they would be for any account change.
+- **The hybrid identity is derived on unlock and held in memory only** (~3 ms of
+  ML-DSA keygen per account). Nothing extra is written to storage. A locked
+  wallet in quantum-ready mode reports **no** address rather than quietly
+  falling back to the classical one — which would have a site paying the wrong
+  account.
+- **It costs more.** ~5.4 KB per transaction against ~130 bytes, and ~11 ms to
+  sign instead of well under one.
+
+`hikma_chainInfo` reports the active `scheme` and both address prefixes, so a
+dapp can tell whether to expect post-quantum fields. See
+[`docs/quantum_readiness.md`](../docs/quantum_readiness.md).
 
 ## Accounts
 

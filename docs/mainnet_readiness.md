@@ -48,8 +48,10 @@ is a launch blocker until closed.
 | Snapshots & checkpoints | `GET /snapshot` exports the tip state + authenticating commitments (backup/inspection); `GET /checkpoint` returns a pinnable finalized (height, block_hash, state_root) triple for weak-subjectivity anchoring; trust-minimizing genesis replay remains the default |
 | Checkpoint fast-sync / pruning | `GET /checkpoint/bundle` (p2p) serves a self-verifying bundle (retarget-boundary anchor + state + forward blocks); `HIKMALAYER_CHECKPOINT=<bundle.json>` boots a fresh node from the anchor without full genesis replay and reconstructs a byte-identical state root, randomness beacon, and difficulty; anchor pinned to a retarget boundary, state-root-bound, forward blocks re-validated; a persisted local chain always takes precedence |
 | Observability | Metrics include blocks mined/received/rejected, reorgs, gossip, txs, slashes, peers banned, invalid-from-peers; structured startup logging of identity/enforcement |
-| Tooling | `hikma-wallet` offline keygen/signing; propose/sign/submit flow for external validators |
-| Tests | 101 automated tests across consensus, state machine, security, replay, fork choice (sovereign finality), slashing, emission (halving + tail), vesting, min-stake, validator allowlist, native token standard, AMM DEX, checkpoint fast-sync, leader rotation, token auth, and API flows |
+| **Quantum-ready accounts (dual-hybrid signatures)** | Opt-in `hkq…` accounts authorized by **two** signatures over the same message: secp256k1 ECDSA **and** ML-DSA-65 (FIPS 204, NIST category 3). The address commits to **both** public keys, so neither can be substituted. Enforced on transfers, HTS tokens, the AMM, vesting, credentials, **staking**, **unbonding** (against the key registered on chain) and **block production**. The address decides which scheme applies, never the transaction, so a hybrid account cannot be downgraded by omitting the post-quantum half; a classical transaction carrying post-quantum fields is rejected too, so one authorization has exactly one encoding. `GENESIS_REQUIRE_HYBRID=1` makes a whole network quantum-ready-only, committed to by the genesis state root; a hybrid genesis validator without its ML-DSA key is refused seating rather than seated weakly. Keys and signatures are deterministic, so the Rust node and the browser wallet produce **byte-identical** output — asserted by test against the CLI, and verified in a real browser. Cost stated honestly: ~5.4 KB per transaction vs ~130 bytes, ~11 ms to sign vs <1 ms |
+| Encoding canonicality | One authorized transaction has exactly one valid on-wire form: public keys are accepted only in the canonical uncompressed lower-case encoding (ML-DSA keys, lower-case hex), closing the transaction malleability that let a relay re-encode a transaction in flight and produce a different, equally valid id |
+| Tooling | `hikma-wallet` offline keygen/signing (classical and hybrid, incl. hybrid block signing); `@hikmalayer/sdk` with `LocalSigner` / `HybridSigner` / `ExtensionSigner`; OpenAPI 3.1 spec; one-command devnet |
+| Tests | **139** unit tests + **40** adversarial tests (`tests/security.rs`), in debug and release; **58** SDK offline tests including Rust↔JS byte-parity against the real signer; **21** live integration tests against a running chain; a 16-check end-to-end demo application; and an in-browser verification that wallet signatures match the node's byte for byte |
 
 ## 🚧 Remaining before mainnet
 
@@ -74,6 +76,21 @@ external process**, not missing protocol code:
    variable is fine for testnets; production validators should use an HSM,
    OS keyring, or remote signer (see `docs/key_management.md`). This is an
    operator deployment choice; the node already never handles foreign keys.
+
+   Note for hybrid validators: the ML-DSA key is **derived** from the same
+   32-byte secret, so there is still exactly one thing to protect — but a
+   remote signer or HSM must be able to produce ML-DSA-65 signatures, and most
+   cannot today. Until that changes, a hybrid validator's key is a software
+   key. This is a real constraint, not a footnote.
+
+6. **Post-quantum coverage of leader election.** The sr25519 VRF remains
+   classical. A quantum adversary that recovered a validator's VRF key could
+   **predict** its future slots — not forge blocks or spend, since block
+   signatures are separately hybrid, but enough to target a denial-of-service.
+   There is no standardized post-quantum VRF today; the options are a
+   hash-based construction with weaker unpredictability guarantees, or waiting
+   for standardization. Hikmalayer waits, and documents it rather than
+   claiming coverage it does not have.
 
 4. **State pruning for very long chains.** ✅ *Implemented.* Checkpoint
    fast-sync now exists: `GET /checkpoint/bundle` serves a self-verifying,

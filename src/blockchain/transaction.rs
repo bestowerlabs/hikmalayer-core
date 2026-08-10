@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::blockchain::block::Block;
-use crate::consensus::pos;
+use crate::consensus::{hybrid, pos};
 
 /// HKM is denominated with 6 decimal places: all on-chain amounts are in
 /// base units, and 1 HKM = 1,000,000 base units. Chosen so the ~100B HKM
@@ -241,6 +241,18 @@ pub struct Transaction {
     /// AMM action (AddLiquidity / RemoveLiquidity / Swap only).
     #[serde(default)]
     pub amm: Option<AmmAction>,
+    /// ML-DSA-65 public key (hex), for hybrid accounts only.
+    ///
+    /// A hybrid account's address commits to BOTH this and `public_key`, so
+    /// neither can be swapped: substituting either produces a different
+    /// address, which is a different account.
+    #[serde(default)]
+    pub pq_public_key: Option<String>,
+    /// ML-DSA-65 signature (hex) over the same message as `signature`.
+    ///
+    /// Both must verify, so forging requires breaking both schemes.
+    #[serde(default)]
+    pub pq_signature: Option<String>,
     /// Which network this transaction is for.
     ///
     /// Without it, a signature is valid on every Hikmalayer network at once:
@@ -288,6 +300,8 @@ impl Transaction {
             vesting_duration_blocks: None,
             token: None,
             amm: None,
+            pq_public_key: None,
+            pq_signature: None,
             chain_id: String::new(),
         }
     }
@@ -764,14 +778,47 @@ impl Transaction {
             .as_ref()
             .ok_or_else(|| "Transaction missing signature".to_string())?;
 
-        let derived = pos::derive_address(public_key)?;
-        if derived != *from {
-            return Err("Sender address does not match the signing key".to_string());
+        // The ADDRESS decides which scheme authorizes it. Reading the scheme
+        // off the transaction instead would let an attacker downgrade a
+        // hybrid account by simply omitting the post-quantum half.
+        match hybrid::scheme_of(from) {
+            Some(hybrid::AccountScheme::Hybrid) => {
+                let pq_public_key = self.pq_public_key.as_ref().ok_or_else(|| {
+                    "Hybrid account requires a post-quantum public key".to_string()
+                })?;
+                let pq_signature = self.pq_signature.as_ref().ok_or_else(|| {
+                    "Hybrid account requires a post-quantum signature".to_string()
+                })?;
+                hybrid::verify_hybrid(
+                    from,
+                    message,
+                    public_key,
+                    pq_public_key,
+                    signature,
+                    pq_signature,
+                )
+            }
+            Some(hybrid::AccountScheme::Classical) => {
+                // A classical transaction carrying post-quantum material is
+                // refused rather than ignored: the extra fields are outside
+                // what the signature covers, so accepting them would give one
+                // authorized transaction more than one valid encoding.
+                if self.pq_public_key.is_some() || self.pq_signature.is_some() {
+                    return Err(
+                        "Classical account must not carry post-quantum fields".to_string()
+                    );
+                }
+                let derived = pos::derive_address(public_key)?;
+                if derived != *from {
+                    return Err("Sender address does not match the signing key".to_string());
+                }
+                if !pos::verify_message(message, public_key, signature) {
+                    return Err("Transaction signature verification failed".to_string());
+                }
+                Ok(())
+            }
+            None => Err(format!("Sender '{}' is not a valid Hikmalayer address", from)),
         }
-        if !pos::verify_message(message, public_key, signature) {
-            return Err("Transaction signature verification failed".to_string());
-        }
-        Ok(())
     }
 }
 

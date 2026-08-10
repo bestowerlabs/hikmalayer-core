@@ -22,6 +22,9 @@ const WalletPanel = ({ refreshTrigger }) => {
     hasWallet,
     unlocked,
     address,
+    scheme,
+    setScheme,
+    hybridAddress,
     error,
     createWallet,
     importWallet,
@@ -200,6 +203,42 @@ const WalletPanel = ({ refreshTrigger }) => {
               </button>
             </div>
             <code className="block break-all text-[11px] text-emerald-200">{address}</code>
+
+            {/* One key, two accounts. Classical is ECDSA only; hybrid also
+                requires an ML-DSA-65 signature, so it survives a quantum
+                break of secp256k1. They hold SEPARATE balances — this is a
+                choice of account, not a display option. */}
+            {unlocked && (
+              <div className="mt-3">
+                <div className="flex items-center gap-1 rounded-md bg-black/30 p-0.5">
+                  {[
+                    ["classical", "Classical", "ECDSA only"],
+                    ["hybrid", "Quantum-ready", "ECDSA + ML-DSA-65"],
+                  ].map(([value, label, hint]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      title={hint}
+                      disabled={value === "hybrid" && !hybridAddress}
+                      onClick={() => setScheme(value)}
+                      className={`flex-1 text-[11px] px-2 py-1 rounded transition ${
+                        scheme === value
+                          ? "bg-emerald-500/25 text-emerald-100"
+                          : "text-gray-400 hover:text-gray-200"
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[10px] text-gray-500 mt-1 leading-snug">
+                  {scheme === "hybrid"
+                    ? "Every transaction carries a second, post-quantum signature (~5 KB). Forging one means breaking both schemes."
+                    : "Separate account from the quantum-ready one — each holds its own balance."}
+                </p>
+              </div>
+            )}
+
             <div className="text-xs text-gray-300 mt-2">
               Balance:{" "}
               <span className="text-white">

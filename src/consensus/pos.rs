@@ -72,11 +72,41 @@ pub fn select_staker(stakers: &[Staker]) -> Option<String> {
 
 /// Derive the canonical native account address from a secp256k1 public key:
 /// `hkm` + hex of the first 20 bytes of SHA-256 over the uncompressed key.
+/// Parse a public key, insisting on its ONE canonical spelling.
+///
+/// secp256k1 accepts a 33-byte compressed encoding of the same key, and hex
+/// accepts upper case — so without this check a single key has several
+/// spellings that all verify the same signatures and hash to the same
+/// address. That would give one authorized transaction more than one valid
+/// on-wire form, and therefore more than one transaction id: anyone relaying
+/// it could re-encode the key and have a *different* id confirm, leaving the
+/// sender watching an id that never lands. It is the same malleability class
+/// that caused years of grief on Bitcoin, and the same rule the post-quantum
+/// fields follow — one authorization, one encoding.
+///
+/// Canonical is: uncompressed, 65 bytes, `04`-prefixed, lower-case hex.
+pub fn canonical_public_key(public_key_hex: &str) -> Result<PublicKey, String> {
+    let bytes = hex::decode(public_key_hex).map_err(|err| err.to_string())?;
+    let public_key = PublicKey::from_slice(&bytes).map_err(|err| err.to_string())?;
+    // Round-trip rather than a pattern match: this is exactly the encoding
+    // the chain produces, so anything else is rejected by construction.
+    if hex::encode(public_key.serialize_uncompressed()) != public_key_hex {
+        return Err(
+            "public key must be the canonical uncompressed form (04 + 128 lower-case hex              characters)"
+                .to_string(),
+        );
+    }
+    Ok(public_key)
+}
+
+/// Is this the canonical encoding of a valid public key?
+pub fn is_canonical_public_key(public_key_hex: &str) -> bool {
+    canonical_public_key(public_key_hex).is_ok()
+}
+
 pub fn derive_address(public_key_hex: &str) -> Result<String, String> {
-    let public_key_bytes = hex::decode(public_key_hex).map_err(|err| err.to_string())?;
-    let public_key = PublicKey::from_slice(&public_key_bytes).map_err(|err| err.to_string())?;
-    let uncompressed = public_key.serialize_uncompressed();
-    let hash = Sha256::digest(uncompressed);
+    let public_key = canonical_public_key(public_key_hex)?;
+    let hash = Sha256::digest(public_key.serialize_uncompressed());
     Ok(format!("{}{}", ADDRESS_PREFIX, hex::encode(&hash[..20])))
 }
 

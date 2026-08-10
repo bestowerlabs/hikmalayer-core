@@ -1,7 +1,7 @@
 use super::block::Block;
-use super::state::{ChainState, DEFAULT_CHAIN_ID};
+use super::state::{ChainState, DEFAULT_CHAIN_ID, STAKING_POOL_ACCOUNT};
 use super::transaction::{Transaction, TransactionType};
-use crate::consensus::{pos, pow, vrf};
+use crate::consensus::{pos, pow, pq, vrf};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +98,18 @@ pub struct Blockchain {
     /// This network's identifier, fixed at genesis (see ChainState::chain_id).
     #[serde(default = "default_chain_id")]
     pub genesis_chain_id: String,
+    /// Whether this network requires every sender to be a quantum-ready
+    /// (`hkq…`) account. Fixed at genesis and committed to by the genesis
+    /// state root, so it is a property of the network rather than a local
+    /// setting an operator could quietly differ on.
+    #[serde(default)]
+    pub genesis_require_hybrid_signatures: bool,
+    /// ML-DSA-65 public key of the genesis validator, when its treasury
+    /// address is a hybrid (`hkq…`) one. Required in that case: without it
+    /// the genesis validator would be a hybrid account whose *stake* and
+    /// *blocks* were protected by ECDSA alone.
+    #[serde(default)]
+    pub genesis_validator_pq_public_key: Option<String>,
     /// Current chain state: derived from the blocks, never persisted.
     /// Rebuilt via `rebuild_state` after deserialization.
     #[serde(skip)]
@@ -215,6 +227,8 @@ impl Blockchain {
             default_genesis_validator_vrf_public_key(),
             default_genesis_supply(),
             allowlist,
+            false,
+            None,
         )
     }
 
@@ -234,6 +248,8 @@ impl Blockchain {
             genesis_validator_vrf_public_key,
             genesis_supply,
             genesis_validator_allowlist,
+            false,
+            None,
         )
     }
 
@@ -247,15 +263,25 @@ impl Blockchain {
         genesis_validator_vrf_public_key: Option<String>,
         genesis_supply: u64,
         genesis_validator_allowlist: Vec<String>,
+        genesis_require_hybrid_signatures: bool,
+        genesis_validator_pq_public_key: Option<String>,
     ) -> Self {
         let difficulty = pow::clamp_difficulty(difficulty);
-        let state = ChainState::genesis_for_chain(
+        let mut state = ChainState::genesis_for_chain(
             &genesis_chain_id,
             &genesis_treasury,
             genesis_validator_public_key.as_deref(),
             genesis_validator_vrf_public_key.as_deref(),
             genesis_supply,
             &genesis_validator_allowlist,
+        );
+        // Set before the genesis state root is computed: the policy is part
+        // of what the network's genesis commits to.
+        state.require_hybrid_signatures = genesis_require_hybrid_signatures;
+        Self::seat_genesis_validator_pq_key(
+            &mut state,
+            &genesis_treasury,
+            genesis_validator_pq_public_key.as_deref(),
         );
         let genesis_block = Block::genesis(difficulty, state.state_root());
         // The beacon starts at the (deterministic) genesis hash.
@@ -270,6 +296,8 @@ impl Blockchain {
             genesis_supply,
             genesis_validator_allowlist,
             genesis_chain_id,
+            genesis_require_hybrid_signatures,
+            genesis_validator_pq_public_key,
             state,
             randomness,
             current_difficulty: difficulty,
@@ -329,6 +357,15 @@ impl Blockchain {
         blocks.extend(forward_blocks);
         let mut chain = Blockchain {
             genesis_chain_id: checkpoint.state.chain_id.clone(),
+            // Carried by the checkpoint's own state: it is a genesis
+            // property, so the bundle already records it.
+            genesis_require_hybrid_signatures: checkpoint.state.require_hybrid_signatures,
+            genesis_validator_pq_public_key: checkpoint
+                .state
+                .stakers
+                .get(&genesis_treasury)
+                .map(|info| info.pq_public_key.clone())
+                .filter(|key| !key.is_empty()),
             blocks,
             difficulty: pow::clamp_difficulty(difficulty),
             finalized_height: anchor.index,
@@ -348,14 +385,68 @@ impl Blockchain {
     }
 
     fn genesis_state(&self) -> ChainState {
-        ChainState::genesis_for_chain(
+        let mut state = ChainState::genesis_for_chain(
             &self.genesis_chain_id,
             &self.genesis_treasury,
             self.genesis_validator_public_key.as_deref(),
             self.genesis_validator_vrf_public_key.as_deref(),
             self.genesis_supply,
             &self.genesis_validator_allowlist,
-        )
+        );
+        // Replay must reproduce genesis exactly, policy included, or every
+        // state root after it differs.
+        state.require_hybrid_signatures = self.genesis_require_hybrid_signatures;
+        Self::seat_genesis_validator_pq_key(
+            &mut state,
+            &self.genesis_treasury,
+            self.genesis_validator_pq_public_key.as_deref(),
+        );
+        state
+    }
+
+    /// Complete (or refuse) a hybrid genesis validator.
+    ///
+    /// A `hkq…` genesis treasury registered with only its secp256k1 key would
+    /// be a quantum-ready account whose *stake* and *blocks* were still
+    /// protected by ECDSA alone — the exact gap hybrid exists to close, left
+    /// open at the one account that starts with the entire supply.
+    ///
+    /// So either the ML-DSA key is supplied and genuinely belongs to that
+    /// address, or the treasury is **not seated as a validator at all**. The
+    /// second outcome is loud: the chain produces no blocks until somebody
+    /// stakes properly. That is much better than bootstrapping a validator
+    /// whose protection is not what its address advertises.
+    fn seat_genesis_validator_pq_key(
+        state: &mut ChainState,
+        treasury: &str,
+        pq_public_key: Option<&str>,
+    ) {
+        if !crate::consensus::hybrid::is_hybrid_address(treasury) {
+            return;
+        }
+        let Some(info) = state.stakers.get(treasury).cloned() else {
+            return;
+        };
+        let seated = pq_public_key.is_some_and(|pq| {
+            crate::consensus::hybrid::derive_hybrid_address(&info.public_key, pq)
+                .is_ok_and(|derived| derived == treasury)
+        });
+        if seated {
+            if let Some(entry) = state.stakers.get_mut(treasury) {
+                entry.pq_public_key = pq_public_key.unwrap_or_default().to_string();
+            }
+        } else {
+            // Unseat: return the bonded stake to the treasury so no supply is
+            // stranded in the staking pool.
+            state.stakers.remove(treasury);
+            let released = info.stake;
+            if released > 0 {
+                if let Some(pool) = state.balances.get_mut(STAKING_POOL_ACCOUNT) {
+                    *pool = pool.saturating_sub(released);
+                }
+                *state.balances.entry(treasury.to_string()).or_insert(0) += released;
+            }
+        }
     }
 
     pub fn latest_hash(&self) -> String {
@@ -544,6 +635,34 @@ impl Blockchain {
         let signature = block.validator_signature.as_ref().unwrap();
         if !pos::verify_block_signature(&block.hash, public_key, signature) {
             return Err(BlockError::slashable("Block signature verification failed"));
+        }
+
+        // A hybrid validator signs blocks under both schemes. Which is
+        // required is decided by the key registered ON CHAIN, never by what
+        // the block carries — otherwise a forger could downgrade a hybrid
+        // validator by simply omitting the post-quantum half.
+        let registered_pq_key = parent_state
+            .stakers
+            .get(validator)
+            .map(|info| info.pq_public_key.as_str())
+            .unwrap_or_default();
+        if registered_pq_key.is_empty() {
+            if block.validator_pq_signature.is_some() {
+                return Err(BlockError::slashable(
+                    "Classical validator must not carry a post-quantum block signature",
+                ));
+            }
+        } else {
+            let Some(pq_signature) = block.validator_pq_signature.as_ref() else {
+                return Err(BlockError::slashable(
+                    "Hybrid validator must sign the block with its post-quantum key",
+                ));
+            };
+            if !pq::verify_block_signature(&block.hash, registered_pq_key, pq_signature) {
+                return Err(BlockError::slashable(
+                    "Block post-quantum signature verification failed",
+                ));
+            }
         }
 
         // VRF: the block must carry the unique, verifiable randomness
@@ -901,6 +1020,8 @@ impl Blockchain {
         // blocks under our network configuration and checkpoint root.
         let mut replay = Blockchain {
             genesis_chain_id: self.genesis_chain_id.clone(),
+            genesis_require_hybrid_signatures: self.genesis_require_hybrid_signatures,
+            genesis_validator_pq_public_key: self.genesis_validator_pq_public_key.clone(),
             blocks: candidate.blocks.clone(),
             difficulty: self.difficulty,
             finalized_height: self.base_height,
@@ -1053,9 +1174,28 @@ mod tests {
         let mut ring = vec![(t_addr, t_key)];
         for seed in 2..=9u8 {
             let (addr, _, key) = wallet(seed);
-            ring.push((addr, key));
+            // The same secret also controls a hybrid account, at a different
+            // address; a hybrid validator is selected under that one.
+            let identity = crate::consensus::hybrid::derive_identity(&key).unwrap();
+            ring.push((addr, key.clone()));
+            ring.push((identity.address, key));
         }
         ring
+    }
+
+    /// A hybrid validator's identity from a seed: address, both public keys,
+    /// the VRF key and the private key.
+    fn hybrid_wallet(seed: u8) -> (String, String, String, String, String) {
+        let private_key = hex::encode([seed; 32]);
+        let identity = crate::consensus::hybrid::derive_identity(&private_key).unwrap();
+        let vrf_public_key = vrf::derive_vrf_public_key(&private_key).unwrap();
+        (
+            identity.address,
+            identity.public_key,
+            identity.pq_public_key,
+            vrf_public_key,
+            private_key,
+        )
     }
 
     /// Build, sign, validate, and commit the next block carrying `extra`
@@ -1095,6 +1235,11 @@ mod tests {
         block.vrf_output = Some(vrf_output);
         block.vrf_proof = Some(vrf_proof);
         block.validator_signature = Some(pos::sign_block_hash(&block.hash, &private_key).unwrap());
+        // A hybrid validator signs blocks under both schemes; the registered
+        // key decides, exactly as validation does.
+        if !chain.state.stakers[&validator].pq_public_key.is_empty() {
+            block.validator_pq_signature = Some(pq::sign_block_hash(&block.hash, &private_key)?);
+        }
 
         let post_state = chain.validate_block_candidate(&block)?;
         chain.commit_block(block, post_state);
@@ -1201,6 +1346,191 @@ stake.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
             mine_valid_block(&mut chain);
         }
         assert!(chain.is_valid());
+    }
+
+    /// Stake a hybrid (`hkq…`) validator, funded from the treasury, and then
+    /// unbond the treasury so the hybrid account is the ONLY validator —
+    /// which makes leader selection deterministic for the tests below.
+    fn chain_with_only_a_hybrid_validator() -> (Blockchain, String, String) {
+        let mut chain = Blockchain::default();
+        let (t_addr, t_pub, t_key) = treasury();
+        let (v_addr, v_pub, v_pq_pub, v_vrf, v_key) = hybrid_wallet(4);
+        let chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID;
+
+        let stake_amount = crate::blockchain::state::MIN_VALIDATOR_STAKE * 4;
+        let fund = signed_transfer((&t_addr, &t_pub, &t_key), &v_addr, stake_amount * 2, 1);
+        mine_block_with(&mut chain, vec![fund]).unwrap();
+
+        let mut stake = test_tx(
+            Some(v_addr.clone()),
+            STAKING_POOL_ACCOUNT.to_string(),
+            stake_amount,
+            TransactionType::Stake,
+        );
+        stake.nonce = 1;
+        stake.public_key = Some(v_pub);
+        stake.vrf_public_key = Some(v_vrf.clone());
+        stake.chain_id = chain_id.to_string();
+        let message = Transaction::scoped_signing_message(
+            chain_id,
+            &Transaction::stake_signing_message(&v_addr, stake_amount, 1, &v_vrf),
+        );
+        let signed = crate::consensus::hybrid::sign_message(&message, &v_key).unwrap();
+        stake.signature = Some(signed.signature);
+        stake.pq_public_key = Some(v_pq_pub);
+        stake.pq_signature = Some(signed.pq_signature);
+        mine_block_with(&mut chain, vec![stake]).unwrap();
+
+        // Treasury exits, leaving the hybrid validator alone.
+        let treasury_stake = chain.state.stakers[&t_addr].stake;
+        let mut exit = test_tx(
+            Some(t_addr.clone()),
+            t_addr.clone(),
+            treasury_stake,
+            TransactionType::Withdraw,
+        );
+        exit.nonce = 2;
+        exit.chain_id = chain_id.to_string();
+        exit.public_key = Some(t_pub.clone());
+        exit.signature = Some(
+            pos::sign_message(
+                &Transaction::scoped_signing_message(
+                    chain_id,
+                    &Transaction::withdraw_signing_message(&t_addr, treasury_stake, 2),
+                ),
+                &t_key,
+            )
+            .unwrap(),
+        );
+        mine_block_with(&mut chain, vec![exit]).unwrap();
+        assert_eq!(
+            chain.state.validator_set().len(),
+            1,
+            "the hybrid validator should be the only one left"
+        );
+
+        (chain, v_addr, v_key)
+    }
+
+    /// A `hkq…` genesis treasury registered with only its secp256k1 key would
+    /// be a quantum-ready account whose stake and blocks were protected by
+    /// ECDSA alone — the gap hybrid exists to close, left open at the one
+    /// account that starts with the entire supply. The chain refuses to seat
+    /// it rather than pretend the protection is what the address advertises.
+    #[test]
+    fn a_hybrid_genesis_validator_without_its_post_quantum_key_is_not_seated() {
+        let (v_addr, v_pub, v_pq_pub, v_vrf, _) = hybrid_wallet(4);
+        let supply = 1_000_000 * crate::blockchain::transaction::UNITS_PER_HKM;
+
+        let refused = Blockchain::new_with_genesis_on_chain(
+            DEFAULT_CHAIN_ID.to_string(),
+            2,
+            v_addr.clone(),
+            Some(v_pub.clone()),
+            Some(v_vrf.clone()),
+            supply,
+            Vec::new(),
+            false,
+            None,
+        );
+        assert!(
+            !refused.state.stakers.contains_key(&v_addr),
+            "a hybrid genesis validator was seated without its post-quantum key"
+        );
+        // And nothing is stranded: the bond it would have held is back with
+        // the treasury, so total supply is untouched.
+        assert_eq!(refused.state.balance_of(&v_addr), supply);
+        assert_eq!(refused.state.balance_of(STAKING_POOL_ACCOUNT), 0);
+        assert!(refused.is_valid());
+
+        // A wrong key is refused too — presence is not the check.
+        let (_, _, other_pq, _, _) = hybrid_wallet(5);
+        let wrong = Blockchain::new_with_genesis_on_chain(
+            DEFAULT_CHAIN_ID.to_string(),
+            2,
+            v_addr.clone(),
+            Some(v_pub.clone()),
+            Some(v_vrf.clone()),
+            supply,
+            Vec::new(),
+            false,
+            Some(other_pq),
+        );
+        assert!(!wrong.state.stakers.contains_key(&v_addr));
+
+        // With the right one it is seated, and the key is on chain.
+        let seated = Blockchain::new_with_genesis_on_chain(
+            DEFAULT_CHAIN_ID.to_string(),
+            2,
+            v_addr.clone(),
+            Some(v_pub),
+            Some(v_vrf),
+            supply,
+            Vec::new(),
+            false,
+            Some(v_pq_pub.clone()),
+        );
+        assert_eq!(seated.state.stakers[&v_addr].pq_public_key, v_pq_pub);
+        assert!(seated.is_valid());
+
+        // Replay must reach the same genesis, or every state root diverges.
+        let mut replayed = seated.clone();
+        replayed.rebuild_state().unwrap();
+        assert_eq!(replayed.state.state_root(), seated.state.state_root());
+    }
+
+    #[test]
+    fn a_hybrid_validator_produces_blocks_signed_under_both_schemes() {
+        let (mut chain, v_addr, _) = chain_with_only_a_hybrid_validator();
+        assert!(!chain.state.stakers[&v_addr].pq_public_key.is_empty());
+
+        for _ in 0..3 {
+            mine_valid_block(&mut chain);
+        }
+        let tip = chain.blocks.last().unwrap();
+        assert_eq!(tip.validator.as_deref(), Some(v_addr.as_str()));
+        assert!(
+            tip.validator_pq_signature.is_some(),
+            "a hybrid validator produced a block with no post-quantum signature"
+        );
+        assert!(chain.is_valid());
+    }
+
+    /// The attack: a quantum adversary holds the validator's secp256k1 key,
+    /// so it can sign blocks classically. Dropping the post-quantum half must
+    /// not be a way to have those blocks accepted.
+    #[test]
+    fn a_block_from_a_hybrid_validator_without_the_post_quantum_signature_is_rejected() {
+        let (chain, v_addr, v_key) = chain_with_only_a_hybrid_validator();
+        let input = chain.next_slot_input();
+        let parent_ts = chain.blocks.last().unwrap().timestamp;
+        let mut block = build_block_at(
+            &chain,
+            &v_addr,
+            &v_key,
+            &input,
+            parent_ts + Duration::seconds(1),
+        );
+        // `build_block_at` signs classically only — exactly the forgery.
+        assert!(block.validator_pq_signature.is_none());
+        let error = chain
+            .validate_block_candidate(&block)
+            .expect_err("a hybrid validator's block was accepted without ML-DSA");
+        assert!(error.contains("post-quantum"), "{}", error);
+
+        // A wrong post-quantum signature must fail too, not just a missing
+        // one — otherwise "present" would be the whole check.
+        block.validator_pq_signature = Some(
+            pq::sign_block_hash("some other block hash", &v_key).unwrap(),
+        );
+        assert!(chain.validate_block_candidate(&block).is_err());
+
+        // And with the real one it is accepted.
+        block.validator_pq_signature =
+            Some(pq::sign_block_hash(&block.hash, &v_key).unwrap());
+        chain
+            .validate_block_candidate(&block)
+            .expect("a correctly dual-signed block should be accepted");
     }
 
     /// Build a reward-only block for `validator` at the next height with an

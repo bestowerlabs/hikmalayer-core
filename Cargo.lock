@@ -369,6 +369,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
+name = "fips204"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9fb5a367b9846933e271a3c2a992930743f82ae5e8cb7faa780715a80fa0b15"
+dependencies = [
+ "rand_core 0.6.4",
+ "sha2",
+ "sha3",
+ "zeroize",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -527,10 +539,12 @@ dependencies = [
  "axum",
  "base64 0.21.7",
  "chrono",
+ "fips204",
  "hex",
  "hmac",
  "jsonwebtoken",
  "rand 0.9.2",
+ "rand_core 0.6.4",
  "reqwest",
  "schnorrkel",
  "secp256k1",

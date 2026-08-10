@@ -96,6 +96,29 @@ export const ExtensionProvider = ({ children }) => {
     [provider]
   );
 
+  /// Authorize a canonical message: the request fields the node expects.
+  ///
+  /// A hybrid (`hkq…`) account in the extension returns a post-quantum
+  /// signature alongside the classical one, and both go on the wire. The node
+  /// requires both for a hybrid sender and rejects either alone.
+  const authorize = useCallback(
+    async (message) => {
+      if (!provider) throw new Error("Extension not available");
+      const result = await provider.signMessage(message);
+      if (result?.publicKey) setPublicKey(result.publicKey);
+      if (!result?.pqSignature) {
+        return { public_key: result.publicKey, signature: result.signature };
+      }
+      return {
+        public_key: result.publicKey,
+        signature: result.signature,
+        pq_public_key: result.pqPublicKey,
+        pq_signature: result.pqSignature,
+      };
+    },
+    [provider]
+  );
+
   const value = useMemo(
     () => ({
       available: !!provider,
@@ -105,8 +128,9 @@ export const ExtensionProvider = ({ children }) => {
       error,
       connect,
       sign,
+      authorize,
     }),
-    [provider, account, publicKey, error, connect, sign]
+    [provider, account, publicKey, error, connect, sign, authorize]
   );
 
   return <ExtensionContext.Provider value={value}>{children}</ExtensionContext.Provider>;

@@ -42,9 +42,10 @@ pub const DEFAULT_CHAIN_ID: &str = "hikmalayer-dev";
 /// and the funds are gone. There is no checksum to catch it later and no way
 /// to reverse it, so the only place to stop it is here.
 pub fn is_valid_address(value: &str) -> bool {
-    value.len() == 43
-        && value.starts_with("hkm")
-        && value[3..].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    // Both account types are payable: `hkm…` classical and `hkq…` hybrid.
+    // Which scheme authorizes *spending* from an address is decided by its
+    // prefix (see `consensus::hybrid`); receiving is the same either way.
+    crate::consensus::hybrid::scheme_of(value).is_some()
 }
 
 /// Integer square root (floor) for u128 — used to size initial LP shares as
@@ -166,6 +167,16 @@ pub struct StakeInfo {
     /// randomness. Registered on-chain with the stake.
     #[serde(default)]
     pub vrf_public_key: String,
+    /// ML-DSA-65 public key, registered when the validator is a hybrid
+    /// (`hkq…`) account. Empty for a classical validator.
+    ///
+    /// A validator's key is the longest-lived key on the chain — it sits
+    /// here for as long as the stake does, in public, which is precisely the
+    /// exposure a quantum adversary needs. When this is set, unbonding and
+    /// block production both require an ML-DSA signature as well as the
+    /// ECDSA one, so breaking secp256k1 alone buys neither.
+    #[serde(default)]
+    pub pq_public_key: String,
 }
 
 /// A native fungible token (HTS — Hikmalayer Token Standard): the ecosystem
@@ -253,6 +264,19 @@ pub struct ChainState {
     /// while testing cannot be replayed against real funds.
     #[serde(default)]
     pub chain_id: String,
+    /// When set, only hybrid (quantum-ready) accounts may originate
+    /// transactions.
+    ///
+    /// The migration lever. A network starts with it off so classical
+    /// accounts keep working while their holders move to hybrid addresses,
+    /// and turns it on once they have — after which a classical signature no
+    /// longer authorizes anything, whatever happens to secp256k1.
+    ///
+    /// It is consensus state, committed to by the state root, so every node
+    /// enforces the same rule at the same height rather than each operator
+    /// deciding locally.
+    #[serde(default)]
+    pub require_hybrid_signatures: bool,
     /// Fees collected within the current block; paid to the validator and
     /// zeroed by `end_block`, so it is always 0 at block boundaries.
     #[serde(default)]
@@ -325,6 +349,9 @@ impl ChainState {
                     stake,
                     public_key: public_key.to_string(),
                     vrf_public_key: treasury_vrf_public_key.unwrap_or_default().to_string(),
+                    // The genesis treasury validator is a classical account;
+                    // a hybrid one registers its key by staking.
+                    pq_public_key: String::new(),
                 },
             );
         }
@@ -544,6 +571,36 @@ impl ChainState {
         Ok(())
     }
 
+    /// Refuse a classical-account transaction once the network requires
+    /// quantum-ready signatures.
+    ///
+    /// Sits beside `verify_chain_scope` on the shared apply path, so block
+    /// validation enforces it too — a validator cannot include classical
+    /// transactions in a block after the switch.
+    ///
+    /// `Reward` and `Slash` are block-scoped and carry no sender.
+    pub fn verify_signature_policy(&self, tx: &Transaction) -> Result<(), String> {
+        if !self.require_hybrid_signatures {
+            return Ok(());
+        }
+        if matches!(
+            tx.transaction_type,
+            TransactionType::Reward | TransactionType::Slash
+        ) {
+            return Ok(());
+        }
+        let Some(from) = tx.from.as_ref() else {
+            return Ok(());
+        };
+        if !crate::consensus::hybrid::is_hybrid_address(from) {
+            return Err(format!(
+                "This network requires quantum-ready (hkq) accounts; '{}' is classical",
+                from
+            ));
+        }
+        Ok(())
+    }
+
     /// Apply a transaction whose authorization has already been verified.
     ///
     /// Only for callers that have just run the full `verify_for_block` check
@@ -560,6 +617,7 @@ impl ChainState {
         // It is a string comparison, not a signature check, so unlike
         // authorization there is nothing to gain by skipping it.
         self.verify_chain_scope(tx)?;
+        self.verify_signature_policy(tx)?;
         match tx.transaction_type {
             TransactionType::Transfer => {
                 let from = tx
@@ -627,6 +685,17 @@ impl ChainState {
                     .ok_or_else(|| "Stake would overflow".to_string())?;
                 entry.public_key = public_key.clone();
                 entry.vrf_public_key = vrf_public_key.clone();
+                // `verify_authorization` has already checked that both keys
+                // derive to `from` and that both signatures verify, so this
+                // key is the one the address commits to — not merely one the
+                // sender claimed.
+                entry.pq_public_key = match crate::consensus::hybrid::scheme_of(from) {
+                    Some(crate::consensus::hybrid::AccountScheme::Hybrid) => tx
+                        .pq_public_key
+                        .clone()
+                        .ok_or_else(|| "Hybrid validator must register a post-quantum key".to_string())?,
+                    _ => String::new(),
+                };
                 Ok(())
             }
             TransactionType::Withdraw => {
@@ -655,6 +724,35 @@ impl ChainState {
                 );
                 if !pos::verify_message(&message, &info.public_key, signature) {
                     return Err("Withdraw signature does not match registered key".to_string());
+                }
+                // A hybrid validator unbonds under both schemes. Without
+                // this, an attacker who broke secp256k1 could unbond a
+                // hybrid validator's whole stake with one break — the
+                // account's post-quantum half would protect its balance but
+                // not its stake.
+                if info.pq_public_key.is_empty() {
+                    if tx.pq_signature.is_some() || tx.pq_public_key.is_some() {
+                        return Err(
+                            "Classical validator must not carry post-quantum fields".to_string()
+                        );
+                    }
+                } else {
+                    let pq_signature = tx.pq_signature.as_ref().ok_or_else(|| {
+                        "Hybrid validator requires a post-quantum signature".to_string()
+                    })?;
+                    // Verified against the key registered ON CHAIN, not one
+                    // supplied with the transaction: a substituted key is
+                    // exactly the attack this defends against.
+                    if !crate::consensus::pq::verify_message(
+                        &message,
+                        &info.pq_public_key,
+                        pq_signature,
+                    ) {
+                        return Err(
+                            "Withdraw post-quantum signature does not match registered key"
+                                .to_string(),
+                        );
+                    }
                 }
                 if info.stake < tx.amount {
                     return Err(format!(

@@ -58,6 +58,36 @@ export ADMIN_TOKEN="replace-with-strong-random-token"
 export RUST_LOG="info"
 ```
 
+### Genesis parameters (a network's identity)
+
+These are committed to by the genesis **state root**. Two nodes that disagree
+on any of them are running different networks, and will neither sync nor accept
+each other's transactions — which is the intended behaviour, not a bug. Fix
+them before launch; they cannot be changed afterwards.
+
+| Variable | Meaning |
+|---|---|
+| `GENESIS_CHAIN_ID` | The network's name. It is inside every signed message, so a testnet and a mainnet **must** differ — otherwise a transaction signed while testing replays against real funds |
+| `GENESIS_TREASURY_ADDRESS` | Holds the initial supply; seated as the bootstrap validator when its keys are given |
+| `GENESIS_VALIDATOR_PUBLIC_KEY` | The treasury's secp256k1 key, canonical uncompressed form |
+| `GENESIS_VALIDATOR_VRF_PUBLIC_KEY` | The treasury's sr25519 VRF key |
+| `GENESIS_VALIDATOR_PQ_PUBLIC_KEY` | **Required if the treasury address is `hkq…`.** Without a key that actually derives to that address, the treasury is *not seated as a validator at all* — the chain will produce no blocks until somebody stakes properly. That is deliberate: seating a quantum-ready validator whose stake and blocks were protected by ECDSA alone would be worse than halting |
+| `GENESIS_SUPPLY` | Initial supply in base units |
+| `GENESIS_VALIDATOR_ALLOWLIST` | Comma-separated addresses permitted to *join* the validator set. Launch posture; existing validators may always top up |
+| `GENESIS_REQUIRE_HYBRID` | `1` makes the network accept **only** quantum-ready (`hkq…`) senders. Decide before genesis — it cannot be turned on later without a new network |
+
+Quantum posture is a launch decision with a real trade-off. Requiring hybrid
+gives every account post-quantum protection from block 0; it also makes every
+transaction ~40× larger (~5.4 KB vs ~130 bytes) and every signature ~11 ms
+instead of under 1 ms, and it excludes any wallet that has not implemented
+ML-DSA. Leaving it off makes hybrid opt-in per account, which is the default
+and the recommended posture for a general-purpose network.
+
+Note for validators: a `hkq…` validator's ML-DSA key is derived from the same
+secret, so there is still one thing to protect — but most HSMs and remote
+signers cannot produce ML-DSA-65 signatures today, so such a validator's key is
+a software key. See `docs/key_management.md`.
+
 ---
 
 ## 4) Local/staging deployment (recommended first)

@@ -39,7 +39,7 @@ const WalletAuth = () => {
             </h3>
             {!isConnected && (
               <p className="text-gray-300 text-sm">
-                Enter your native hkm… address (from{" "}
+                Enter your native hkm… or hkq… address (from{" "}
                 <code className="text-cyan-300">hikma-wallet keygen</code>)
               </p>
             )}
@@ -94,7 +94,7 @@ const WalletAuth = () => {
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="hkm… address"
+              placeholder="hkm… or hkq… address"
               className="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-3 text-white placeholder-gray-400 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
             <button

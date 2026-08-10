@@ -35,7 +35,17 @@ import {
   signMessageFromBytes,
   withProtectedKey,
 } from "../lib/wallet";
+import { deriveHybridIdentity, signHybridFromBytes } from "../lib/hybrid";
 import SignConfirm from "../components/SignConfirm";
+
+/// Which account of the unlocked key the UI is operating as.
+///
+/// One private key controls two DIFFERENT accounts with separate balances:
+/// the classical `hkm…` one and the quantum-ready `hkq…` one. This is a
+/// local preference, not a secret, so it lives in localStorage.
+const SCHEME_KEY = "hikmalayer.wallet.scheme";
+
+const readScheme = () => (localStorage.getItem(SCHEME_KEY) === "hybrid" ? "hybrid" : "classical");
 
 const SignerContext = createContext(null);
 
@@ -56,10 +66,16 @@ export const SignerProvider = ({ children, onUnlock }) => {
   // Neither refs hold anything usable on their own.
   const sessionKeyRef = useRef(null);
   const protectedKeyRef = useRef(null);
+  // The hybrid identity is derived on unlock and held in memory only. It is
+  // public material, but there is no reason to persist a second copy of
+  // something a key already determines.
+  const [hybridIdentity, setHybridIdentity] = useState(null);
+  const [scheme, setSchemeState] = useState(readScheme);
 
   const lock = useCallback(() => {
     sessionKeyRef.current = null;
     protectedKeyRef.current = null;
+    setHybridIdentity(null);
     setUnlocked(false);
     setPending((current) => {
       current?.reject(new Error("Wallet locked"));
@@ -88,6 +104,9 @@ export const SignerProvider = ({ children, onUnlock }) => {
       const sessionKey = await createSessionKey();
       sessionKeyRef.current = sessionKey;
       protectedKeyRef.current = await protectKey(sessionKey, privateKeyHex);
+      // ~3 ms of ML-DSA keygen, once per unlock. Doing it here means the
+      // hybrid address is available to the UI without ever storing it.
+      setHybridIdentity(deriveHybridIdentity(privateKeyHex));
       setVault(nextVault);
       setUnlocked(true);
       touch();
@@ -161,10 +180,13 @@ export const SignerProvider = ({ children, onUnlock }) => {
     return decryptVault(stored, password);
   }, []);
 
-  /// Sign a canonical message. Always asks the user first, and only ever
-  /// exposes the key as a buffer that is wiped immediately after use.
-  const sign = useCallback(
-    async (message) => {
+  /// Ask the user, then run `consumer` over the raw key bytes.
+  ///
+  /// The key exists as a buffer for exactly the duration of the callback and
+  /// is wiped after; it is never a string, because JS strings cannot be
+  /// wiped. Every signature passes through here, so there is no silent path.
+  const withApproval = useCallback(
+    async (message, consumer) => {
       if (!sessionKeyRef.current || !protectedKeyRef.current) {
         throw new Error("Wallet is locked");
       }
@@ -175,14 +197,49 @@ export const SignerProvider = ({ children, onUnlock }) => {
         setPending({ message, resolve, reject });
       });
 
-      return withProtectedKey(
-        sessionKeyRef.current,
-        protectedKeyRef.current,
-        (keyBytes) => signMessageFromBytes(message, keyBytes)
-      );
+      return withProtectedKey(sessionKeyRef.current, protectedKeyRef.current, consumer);
     },
     [touch]
   );
+
+  /// Sign a canonical message under the classical scheme. Returns compact
+  /// ECDSA hex.
+  const sign = useCallback(
+    (message) => withApproval(message, (keyBytes) => signMessageFromBytes(message, keyBytes)),
+    [withApproval]
+  );
+
+  /// Authorize a canonical message: the request fields the node expects.
+  ///
+  /// In hybrid mode this carries both signatures. The node rejects a
+  /// classical (`hkm…`) transaction that carries post-quantum fields and a
+  /// hybrid (`hkq…`) one that omits them, so the mode and the address cannot
+  /// silently disagree — one authorized transaction, one valid encoding.
+  const authorize = useCallback(
+    async (message) => {
+      if (scheme !== "hybrid") {
+        return { public_key: vault?.publicKey, signature: await sign(message) };
+      }
+      if (!hybridIdentity) throw new Error("Wallet is locked");
+      const both = await withApproval(message, (keyBytes) =>
+        signHybridFromBytes(message, keyBytes)
+      );
+      return {
+        public_key: hybridIdentity.publicKey,
+        signature: both.signature,
+        pq_public_key: hybridIdentity.pqPublicKey,
+        pq_signature: both.pqSignature,
+      };
+    },
+    [scheme, hybridIdentity, sign, vault, withApproval]
+  );
+
+  /// Switch which of the key's two accounts the UI operates as.
+  const setScheme = useCallback((next) => {
+    const value = next === "hybrid" ? "hybrid" : "classical";
+    localStorage.setItem(SCHEME_KEY, value);
+    setSchemeState(value);
+  }, []);
 
   const approve = useCallback(() => {
     setPending((current) => {
@@ -202,8 +259,19 @@ export const SignerProvider = ({ children, onUnlock }) => {
     () => ({
       hasWallet: !!vault,
       unlocked,
-      address: vault?.address ?? null,
+      // The active account follows the selected scheme. Hybrid needs the
+      // wallet unlocked, because the address depends on the ML-DSA key.
+      address:
+        scheme === "hybrid"
+          ? hybridIdentity?.address ?? null
+          : vault?.address ?? null,
       publicKey: vault?.publicKey ?? null,
+      classicalAddress: vault?.address ?? null,
+      hybridAddress: hybridIdentity?.address ?? null,
+      pqPublicKey: hybridIdentity?.pqPublicKey ?? null,
+      scheme,
+      setScheme,
+      authorize,
       error,
       createWallet,
       importWallet,
@@ -227,6 +295,10 @@ export const SignerProvider = ({ children, onUnlock }) => {
       removeWallet,
       exportPrivateKey,
       sign,
+      authorize,
+      scheme,
+      setScheme,
+      hybridIdentity,
       touch,
     ]
   );
@@ -236,7 +308,7 @@ export const SignerProvider = ({ children, onUnlock }) => {
       {children}
       <SignConfirm
         request={pending}
-        address={vault?.address}
+        address={scheme === "hybrid" ? hybridIdentity?.address : vault?.address}
         onApprove={approve}
         onReject={reject}
       />

@@ -17,7 +17,7 @@ import { describeAsset, safeText } from "../lib/sanitize";
 /// registry reports is the real, consensus-enforced supply.
 const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
   const { account } = useWallet();
-  const { canSign: unlocked, sign, publicKey: signerPublicKey } = useActiveSigner();
+  const { canSign: unlocked, authorize } = useActiveSigner();
   const [assets, setAssets] = useState([]);
   const [mode, setMode] = useState("browse");
   const [nonce, setNonce] = useState(null);
@@ -117,10 +117,7 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
     setMessage(null);
     try {
       const signedBy = unlocked
-        ? {
-            public_key: signerPublicKey,
-            signature: await sign(signingMessages.createAsset(createParams)),
-          }
+        ? await authorize(signingMessages.createAsset(createParams))
         : { public_key: publicKey.trim(), signature: signature.trim() };
       const res = await createAsset({
         creator: account,
@@ -154,10 +151,7 @@ const AssetExplorer = ({ refreshTrigger, onUpdate }) => {
     setMessage(null);
     try {
       const signedBy = unlocked
-        ? {
-            public_key: signerPublicKey,
-            signature: await sign(signingMessages.transferAsset(transferParams)),
-          }
+        ? await authorize(signingMessages.transferAsset(transferParams))
         : { public_key: publicKey.trim(), signature: signature.trim() };
       const res = await transferAsset({
         token_id: sendToken,

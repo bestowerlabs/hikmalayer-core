@@ -584,24 +584,6 @@ of Bestower Labs Limited, the company that develops the protocol.
 | Email | Ayanrao@bestowerlabs.com |
 | Company website | www.bestowerlabs.com |
 
-> **⚠️ Please complete before publishing.** The details above are the ones
-> confirmed in Hikmalayer's own published documents (whitepaper, licence,
-> contributor agreement). The fields below are personal details only Ayan Rao
-> can confirm — **they have deliberately been left blank rather than guessed**,
-> because publishing an invented biography of a real person would be both wrong
-> and a serious credibility risk if a journalist checked it.
->
-> Fill in whichever you're happy to make public, and delete the rest:
->
-> - **Based in:** _[city, country]_
-> - **Education:** _[qualifications, institutions]_
-> - **Professional background:** _[previous roles, companies, years of experience]_
-> - **Areas of expertise:** _[e.g. blockchain architecture, cryptography, systems engineering]_
-> - **Why he built Hikmalayer:** _[the founding story — this is usually the most
->   compelling part of any founder profile, so it's worth a few sentences]_
-> - **Public profiles:** _[LinkedIn, X/Twitter, GitHub, personal site]_
-> - **Speaking, publications or press:** _[talks, papers, interviews]_
-> - **Photograph:** _[a high-resolution headshot, for press use]_
 
 ### 11.3 Suggested founder biography (short version)
 

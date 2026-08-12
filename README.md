@@ -43,6 +43,7 @@ any other chain's conventions.
 | [Security assessment](docs/security_assessment.md) | 13 findings, all fixed, each with a regression test |
 | [Threat model](docs/threat_model.md) | Adversaries, mitigations, and what is explicitly out of scope |
 | [HKM, HTS and listings](docs/hts_and_listings.md) | What the token layer is, and honest expectations about exchanges |
+| [Marketing data](docs/Marketing%20Data.md) | Public information pack — plain-language explanations, facts and figures, ready-to-use copy |
 | [API](docs/API.md) · [OpenAPI 3.1](docs/openapi.yaml) · [SDK](sdk/README.md) | Building on it |
 | [Consensus flow](docs/consensus_flow.md) · [Validator lifecycle](docs/validator_lifecycle.md) · [Key management](docs/key_management.md) | Running a validator |
 | [Wallet security](docs/wallet_security.md) · [Deployment](docs/deployment_guide.md) | Operating it |

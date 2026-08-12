@@ -30,10 +30,23 @@ describe("live chain", { skip: reachable ? false : `no node at ${URL}` }, () => 
   let bob;
   let admin;
 
-  /// Queued transactions only take effect once mined.
+  /// Queued transactions only take effect once mined — and a transaction is
+  /// not guaranteed to make the very next block. Sealing one block and then
+  /// asserting races the chain: whichever test loses reads pre-transaction
+  /// state and fails, on a different test each run.
+  ///
+  /// Waiting for the mempool to drain is the general form of "my transaction
+  /// landed". This suite is sequential, so nothing else is filling it.
   const settle = async () => {
-    await admin.mine();
-    await new Promise((r) => setTimeout(r, 700));
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      // Not this slot's leader is fine — the devnet timer will seal it.
+      await admin.mine().catch(() => {});
+      await new Promise((r) => setTimeout(r, 300));
+      const { pending_transactions } = await admin.stats();
+      if (pending_transactions === 0) return;
+    }
+    throw new Error("Timed out after 60s waiting for the mempool to drain");
   };
 
   before(async () => {

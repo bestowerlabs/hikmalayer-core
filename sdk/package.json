@@ -14,7 +14,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test 'test/*.test.mjs'",
+    "test": "node --test test/",
     "test:integration": "HIKMALAYER_NODE=${HIKMALAYER_NODE:-http://127.0.0.1:3000} node --test --test-concurrency=1 'test/integration/*.test.mjs'"
   },
   "dependencies": {

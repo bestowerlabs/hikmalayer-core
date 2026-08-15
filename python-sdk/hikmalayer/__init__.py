@@ -40,6 +40,17 @@ from .units import (
     isqrt,
 )
 from . import messages
+from . import hybrid
+from .hybrid import (
+    HybridSigningUnavailable,
+    derive_hybrid_address,
+    derive_hybrid_identity,
+    derive_pq_public_key,
+    is_hybrid_address,
+    pq_available,
+    pq_verify_message,
+    verify_hybrid,
+)
 
 __version__ = "0.1.0"
 
@@ -66,4 +77,13 @@ __all__ = [
     "apply_slippage",
     "isqrt",
     "messages",
+    "hybrid",
+    "HybridSigningUnavailable",
+    "derive_hybrid_address",
+    "derive_hybrid_identity",
+    "derive_pq_public_key",
+    "is_hybrid_address",
+    "pq_available",
+    "pq_verify_message",
+    "verify_hybrid",
 ]

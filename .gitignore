@@ -36,3 +36,5 @@ python-sdk/*.egg-info/
 python-sdk/.pytest_cache/
 __pycache__/
 *.py[cod]
+pub_key
+pub_key

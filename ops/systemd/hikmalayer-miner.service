@@ -1,0 +1,15 @@
+[Unit]
+Description=Hikmalayer bootnode block production loop
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hikmalayer-miner.sh
+Restart=always
+RestartSec=5
+User=hikmalayer
+
+[Install]
+WantedBy=multi-user.target
+

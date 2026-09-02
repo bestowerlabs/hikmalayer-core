@@ -61,6 +61,7 @@ services:
       - "80:80"
     volumes:
       - /home/hikmalayer/hikmalayer-core/ops/caddy/Caddyfile.mainnet:/etc/caddy/Caddyfile:ro
+      - /home/hikmalayer/hikmalayer-core/dashboard/dist:/srv/dashboard:ro
       - caddy_data:/data
     depends_on:
       - bootnode

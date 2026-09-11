@@ -3288,8 +3288,9 @@ mod tests {
         Transaction::new(from, to, amount, kind)
             .for_chain(crate::blockchain::state::DEFAULT_CHAIN_ID)
     }
-    use super::*;
+        use super::*;
     use crate::blockchain::chain::dev_genesis_private_key;
+    use crate::blockchain::transaction::BLOCK_REWARD;
     use axum::http::HeaderValue;
 
     const ADMIN_TOKEN: &str = "test-admin-token";
@@ -3702,10 +3703,11 @@ mod tests {
         .await
         .0
         .balance;
-        // The 30B hard cap is fully consumed by genesis allocation alone,
-        // so no further HKM can be minted through block rewards — this
-        // block correctly pays nothing rather than exceeding the cap.
-        assert_eq!(balance_after, balance_before);
+        // With DEFAULT_GENESIS_SUPPLY at 15B against a 30B cap, there is
+        // 15B of headroom — this fixture uses the no-Protocol-Treasury
+        // fallback path (test_state passes no protocol treasury), so the
+        // full, untruncated reward goes to the one treasury normally.
+        assert_eq!(balance_after, balance_before + BLOCK_REWARD);
     }
 
     #[tokio::test]

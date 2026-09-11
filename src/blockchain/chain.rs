@@ -13,7 +13,7 @@ pub const MAX_TIMESTAMP_SKEW_SECONDS: i64 = 120;
 /// through block rewards once this is reached; a Reward transaction after
 /// genesis correctly credits nothing rather than exceeding the cap.
 pub const DEFAULT_GENESIS_SUPPLY: u64 =
-    30_000_000_000 * crate::blockchain::transaction::UNITS_PER_HKM;
+    15_000_000_000 * crate::blockchain::transaction::UNITS_PER_HKM;
 
 /// Target seconds between blocks for difficulty retargeting.
 pub const TARGET_BLOCK_SECONDS: i64 = 15;

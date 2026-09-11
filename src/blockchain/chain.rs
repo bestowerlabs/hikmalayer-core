@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 /// Maximum tolerated clock skew (seconds) for incoming block timestamps.
 pub const MAX_TIMESTAMP_SKEW_SECONDS: i64 = 120;
 
-/// Default initial supply for networks that do not configure one:
-/// 30,000,000,000 HKM (the 30% genesis allocation of the ~100B HKM supply;
-/// the remaining ~70B is mined via the halving schedule with tail).
+/// 30,000,000,000 HKM — the entire hard-capped supply (see MAX_SUPPLY in
+/// transaction.rs), allocated in full at genesis. No further HKM is minted
+/// through block rewards once this is reached; a Reward transaction after
+/// genesis correctly credits nothing rather than exceeding the cap.
 pub const DEFAULT_GENESIS_SUPPLY: u64 =
     30_000_000_000 * crate::blockchain::transaction::UNITS_PER_HKM;
 
@@ -71,6 +72,10 @@ fn default_genesis_treasury() -> String {
         .unwrap_or_default()
 }
 
+fn default_genesis_protocol_treasury() -> Option<String> {
+    None
+}
+
 fn default_genesis_supply() -> u64 {
     DEFAULT_GENESIS_SUPPLY
 }
@@ -85,6 +90,12 @@ pub struct Blockchain {
     /// different parameters produce different genesis hashes and never sync.
     #[serde(default = "default_genesis_treasury")]
     pub genesis_treasury: String,
+    /// Protocol/Ecosystem Treasury — receives half of each block reward
+    /// once configured. `None` means no split is active and the full
+    /// reward goes to the block producer, preserving the behaviour of any
+    /// chain that predates this field.
+    #[serde(default = "default_genesis_protocol_treasury")]
+    pub genesis_protocol_treasury: Option<String>,    
     #[serde(default = "default_genesis_validator_public_key")]
     pub genesis_validator_public_key: Option<String>,
     #[serde(default = "default_genesis_validator_vrf_public_key")]
@@ -156,6 +167,7 @@ pub struct CheckpointBundle {
     pub genesis_treasury: String,
     pub genesis_validator_public_key: Option<String>,
     pub genesis_validator_vrf_public_key: Option<String>,
+    pub genesis_protocol_treasury: Option<String>,
     pub genesis_supply: u64,
     #[serde(default)]
     pub genesis_validator_allowlist: Vec<String>,
@@ -223,6 +235,7 @@ impl Blockchain {
             chain_id,
             difficulty,
             default_genesis_treasury(),
+            None,
             default_genesis_validator_public_key(),
             default_genesis_validator_vrf_public_key(),
             default_genesis_supply(),
@@ -244,6 +257,7 @@ impl Blockchain {
             DEFAULT_CHAIN_ID.to_string(),
             difficulty,
             genesis_treasury,
+            None,
             genesis_validator_public_key,
             genesis_validator_vrf_public_key,
             genesis_supply,
@@ -259,6 +273,7 @@ impl Blockchain {
         genesis_chain_id: String,
         difficulty: usize,
         genesis_treasury: String,
+        genesis_protocol_treasury: Option<String>,
         genesis_validator_public_key: Option<String>,
         genesis_validator_vrf_public_key: Option<String>,
         genesis_supply: u64,
@@ -270,6 +285,7 @@ impl Blockchain {
         let mut state = ChainState::genesis_for_chain(
             &genesis_chain_id,
             &genesis_treasury,
+            genesis_protocol_treasury.as_deref(),
             genesis_validator_public_key.as_deref(),
             genesis_validator_vrf_public_key.as_deref(),
             genesis_supply,
@@ -291,6 +307,7 @@ impl Blockchain {
             difficulty,
             finalized_height: 0,
             genesis_treasury,
+            genesis_protocol_treasury,        
             genesis_validator_public_key,
             genesis_validator_vrf_public_key,
             genesis_supply,
@@ -338,6 +355,7 @@ impl Blockchain {
     pub fn from_checkpoint(
         difficulty: usize,
         genesis_treasury: String,
+        genesis_protocol_treasury: Option<String>,
         genesis_validator_public_key: Option<String>,
         genesis_validator_vrf_public_key: Option<String>,
         genesis_supply: u64,
@@ -370,6 +388,7 @@ impl Blockchain {
             difficulty: pow::clamp_difficulty(difficulty),
             finalized_height: anchor.index,
             genesis_treasury,
+            genesis_protocol_treasury,
             genesis_validator_public_key,
             genesis_validator_vrf_public_key,
             genesis_supply,
@@ -388,6 +407,7 @@ impl Blockchain {
         let mut state = ChainState::genesis_for_chain(
             &self.genesis_chain_id,
             &self.genesis_treasury,
+            self.genesis_protocol_treasury.as_deref(),
             self.genesis_validator_public_key.as_deref(),
             self.genesis_validator_vrf_public_key.as_deref(),
             self.genesis_supply,
@@ -1021,6 +1041,7 @@ impl Blockchain {
         let mut replay = Blockchain {
             genesis_chain_id: self.genesis_chain_id.clone(),
             genesis_require_hybrid_signatures: self.genesis_require_hybrid_signatures,
+            genesis_protocol_treasury: self.genesis_protocol_treasury.clone(),
             genesis_validator_pq_public_key: self.genesis_validator_pq_public_key.clone(),
             blocks: candidate.blocks.clone(),
             difficulty: self.difficulty,
@@ -1094,6 +1115,7 @@ impl Blockchain {
             genesis_chain_id: self.genesis_chain_id.clone(),
             difficulty: self.difficulty,
             genesis_treasury: self.genesis_treasury.clone(),
+            genesis_protocol_treasury: self.genesis_protocol_treasury.clone(),
             genesis_validator_public_key: self.genesis_validator_public_key.clone(),
             genesis_validator_vrf_public_key: self.genesis_validator_vrf_public_key.clone(),
             genesis_supply: self.genesis_supply,
@@ -1109,6 +1131,7 @@ impl Blockchain {
         Self::from_checkpoint(
             bundle.difficulty,
             bundle.genesis_treasury,
+            bundle.genesis_protocol_treasury,
             bundle.genesis_validator_public_key,
             bundle.genesis_validator_vrf_public_key,
             bundle.genesis_supply,
@@ -1426,6 +1449,7 @@ stake.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
             DEFAULT_CHAIN_ID.to_string(),
             2,
             v_addr.clone(),
+            None,
             Some(v_pub.clone()),
             Some(v_vrf.clone()),
             supply,
@@ -1449,6 +1473,7 @@ stake.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
             DEFAULT_CHAIN_ID.to_string(),
             2,
             v_addr.clone(),
+            None,
             Some(v_pub.clone()),
             Some(v_vrf.clone()),
             supply,
@@ -1463,6 +1488,7 @@ stake.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
             DEFAULT_CHAIN_ID.to_string(),
             2,
             v_addr.clone(),
+            None,
             Some(v_pub),
             Some(v_vrf),
             supply,
@@ -2020,6 +2046,7 @@ stake.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
         let synced = Blockchain::from_checkpoint(
             2,
             full.genesis_treasury.clone(),
+            full.genesis_protocol_treasury.clone(),
             full.genesis_validator_public_key.clone(),
             full.genesis_validator_vrf_public_key.clone(),
             full.genesis_supply,
@@ -2096,6 +2123,7 @@ stake.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
         let result = Blockchain::from_checkpoint(
             2,
             full.genesis_treasury.clone(),
+            full.genesis_protocol_treasury.clone(),
             full.genesis_validator_public_key.clone(),
             full.genesis_validator_vrf_public_key.clone(),
             full.genesis_supply,

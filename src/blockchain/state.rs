@@ -175,7 +175,6 @@ pub struct StakeInfo {
     /// exposure a quantum adversary needs. When this is set, unbonding and
     /// block production both require an ML-DSA signature as well as the
     /// ECDSA one, so breaking secp256k1 alone buys neither.
-    #[serde(default)]
     pub pq_public_key: String,
 }
 
@@ -264,6 +263,24 @@ pub struct ChainState {
     /// while testing cannot be replayed against real funds.
     #[serde(default)]
     pub chain_id: String,
+  /// Protocol/Ecosystem Treasury address. When set, half of each block
+    /// reward is credited here instead of to the block producer alone.
+    /// `None` means no split is active — the full reward goes to the
+    /// producer, preserving the behaviour of any chain that predates this
+    /// field, including this one before the field was added.
+    #[serde(default)]
+    pub protocol_treasury: Option<String>,  
+    /// Cumulative HKM minted toward the Founder Treasury via block rewards,
+    /// separate from its fixed genesis allocation. Tracked independently so
+    /// this side's mining ceiling can be reached and stop without affecting
+    /// the Ecosystem side.
+    #[serde(default)]
+    pub founder_mined: u64,
+    /// Cumulative HKM minted toward the Protocol/Ecosystem Treasury via
+    /// block rewards, separate from its fixed genesis allocation. Tracked
+    /// independently for the same reason as founder_mined.
+    #[serde(default)]
+    pub ecosystem_mined: u64,
     /// When set, only hybrid (quantum-ready) accounts may originate
     /// transactions.
     ///
@@ -307,6 +324,7 @@ impl ChainState {
         Self::genesis_for_chain(
             DEFAULT_CHAIN_ID,
             treasury_address,
+            None,
             treasury_public_key,
             treasury_vrf_public_key,
             initial_supply,
@@ -319,6 +337,7 @@ impl ChainState {
     pub fn genesis_for_chain(
         chain_id: &str,
         treasury_address: &str,
+        protocol_treasury_address: Option<&str>,
         treasury_public_key: Option<&str>,
         treasury_vrf_public_key: Option<&str>,
         initial_supply: u64,
@@ -329,11 +348,29 @@ impl ChainState {
             base_fee: TX_FEE,
             validator_allowlist: validator_allowlist.iter().cloned().collect(),
             chain_id: chain_id.to_string(),
+            protocol_treasury: protocol_treasury_address.map(|s| s.to_string()),
             ..Default::default()
         };
-        state
-            .balances
-            .insert(treasury_address.to_string(), initial_supply);
+        // Genesis allocation: when a Protocol/Ecosystem Treasury is
+        // configured, the initial (immediate) supply splits 10B/5B between
+        // the Founder Treasury and the Protocol/Ecosystem Treasury — a 2:1
+        // ratio, not an even half. Without one, all of it goes to the
+        // Founder Treasury alone — the original, pre-split behaviour, kept
+        // for any chain that predates this allocation model.
+        match protocol_treasury_address {
+            Some(protocol_address) => {
+                // 2:1 ratio. Computed from initial_supply rather than
+                // hardcoded, so it stays correct if the immediate-portion
+                // constant ever changes.
+                let founder_share = (initial_supply / 3) * 2;
+                let protocol_share = initial_supply - founder_share; // remainder to protocol, so the two shares always sum to initial_supply exactly
+                state.balances.insert(treasury_address.to_string(), founder_share);
+                state.balances.insert(protocol_address.to_string(), protocol_share);
+            }
+            None => {
+                state.balances.insert(treasury_address.to_string(), initial_supply);
+            }
+        }
 
         if let Some(public_key) = treasury_public_key {
             let stake = GENESIS_VALIDATOR_STAKE.min(initial_supply);
@@ -827,11 +864,46 @@ impl ChainState {
                 Ok(())
             }
             TransactionType::Reward => {
-                // `Transaction::verify_for_block` already bounds this to the
-                // emission schedule. Saturating here means even a bug
-                // upstream cannot wrap the supply counter around to zero.
-                self.credit(&tx.to, tx.amount);
-                self.total_supply = self.total_supply.saturating_add(tx.amount);
+                // Each side has its own 7.5B mining ceiling, on top of its
+                // 10B/5B genesis allocation. `tx.to` here is the Founder
+                // Treasury address — this chain's validators earn
+                // transaction fees, not a share of the block reward itself.
+                //
+                // Each stream truncates and stops independently: the
+                // Founder side can keep earning after the Ecosystem side is
+                // exhausted, and vice versa, rather than one side's
+                // exhaustion silently capping the other's too.
+                let founder_ceiling = crate::blockchain::transaction::FOUNDER_MINING_CEILING;
+                let ecosystem_ceiling = crate::blockchain::transaction::ECOSYSTEM_MINING_CEILING;
+
+                let founder_room = founder_ceiling.saturating_sub(self.founder_mined);
+                let ecosystem_room = ecosystem_ceiling.saturating_sub(self.ecosystem_mined);
+
+                match self.protocol_treasury.clone() {
+                    Some(protocol_address) => {
+                        let intended_share = tx.amount / 2;
+                        let founder_share = intended_share.min(founder_room);
+                        let protocol_share = intended_share.min(ecosystem_room);
+                        self.credit(&tx.to, founder_share);
+                        self.credit(&protocol_address, protocol_share);
+                        self.founder_mined = self.founder_mined.saturating_add(founder_share);
+                        self.ecosystem_mined = self.ecosystem_mined.saturating_add(protocol_share);
+                        self.total_supply = self
+                            .total_supply
+                            .saturating_add(founder_share)
+                            .saturating_add(protocol_share);
+                    }
+                    None => {
+                        // No Protocol Treasury configured: original,
+                        // pre-split behaviour, kept for any chain that
+                        // predates this allocation model.
+                        let remaining_budget = crate::blockchain::transaction::MAX_SUPPLY
+                            .saturating_sub(self.total_supply);
+                        let amount = tx.amount.min(remaining_budget);
+                        self.credit(&tx.to, amount);
+                        self.total_supply = self.total_supply.saturating_add(amount);
+                    }
+                }
                 Ok(())
             }
             TransactionType::TokenCreate => {
@@ -1391,7 +1463,78 @@ mod tests {
         assert_eq!(state.validator_set().len(), 1);
         assert_eq!(state.total_supply, TEST_SUPPLY);
     }
+    fn genesis_state_with_protocol_treasury() -> (ChainState, String, String) {
+        let (founder_address, _, _) = wallet(1);
+        let (protocol_address, _, _) = wallet(2);
+        let state = ChainState::genesis_for_chain(
+            DEFAULT_CHAIN_ID,
+            &founder_address,
+            Some(&protocol_address),
+            None,
+            None,
+            TEST_SUPPLY,
+            &[],
+        );
+        (state, founder_address, protocol_address)
+    }
 
+    #[test]
+    fn genesis_splits_immediate_supply_ten_to_five() {
+        let (state, founder, protocol) = genesis_state_with_protocol_treasury();
+        // 2:1 ratio: Founder gets two-thirds, Protocol/Ecosystem gets
+        // one-third, of whatever the immediate genesis supply is —
+        // TEST_SUPPLY here, DEFAULT_GENESIS_SUPPLY (15B) in production,
+        // which resolves to exactly 10B/5B.
+        let expected_founder = (TEST_SUPPLY / 3) * 2;
+        let expected_protocol = TEST_SUPPLY - expected_founder;
+        assert_eq!(state.balance_of(&founder), expected_founder);
+        assert_eq!(state.balance_of(&protocol), expected_protocol);
+        // The two shares must always sum to exactly the immediate supply —
+        // no unit created or lost to rounding.
+        assert_eq!(
+            state.balance_of(&founder) + state.balance_of(&protocol),
+            TEST_SUPPLY
+        );
+    }
+
+    #[test]
+    fn mining_ceilings_truncate_and_stop_independently() {
+        use crate::blockchain::transaction::{
+            ECOSYSTEM_MINING_CEILING, FOUNDER_MINING_CEILING,
+        };
+        let (mut state, founder, protocol) = genesis_state_with_protocol_treasury();
+
+        // Push the Founder side to within 100 units of its own ceiling,
+        // while leaving the Ecosystem side untouched — the two must behave
+        // independently.
+        state.founder_mined = FOUNDER_MINING_CEILING - 100;
+
+        let reward_amount = 3_700 * UNITS_PER_HKM; // BLOCK_REWARD, spelled
+                                                     // out to avoid an extra
+                                                     // import in this test
+        let tx = test_tx(None, founder.clone(), reward_amount, TransactionType::Reward);
+        state.apply_transaction(&tx, 0).unwrap();
+
+        // Founder's intended share (half the reward) would exceed its
+        // remaining room (100), so it must be truncated to exactly 100 —
+        // not the full 1,850 it would otherwise receive.
+        assert_eq!(state.founder_mined, FOUNDER_MINING_CEILING);
+
+        // Ecosystem side is nowhere near its ceiling, so its full intended
+        // share (half the reward) is credited normally, unaffected by the
+        // Founder side's exhaustion.
+        assert_eq!(state.ecosystem_mined, reward_amount / 2);
+        assert!(state.ecosystem_mined < ECOSYSTEM_MINING_CEILING);
+
+        // A second reward, now that Founder's ceiling is fully reached,
+        // must credit the Founder side nothing further at all.
+        let tx2 = test_tx(None, founder.clone(), reward_amount, TransactionType::Reward);
+        state.apply_transaction(&tx2, 0).unwrap();
+        assert_eq!(state.founder_mined, FOUNDER_MINING_CEILING); // unchanged
+        assert_eq!(state.ecosystem_mined, reward_amount); // Ecosystem kept earning
+
+        let _ = protocol; // used only to construct genesis; silence unused warning if any
+    }
     /// The supply is a consensus invariant: outside `Reward` (the emission
     /// schedule) and `TokenCreate`, no transaction may change how much HKM
     /// exists. An attacker who can break that mints money.

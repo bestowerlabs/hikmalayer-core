@@ -108,6 +108,7 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
         println!("🛡️  This network requires quantum-ready (hkq) accounts at genesis.");
     }
 
+    let protocol_treasury = std::env::var("GENESIS_PROTOCOL_TREASURY").ok().filter(|v| !v.is_empty());
     match (
         std::env::var("GENESIS_TREASURY_ADDRESS").ok().filter(|v| !v.is_empty()),
         std::env::var("GENESIS_VALIDATOR_PUBLIC_KEY").ok().filter(|v| !v.is_empty()),
@@ -116,6 +117,7 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
             chain_id,
             difficulty,
             treasury,
+            protocol_treasury.clone(),
             validator_key,
             vrf_key,
             supply,
@@ -129,6 +131,7 @@ fn fresh_chain(difficulty: usize) -> Blockchain {
                 chain_id,
                 difficulty,
                 treasury,
+                protocol_treasury.clone(),
                 Some(validator_key),
                 vrf_key,
                 supply,

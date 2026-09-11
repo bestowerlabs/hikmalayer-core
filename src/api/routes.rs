@@ -3290,7 +3290,6 @@ mod tests {
     }
     use super::*;
     use crate::blockchain::chain::dev_genesis_private_key;
-    use crate::blockchain::transaction::BLOCK_REWARD;
     use axum::http::HeaderValue;
 
     const ADMIN_TOKEN: &str = "test-admin-token";
@@ -3703,7 +3702,10 @@ mod tests {
         .await
         .0
         .balance;
-        assert_eq!(balance_after, balance_before + BLOCK_REWARD);
+        // The 30B hard cap is fully consumed by genesis allocation alone,
+        // so no further HKM can be minted through block rewards — this
+        // block correctly pays nothing rather than exceeding the cap.
+        assert_eq!(balance_after, balance_before);
     }
 
     #[tokio::test]

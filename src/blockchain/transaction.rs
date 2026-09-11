@@ -30,7 +30,22 @@ pub const HALVING_INTERVAL: u64 = 9_500_000;
 /// fees alone. Monero-style: supply is asymptotically capped in *rate*,
 /// not absolute count.
 pub const TAIL_EMISSION: u64 = 50 * UNITS_PER_HKM;
+/// Hard, permanent ceiling on total HKM in existence — genesis allocation
+/// plus every block reward ever minted must never exceed this. Once
+/// total_supply reaches it, no further HKM is created; a reward that would
+/// cross it is truncated to exactly what remains of the budget.
+pub const MAX_SUPPLY: u64 = 30_000_000_000 * UNITS_PER_HKM;
+/// Founder Treasury's ceiling for HKM earned via block rewards, on top of
+/// its 10B immediate genesis allocation. 10B + 7.5B = 17.5B total to this
+/// side once fully mined.
+pub const FOUNDER_MINING_CEILING: u64 = 7_500_000_000 * UNITS_PER_HKM;
 
+/// Protocol/Ecosystem Treasury's ceiling for HKM earned via block rewards,
+/// on top of its 5B immediate genesis allocation. 5B + 7.5B = 12.5B total
+/// to this side once fully mined. Together with FOUNDER_MINING_CEILING,
+/// the two mining streams total exactly 15B — the other half of
+/// MAX_SUPPLY, alongside the 15B allocated immediately at genesis.
+pub const ECOSYSTEM_MINING_CEILING: u64 = 7_500_000_000 * UNITS_PER_HKM;
 /// Deterministic block reward for the block at `height`. Genesis (height 0)
 /// pays nothing; every subsequent block pays `BLOCK_REWARD >> halvings`
 /// (where `halvings = (height - 1) / HALVING_INTERVAL`) floored at

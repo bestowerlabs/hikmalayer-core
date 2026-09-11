@@ -52,6 +52,7 @@ fn chain_named(chain_id: &str) -> (ChainState, Account) {
     let state = ChainState::genesis_for_chain(
         chain_id,
         &treasury.address,
+        None,
         Some(&treasury.public_key),
         Some(&treasury.vrf_public_key),
         SUPPLY,

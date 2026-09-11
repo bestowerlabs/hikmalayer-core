@@ -291,3 +291,81 @@ export const completeWorkflow = async () => {
 // Export the base URL for components that need it
 export { API_BASE };
 export default api;
+
+// ===== VERIFIABLE CREDENTIALS =====
+// Distinct from /certificates/* above — a separate on-chain credential
+// registry with issue/revoke/proof semantics.
+
+export const issueCredential = async (data) => {
+  return api.post("/credentials/issue", data);
+};
+
+export const revokeCredential = async (data) => {
+  return api.post("/credentials/revoke", data);
+};
+
+export const getCredential = async (id) => {
+  return api.get(`/credentials/${encodeURIComponent(id)}`);
+};
+
+export const getCredentialProof = async (id) => {
+  return api.get(`/credentials/${encodeURIComponent(id)}/proof`);
+};
+
+// ===== STAKING =====
+
+export const stakeTokens = async (data) => {
+  return api.post("/staking/deposit", data);
+};
+
+export const withdrawStake = async (data) => {
+  return api.post("/staking/withdraw", data);
+};
+
+export const listValidators = async () => {
+  return api.get("/staking/validators");
+};
+
+export const getUnbonding = async (address) => {
+  return api.get(`/staking/unbonding/${encodeURIComponent(address)}`);
+};
+
+// ===== VESTING =====
+
+export const vestTokens = async (data) => {
+  return api.post("/tokens/vest", data);
+};
+
+export const getVesting = async (address) => {
+  return api.get(`/vesting/${encodeURIComponent(address)}`);
+};
+
+// ===== GOVERNANCE =====
+
+export const getGovernance = async () => {
+  return api.get("/governance/config");
+};
+
+export const updateGovernance = async (data) => {
+  return api.post("/governance/config", data);
+};
+
+// ===== SLASHING =====
+
+export const submitSlashEvidence = async (data) => {
+  return api.post("/slashing/evidence", data);
+};
+
+export const listSlashEvidence = async () => {
+  return api.get("/slashing/evidence");
+};
+
+export const submitEquivocation = async (data) => {
+  return api.post("/slashing/equivocation", data);
+};
+
+// ===== FEES =====
+
+export const getFees = async () => {
+  return api.get("/fees");
+};

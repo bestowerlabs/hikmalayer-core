@@ -28,7 +28,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+# ML-DSA-65 for hybrid (hkq) accounts. cryptography gained it in v46;
+# without this the SDK works normally but cannot derive or verify hybrid
+# identities, and says so rather than failing quietly.
+pq = ["cryptography>=46"]
+dev = ["pytest>=7.4", "cryptography>=46"]
 
 [tool.setuptools.packages.find]
 include = ["hikmalayer*"]

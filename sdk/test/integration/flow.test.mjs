@@ -21,6 +21,10 @@ import {
 const URL = process.env.HIKMALAYER_NODE ?? "http://127.0.0.1:3000";
 const ADMIN = process.env.HIKMALAYER_ADMIN_TOKEN ?? "devadmin";
 
+/// The treasury ops/devnet.sh funds at genesis. Fixed, because the devnet
+/// uses fixed keys — see the banner it prints on startup.
+const DEVNET_TREASURY = "hkm13320761030a4c59d96060708e2377bc4e936dee";
+
 const reachable = await fetch(`${URL}/blockchain/stats`)
   .then((r) => r.ok)
   .catch(() => false);
@@ -191,6 +195,25 @@ describe("live chain", { skip: reachable ? false : `no node at ${URL}` }, () => 
   test("an amount past 2^53 survives the whole round trip", async () => {
     // Beyond Number.MAX_SAFE_INTEGER: the case that silently corrupted before.
     const huge = 9_007_199_254_740_993n;
+
+    // This spends ~9 quadrillion base units and never returns them, so a few
+    // consecutive runs against one devnet drain the treasury. Check the
+    // treasury can still cover it and say so plainly if not: the alternative
+    // is an insufficient-balance error that reads like a real failure of the
+    // thing under test.
+    //
+    // Note this is the treasury's own balance, not total_supply — the latter
+    // counts every account on the chain and stays far above the threshold
+    // long after the treasury itself is empty.
+    const treasury = await admin.balance(DEVNET_TREASURY);
+    assert.ok(
+      treasury > huge,
+      `the devnet treasury cannot cover this test: it holds ${treasury} and ` +
+        `the test needs ${huge}. Each run spends this and never returns it, ` +
+        `so a few consecutive runs exhaust it. Restart the devnet — stop the ` +
+        `node, rm -rf .devnet, then ops/devnet.sh`
+    );
+
     const carol = new HikmalayerClient({ url: URL, signer: LocalSigner.random() });
     await admin.faucet({ to: carol.signer.address, amount: huge });
     await settle();

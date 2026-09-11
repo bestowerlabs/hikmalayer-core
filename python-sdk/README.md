@@ -223,6 +223,85 @@ print(out["amount_hkm"], out["amount_token"])
 
 ---
 
+## Hybrid (quantum-ready) accounts
+
+A hybrid account is authorised by two signatures over the same message —
+secp256k1 ECDSA and ML-DSA-65 (FIPS 204). An attacker has to break both to
+forge one transaction.
+Both derive from the one private key you already hold, so there is no second
+secret to back up.
+
+```python
+from hikmalayer import derive_hybrid_identity, pq_available
+
+if pq_available():
+    identity = derive_hybrid_identity(private_key)
+    identity["address"]         # hkq…
+    identity["public_key"]      # 04…  (65 bytes)
+    identity["pq_public_key"]   # …    (1952 bytes)
+```
+
+Needs `cryptography` 46 or later:
+
+```bash
+pip install 'hikmalayer[pq]'
+```
+
+Verification works in full:
+
+```python
+from hikmalayer import verify_hybrid
+
+verify_hybrid(
+    message, address,
+    public_key, signature,
+    pq_public_key, pq_signature,
+)
+```
+
+`verify_hybrid` checks three things: that the address is the one both public
+keys derive to, that the ECDSA signature verifies, and that the ML-DSA
+signature verifies. The address check is what makes the pair binding —
+without it, an attacker who broke secp256k1 could pair the victim's classical
+key with an ML-DSA key of their own and both signatures would still verify.
+
+### Signing hybrid accounts is not supported here
+
+```python
+from hikmalayer import HybridSigningUnavailable
+
+try:
+    client.transfer(to="hkm…", amount=parse_hkm("1"))   # from an hkq account
+except HybridSigningUnavailable as err:
+    print(err)   # explains why, and where to sign instead
+```
+
+The chain signs ML-DSA with FIPS 204's `rnd` parameter pinned to
+`SHA256(domain ‖ seed ‖ message)` rather than fresh randomness. That makes
+signatures reproducible across implementations, and means a broken RNG on the
+signer's machine cannot leak the key.
+
+Reproducing it requires supplying `rnd`, and no Python ML-DSA implementation
+exposes it:
+
+| Library | Why not |
+|---|---|
+| `pyca/cryptography` | `sign(data, context)` and `sign_mu(mu)` — no `rnd` |
+| `dilithium-py` | Author states it is educational and not constant-time |
+| `pqcrypto` | 0.4.0 accepted a tampered ML-DSA-65 message as valid |
+| `liboqs-python` | Upstream documents it as prototypical |
+
+Signing with hedged randomness instead would produce valid signatures the
+chain accepts — but not byte-identical to the CLI, and Python would be the one
+client whose signatures depend on the local RNG. That difference is invisible
+in the API and only shows up when someone's entropy is poor, so this SDK
+raises instead.
+
+**To sign for a hybrid account, use the JavaScript SDK or `hikma-wallet`.**
+Python derives the addresses and verifies the signatures.
+
+---
+
 ## Vesting
 
 Cliff plus linear release, enforced by consensus. Once mined the schedule cannot be altered.

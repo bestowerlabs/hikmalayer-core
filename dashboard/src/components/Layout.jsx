@@ -17,41 +17,48 @@ const Layout = () => {
   const location = useLocation();
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 relative overflow-hidden">
-      <div className="absolute inset-0 overflow-hidden">
-        <div className="absolute -top-40 -right-40 w-80 h-80 bg-blue-500/10 rounded-full blur-3xl animate-pulse"></div>
-        <div
-          className="absolute -bottom-40 -left-40 w-80 h-80 bg-purple-500/10 rounded-full blur-3xl animate-pulse"
-          style={{ animationDelay: "1000ms" }}
-        ></div>
+    <div className="min-h-screen bg-hikma-bg font-body text-hikma-paper relative overflow-hidden">
+      {/* Subtle ember glow, echoing the site's hero without competing with it */}
+      <div className="absolute inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute -top-40 -right-40 w-96 h-96 bg-hikma-ember/5 rounded-full blur-3xl"></div>
+        <div className="absolute -bottom-40 -left-40 w-96 h-96 bg-hikma-ember/5 rounded-full blur-3xl"></div>
       </div>
 
-      <nav className="relative z-20 border-b border-white/10 backdrop-blur-sm">
-        <div className="max-w-7xl mx-auto px-4 md:px-8 flex flex-wrap gap-1 py-3">
-          {NAV_ITEMS.map((item) => {
-            const active = location.pathname === item.path;
-            return (
-              <Link
-                key={item.path}
-                to={item.path}
-                className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
-                  active
-                    ? "bg-blue-500/30 text-white"
-                    : "text-gray-300 hover:bg-white/10 hover:text-white"
-                }`}
-              >
-                {item.label}
-              </Link>
-            );
-          })}
-        </div>
-      </nav>
+      <header className="relative z-20 border-b border-hikma-rule">
+        <div className="max-w-7xl mx-auto px-4 md:px-8 py-4 flex flex-wrap items-center gap-6">
+          <Link to="/" className="flex items-center gap-2.5 group">
+            <img src="/hikma-logo.png" alt="" className="w-8 h-8" />
+            <span className="font-display font-bold text-xl tracking-wide uppercase text-hikma-paper group-hover:text-hikma-ember transition-colors">
+              Hikmalayer
+            </span>
+          </Link>
 
-      <div className="relative z-10 p-4 md:p-8">
+          <nav className="flex flex-wrap gap-1 ml-auto">
+            {NAV_ITEMS.map((item) => {
+              const active = location.pathname === item.path;
+              return (
+                <Link
+                  key={item.path}
+                  to={item.path}
+                  className={`px-3 py-1.5 rounded text-xs font-medium uppercase tracking-wide transition-colors ${
+                    active
+                      ? "bg-hikma-ember/20 text-hikma-ember border border-hikma-ember/40"
+                      : "text-hikma-muted hover:text-hikma-paper hover:bg-white/5"
+                  }`}
+                >
+                  {item.label}
+                </Link>
+              );
+            })}
+          </nav>
+        </div>
+      </header>
+
+      <main className="relative z-10 px-4 md:px-8 py-8">
         <div className="max-w-7xl mx-auto space-y-8">
           <Outlet />
         </div>
-      </div>
+      </main>
     </div>
   );
 };

@@ -6,7 +6,7 @@
 set -u
 
 ADMIN_TOKEN="$(grep '^ADMIN_TOKEN=' /home/hikmalayer/hikmalayer-core/.env | cut -d= -f2-)"
-BLOCK_SECONDS=5
+BLOCK_SECONDS=117
 PORT=3000
 
 if [ -z "$ADMIN_TOKEN" ]; then

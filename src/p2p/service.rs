@@ -3,7 +3,7 @@ use std::time::Duration;
 use reqwest::Client;
 
 use crate::{
-    blockchain::{block::Block, chain::Blockchain},
+    blockchain::{block::Block, chain::Blockchain, chain::ChainHead},
     p2p::protocol::{P2PEnvelope, P2PPayload},
 };
 
@@ -111,6 +111,81 @@ impl P2PService {
         }
 
         false
+    }
+
+    /// Tell a peer we exist, so its gossip reaches us.
+    ///
+    /// Without this a fresh node is invisible: it knows its bootnode from
+    /// configuration, but the bootnode has never heard of it, so no block is
+    /// ever pushed its way. Announcing is what makes the link bidirectional.
+    pub async fn announce_self(&self, peer: &str, our_address: &str) -> bool {
+        let envelope = self.finalize(P2PEnvelope::new(
+            self.node_id.clone(),
+            P2PPayload::PeerAnnounce {
+                address: our_address.to_string(),
+            },
+        ));
+        self.send_once(peer, &envelope).await
+    }
+
+    /// Ask a peer which peers it knows, so the network can grow past the
+    /// bootnodes a node happened to be configured with.
+    pub async fn fetch_peers(&self, peer: &str) -> Option<Vec<String>> {
+        let url = format!("{}/p2p/peers", peer.trim_end_matches('/'));
+        let response = self.authorized(self.client.get(url)).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json::<Vec<String>>().await.ok()
+    }
+
+    /// Where a peer's chain stands, without downloading it.
+    pub async fn fetch_head(&self, peer: &str) -> Option<ChainHead> {
+        let url = format!("{}/p2p/head", peer.trim_end_matches('/'));
+        let response = self.authorized(self.client.get(url)).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json::<ChainHead>().await.ok()
+    }
+
+    /// Fetch a bounded run of blocks starting at an absolute height.
+    ///
+    /// The peer caps the count regardless of what we ask for, so a long
+    /// history arrives as a sequence of bounded responses rather than one
+    /// enormous one.
+    pub async fn fetch_blocks_from(
+        &self,
+        peer: &str,
+        from_height: u64,
+        limit: usize,
+    ) -> Option<Vec<Block>> {
+        let url = format!(
+            "{}/p2p/blocks/{}?limit={}",
+            peer.trim_end_matches('/'),
+            from_height,
+            limit
+        );
+        // Block ranges are much larger than a head poll, so they get their
+        // own, longer timeout rather than the default used for small calls.
+        let response = self
+            .authorized(self.client.get(url))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json::<Vec<Block>>().await.ok()
+    }
+
+    /// Attach the P2P bearer token, when this node has one.
+    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.p2p_token {
+            Some(token) => request.header("x-p2p-token", token),
+            None => request,
+        }
     }
 
     /// Fetch a peer's full chain for fork-choice evaluation.

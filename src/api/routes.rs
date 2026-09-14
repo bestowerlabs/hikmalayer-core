@@ -30,6 +30,19 @@ use crate::{
 };
 
 /// Maximum transactions the node will hold in its pending pool.
+/// Blocks served per sync range request.
+///
+/// A ceiling, not a suggestion: a peer may ask for fewer but never more, so
+/// one caller cannot turn a sync request into a memory-exhaustion request.
+/// 256 blocks is a useful batch without being a large response.
+pub const MAX_SYNC_BATCH: usize = 256;
+
+/// Query parameters for a block-range request.
+#[derive(Debug, Deserialize)]
+struct BlockRangeQuery {
+    limit: Option<usize>,
+}
+
 const MAX_PENDING_TXS: usize = 1_000;
 
 /// Maximum transactions included per block (plus the reward).
@@ -513,7 +526,7 @@ pub struct Metrics {
     pub invalid_from_peers: u64,
 }
 
-async fn persist_state(state: &AppState) -> Result<(), String> {
+pub(crate) async fn persist_state(state: &AppState) -> Result<(), String> {
     let chain = state.chain.lock().await;
     let contracts = state.contracts.lock().await;
     let pending = state.pending_transactions.lock().await;
@@ -784,6 +797,8 @@ pub fn api_routes() -> Router<AppState> {
         .route("/p2p/block", post(receive_block))
         .route("/p2p/blocks", post(receive_blocks))
         .route("/p2p/chain", get(get_p2p_chain))
+        .route("/p2p/head", get(get_p2p_head))
+        .route("/p2p/blocks/{from_height}", get(get_p2p_blocks_from))
         .route("/p2p/peers/scores", get(get_peer_scores))
         .route("/snapshot", get(get_snapshot))
         .route("/checkpoint", get(get_checkpoint))
@@ -1544,7 +1559,7 @@ async fn build_block_off_thread(
 
 /// Remove pending transactions that were included in accepted blocks or can
 /// no longer apply (their nonce was consumed on-chain).
-async fn prune_pending(state: &AppState, accepted: &[Block]) {
+pub(crate) async fn prune_pending(state: &AppState, accepted: &[Block]) {
     let included_ids: HashSet<String> = accepted
         .iter()
         .flat_map(|block| block.transactions.iter())
@@ -2621,6 +2636,46 @@ async fn get_p2p_chain(
     }
     let chain = state.chain.lock().await;
     Ok(Json(chain.clone()))
+}
+
+/// Where this node's chain stands, without sending the chain.
+///
+/// The syncer polls this from every peer on every tick to decide whether it
+/// is behind and whether the peer is even on the same network. Serving the
+/// whole chain for that comparison would make background sync cost more than
+/// the chain it is syncing.
+async fn get_p2p_head(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::blockchain::chain::ChainHead>, StatusCode> {
+    if !authorize_p2p(&headers, &state) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let chain = state.chain.lock().await;
+    Ok(Json(chain.head()))
+}
+
+/// Blocks from an absolute height onward, capped at `MAX_SYNC_BATCH`.
+///
+/// This is what lets a brand-new node reconstruct the full history on its
+/// own: it walks the chain in bounded batches rather than asking for one
+/// JSON document the size of the entire ledger. The cap is ours, not the
+/// caller's — `?limit=` may only ask for *fewer* blocks, never more.
+async fn get_p2p_blocks_from(
+    State(state): State<AppState>,
+    Path(from_height): Path<u64>,
+    Query(params): Query<BlockRangeQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<Block>>, StatusCode> {
+    if !authorize_p2p(&headers, &state) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let limit = params
+        .limit
+        .unwrap_or(MAX_SYNC_BATCH)
+        .clamp(1, MAX_SYNC_BATCH);
+    let chain = state.chain.lock().await;
+    Ok(Json(chain.blocks_from(from_height, limit)))
 }
 
 /// Accept one block from a peer; on a tip mismatch, trigger fork-choice

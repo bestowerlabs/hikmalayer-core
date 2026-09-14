@@ -45,7 +45,7 @@ any other chain's conventions.
 | [HKM, HTS and listings](docs/hts_and_listings.md) | What the token layer is, and honest expectations about exchanges |
 | [Marketing data](docs/Marketing%20Data.md) | Public information pack — plain-language explanations, facts and figures, ready-to-use copy |
 | [API](docs/API.md) · [OpenAPI 3.1](docs/openapi.yaml) · [SDK](sdk/README.md) | Building on it |
-| [Consensus flow](docs/consensus_flow.md) · [Validator lifecycle](docs/validator_lifecycle.md) · [Key management](docs/key_management.md) | Running a validator |
+| [Consensus flow](docs/consensus_flow.md) · [Node sync](docs/node_sync.md) · [Validator lifecycle](docs/validator_lifecycle.md) · [Key management](docs/key_management.md) | Running a validator |
 | [Wallet security](docs/wallet_security.md) · [Deployment](docs/deployment_guide.md) | Operating it |
 | [Mainnet readiness](docs/mainnet_readiness.md) · [External audit guide](docs/external_audit_guide.md) | What remains before launch |
 | [Bridge design](docs/bridge_design.md) | Why there is no bridge |
@@ -114,6 +114,11 @@ Stake decides *who* may produce a block; work decides *that* it was produced.
 - **Slashing.** Equivocation proofs are permissionless and burn the offender's
   stake on chain. Withdrawn stake stays locked and slashable for the unbonding
   period, so misbehaving stake cannot exit ahead of its punishment.
+- **Automatic sync.** A node given one peer address pulls the entire history
+  from genesis on its own, validating every block, and keeps following the tip
+  — so a new validator needs no manual bootstrap and one that falls behind
+  recovers unattended. Sync can only make a node *longer*; only fork choice can
+  make it *different*. See [`docs/node_sync.md`](docs/node_sync.md).
 
 Full detail: [`docs/consensus_flow.md`](docs/consensus_flow.md).
 
@@ -381,6 +386,10 @@ curl -s "$NODE/staking/validators"
 | `VALIDATOR_PRIVATE_KEY` | This node's own validator key. Never a foreign key |
 | `TREASURY_PRIVATE_KEY` | Enables the devnet faucet. Development only |
 | `CORS_ALLOWED_ORIGINS` | Browser origins permitted to call the API |
+| `BOOTNODES` | Comma-separated peer URLs. One is enough — a new node pulls the full history from it automatically |
+| `P2P_PUBLIC_URL` | How peers reach this node, announced so gossip flows both ways. Defaults to `http://{NODE_ID}:{PORT}` |
+| `P2P_SYNC_INTERVAL_SECONDS` | Gap between sync ticks when caught up (default 10) |
+| `P2P_SYNC_DISABLED` | `1` turns automatic sync off — isolated devnets only |
 | `HIKMALAYER_CHECKPOINT` | Boot from a self-verifying checkpoint bundle instead of full replay |
 
 Full deployment guidance: [`docs/deployment_guide.md`](docs/deployment_guide.md).

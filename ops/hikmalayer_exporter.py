@@ -5,10 +5,8 @@ import json
 
 NODES = {
     "bootnode":   "http://bootnode:3000",
-    "validator1": "http://validator1:3000",
-    "validator2": "http://validator2:3000",
-    "validator3": "http://validator3:3000",
-    "validator4": "http://validator4:3000",
+    "validator1": "http://84.32.108.199:3001",
+    "validator2": "http://88.216.210.55:3001",
 }
 
 COUNTER_METRICS = {

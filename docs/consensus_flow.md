@@ -97,7 +97,24 @@ offender's stake on chain. Double-slashing is prevented. Withdrawn stake stays
 locked and slashable for the unbonding period, and the slashing window equals
 it — so misbehaving stake can never exit ahead of its punishment.
 
-## 5. Transport
+## 5. Joining the network
+
+A node given one peer address reconstructs the whole chain by itself:
+
+1. It announces itself to its peers, so their gossip reaches it.
+2. It polls each peer's head — a small summary, not a chain download — and
+   discards any peer whose chain id, root hash or base height differ from its
+   own, since those are different networks.
+3. If a peer is ahead, it downloads blocks in bounded batches and appends them
+   through **the same full validation** a gossiped block gets.
+4. If the peer's history diverges rather than merely extending ours, the fast
+   path stops and fork choice (§3) decides.
+
+That last point is the boundary worth remembering: **sync can only make a node
+longer; only fork choice can make it different.** Full detail, configuration
+and verification steps are in [`node_sync.md`](node_sync.md).
+
+## 6. Transport
 
 Inter-node propagation uses a versioned protocol envelope
 (`POST /p2p/protocol`, `hikmalayer-p2p/1`) with typed payloads (`Ping`,

@@ -158,6 +158,27 @@ pub struct CheckpointRoot {
     pub difficulty: usize,
 }
 
+/// What a peer reports about its chain, without sending the chain.
+///
+/// Deliberately small and derived: a syncing node fetches this from every
+/// peer on every tick, so it has to be cheap to produce and cheap to move.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainHead {
+    /// Network identifier. A mismatch means a different network.
+    pub chain_id: String,
+    /// Hash of `blocks[0]` — genesis, or the checkpoint anchor on a pruned
+    /// node. Together with `base_height` this is the chain's root identity.
+    pub root_hash: String,
+    pub base_height: u64,
+    /// Absolute height of the tip.
+    pub height: u64,
+    pub tip_hash: String,
+    pub finalized_height: u64,
+    /// Cumulative PoW work as a decimal string: it is a `u128`, which JSON
+    /// numbers cannot carry exactly.
+    pub cumulative_work: String,
+}
+
 /// A self-contained fast-sync bundle: the trusted checkpoint anchor plus the
 /// blocks that follow it, and the genesis network parameters (chain identity).
 /// A fresh node can import this and be current without replaying from genesis.
@@ -331,6 +352,50 @@ impl Blockchain {
     /// Absolute height of the current tip.
     pub fn tip_index(&self) -> u64 {
         self.next_index().saturating_sub(1)
+    }
+
+    /// A cheap summary of where this chain stands, for peers deciding
+    /// whether they are behind and whether we are even on their network.
+    ///
+    /// Sync polls this constantly, so it must stay O(1)-ish: pulling the
+    /// whole chain just to compare two heights would make a background
+    /// syncer more expensive than the thing it is syncing.
+    pub fn head(&self) -> ChainHead {
+        ChainHead {
+            chain_id: self.genesis_chain_id.clone(),
+            // Chain identity. Two nodes whose roots differ are on different
+            // networks and must never exchange blocks, so this is checked
+            // before anything is downloaded.
+            root_hash: self
+                .blocks
+                .first()
+                .map(|block| block.hash.clone())
+                .unwrap_or_default(),
+            base_height: self.base_height,
+            height: self.tip_index(),
+            tip_hash: self.latest_hash(),
+            finalized_height: self.finalized_height,
+            cumulative_work: self.cumulative_work().to_string(),
+        }
+    }
+
+    /// Blocks in the absolute height range `[from, from + limit)`, clamped to
+    /// what this node actually holds.
+    ///
+    /// Range requests are what make full-history sync survive a long chain: a
+    /// fresh node walks the chain in bounded pieces instead of asking for a
+    /// single JSON document the size of the entire ledger.
+    pub fn blocks_from(&self, from: u64, limit: usize) -> Vec<Block> {
+        if from < self.base_height {
+            return Vec::new();
+        }
+        let start = (from - self.base_height) as usize;
+        self.blocks
+            .iter()
+            .skip(start)
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     /// Deterministic retarget decision shared by block production and
@@ -1592,6 +1657,112 @@ stake.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
         block.validator_signature =
             Some(pos::sign_block_hash(&block.hash, private_key).unwrap());
         block
+    }
+
+    /// A brand-new node reconstructs the whole history by walking ranges and
+    /// validating each block itself — the path `p2p::sync` drives.
+    ///
+    /// This is the regression test for a node that sat at genesis forever:
+    /// the pieces sync needs (a cheap head, bounded ranges, and append-only
+    /// catch-up through full validation) have to keep working together.
+    #[test]
+    fn a_fresh_chain_rebuilds_full_history_from_block_ranges() {
+        let mut source = Blockchain::default();
+        for _ in 0..12 {
+            mine_valid_block(&mut source);
+        }
+        assert_eq!(source.tip_index(), 12);
+
+        // The syncing node starts from nothing but the same genesis
+        // parameters — exactly what a new validator has.
+        let mut fresh = Blockchain::default();
+        assert_eq!(fresh.tip_index(), 0);
+        assert_eq!(fresh.head().height, 0);
+
+        // Walk the chain in small batches, as a real syncer does, and
+        // validate every block rather than trusting the sender.
+        let batch = 5;
+        loop {
+            let from = fresh.next_index();
+            let blocks = source.blocks_from(from, batch);
+            if blocks.is_empty() {
+                break;
+            }
+            for block in blocks {
+                let post_state = fresh
+                    .validate_block_candidate(&block)
+                    .expect("a block from the canonical chain must validate");
+                fresh.commit_block(block, post_state);
+            }
+        }
+
+        assert_eq!(fresh.tip_index(), source.tip_index());
+        assert_eq!(fresh.latest_hash(), source.latest_hash());
+        // The state root is the real proof: it commits to every balance,
+        // staker and nonce, so matching roots means the node re-executed the
+        // history rather than merely copying blocks.
+        assert_eq!(fresh.state.state_root(), source.state.state_root());
+        assert!(fresh.is_valid());
+    }
+
+    /// A head must describe the chain a peer would have to match, and a range
+    /// must never hand back more than was asked for.
+    #[test]
+    fn a_head_identifies_the_network_and_ranges_stay_bounded() {
+        let mut chain = Blockchain::default();
+        for _ in 0..8 {
+            mine_valid_block(&mut chain);
+        }
+
+        let head = chain.head();
+        assert_eq!(head.chain_id, chain.genesis_chain_id);
+        assert_eq!(head.root_hash, chain.blocks[0].hash);
+        assert_eq!(head.height, chain.tip_index());
+        assert_eq!(head.tip_hash, chain.latest_hash());
+        assert_eq!(head.base_height, chain.base_height);
+        // u128 work cannot survive a JSON number, so it travels as digits.
+        assert_eq!(head.cumulative_work, chain.cumulative_work().to_string());
+
+        assert_eq!(chain.blocks_from(0, 3).len(), 3);
+        assert_eq!(chain.blocks_from(0, 3)[0].index, 0);
+        assert_eq!(chain.blocks_from(5, 100).len(), 4, "clamped to what we hold");
+        assert!(chain.blocks_from(9_999, 10).is_empty(), "past the tip");
+        assert!(chain.blocks_from(0, 0).is_empty(), "a zero limit asks for nothing");
+    }
+
+    /// Sync must never be a way around validation. A tampered block offered
+    /// by a peer has to be refused exactly as a gossiped one would be.
+    #[test]
+    fn a_tampered_block_from_a_peer_is_refused_during_catch_up() {
+        let mut source = Blockchain::default();
+        for _ in 0..4 {
+            mine_valid_block(&mut source);
+        }
+
+        let mut fresh = Blockchain::default();
+        let mut blocks = source.blocks_from(1, 10);
+        // A peer rewrites a block's state root — the commitment to the
+        // result of executing it.
+        blocks[2].state_root = "0".repeat(64);
+
+        let mut applied = 0;
+        let mut refused = false;
+        for block in blocks {
+            match fresh.validate_block_candidate(&block) {
+                Ok(post_state) => {
+                    fresh.commit_block(block, post_state);
+                    applied += 1;
+                }
+                Err(_) => {
+                    refused = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(refused, "a tampered block was accepted during sync");
+        assert_eq!(applied, 2, "only the blocks before the tampered one applied");
+        assert!(fresh.is_valid());
     }
 
     #[test]

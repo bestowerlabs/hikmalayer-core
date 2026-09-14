@@ -52,11 +52,20 @@ validators may always top up.
 
 ## 3. Active validation
 
-The node needs the validator's key to produce blocks:
+The node needs the validator's key to produce blocks, and one peer address to
+find the network:
 
 ```bash
-VALIDATOR_PRIVATE_KEY=<hex> ./hikmalayer
+VALIDATOR_PRIVATE_KEY=<hex> \
+BOOTNODES=http://bootnode:3000 \
+P2P_PUBLIC_URL=http://this-node:3000 \
+  ./hikmalayer
 ```
+
+**Syncing is automatic.** A new validator pulls the entire history from
+genesis on its own, validating every block, and then follows the tip. There is
+no state file to copy and no checkpoint to import by hand; a node that falls
+behind recovers the same way. See [`node_sync.md`](node_sync.md).
 
 It then: waits to be selected, proves the VRF for its slot, mines the block to
 the consensus difficulty, and signs — with both schemes automatically if its

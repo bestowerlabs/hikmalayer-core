@@ -22,6 +22,10 @@ services:
     environment:
       <<: *common-env
       NODE_ID: bootnode
+      # How peers reach this node. Announced to them so gossip flows both
+      # ways; without it a node can still pull history, but nothing pushes
+      # new blocks to it.
+      P2P_PUBLIC_URL: http://bootnode:3000
       VALIDATOR_PRIVATE_KEY: ${BOOTNODE_VALIDATOR_KEY}
       TREASURY_PRIVATE_KEY: ${BOOTNODE_TREASURY_KEY}
     ports:
@@ -34,7 +38,10 @@ services:
     environment:
       <<: *common-env
       NODE_ID: validator1
+      P2P_PUBLIC_URL: http://validator1:3000
       VALIDATOR_PRIVATE_KEY: ${VALIDATOR1_KEY}
+      # A new validator needs nothing but this: it pulls the entire history
+      # from the bootnode on its own and then follows the tip.
       BOOTNODES: http://bootnode:3000
     ports:
       - "3001:3000"
@@ -46,6 +53,7 @@ services:
     environment:
       <<: *common-env
       NODE_ID: validator2
+      P2P_PUBLIC_URL: http://validator2:3000
       VALIDATOR_PRIVATE_KEY: ${VALIDATOR2_KEY}
       BOOTNODES: http://bootnode:3000
     ports:
@@ -58,6 +66,7 @@ services:
     environment:
       <<: *common-env
       NODE_ID: validator3
+      P2P_PUBLIC_URL: http://validator3:3000
       VALIDATOR_PRIVATE_KEY: ${VALIDATOR3_KEY}
       BOOTNODES: http://bootnode:3000
     ports:
@@ -70,6 +79,7 @@ services:
     environment:
       <<: *common-env
       NODE_ID: validator4
+      P2P_PUBLIC_URL: http://validator4:3000
       VALIDATOR_PRIVATE_KEY: ${VALIDATOR4_KEY}
       BOOTNODES: http://bootnode:3000
     ports:
@@ -82,6 +92,7 @@ services:
     environment:
       <<: *common-env
       NODE_ID: rpc
+      P2P_PUBLIC_URL: http://rpc:3000
       BOOTNODES: http://bootnode:3000
     ports:
       - "3010:3000"

@@ -421,6 +421,10 @@ async fn main() {
 
     // Combine API routes with auth routes. Request bodies are capped to
     // bound memory per request.
+    // The syncer holds its own handle to the shared state; every field is an
+    // Arc, so this is a handle to the same chain the router serves.
+    let sync_state = app_state.clone();
+
     let app = api_routes()
         .merge(auth_routes())
         .with_state(app_state)
@@ -431,6 +435,57 @@ async fn main() {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(3000);
+
+    // ---- Automatic chain synchronisation --------------------------------
+    //
+    // Without this a fresh node sits at genesis forever: nothing asked peers
+    // for history, and nothing told peers this node existed, so the one sync
+    // trigger that did exist (a gossiped block that fails to extend the tip)
+    // could never fire. The worker below polls peers, pulls missing history
+    // in bounded batches, and validates every block through the ordinary
+    // consensus path. See `src/p2p/sync.rs`.
+    //
+    // How other nodes reach us. Explicit `P2P_PUBLIC_URL` wins; otherwise we
+    // fall back to the node id as a hostname, which is what a container or
+    // service name gives us in practice. Announcing is an optimisation for
+    // being gossiped TO — pull-based sync works without it, so a node that
+    // cannot name itself still catches up.
+    let announce_address = std::env::var("P2P_PUBLIC_URL")
+        .ok()
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .or_else(|| {
+            let node_id = std::env::var("NODE_ID").ok()?;
+            let node_id = node_id.trim();
+            // Only when the id plausibly resolves as a host: the default
+            // "node-local" and anything with whitespace or a scheme is a
+            // label, not an address, and announcing it would send peers
+            // somewhere that does not answer.
+            let usable = !node_id.is_empty()
+                && node_id != "node-local"
+                && !node_id.contains(char::is_whitespace)
+                && !node_id.contains("://");
+            usable.then(|| format!("http://{}:{}", node_id, port))
+        });
+
+    if hikmalayer::p2p::sync::SyncConfig::disabled_by_env() {
+        println!("⏸️  Automatic chain sync DISABLED (P2P_SYNC_DISABLED).");
+    } else {
+        let sync_config = hikmalayer::p2p::sync::SyncConfig::from_env(announce_address.clone());
+        match &sync_config.announce_address {
+            Some(address) => println!("🔁 Automatic chain sync ON — announcing as {}.", address),
+            None => println!(
+                "🔁 Automatic chain sync ON (pull only — set P2P_PUBLIC_URL so peers can \
+                 gossip to this node)."
+            ),
+        }
+        println!(
+            "   Polling peers every {}s; missing history is pulled in batches of up to {}.",
+            sync_config.interval.as_secs(),
+            sync_config.batch
+        );
+        hikmalayer::p2p::sync::spawn(sync_state, sync_config);
+    }
 
     println!("🚀 Hikmalayer REST API running on http://127.0.0.1:{}", port);
     println!("📋 Available endpoints:");

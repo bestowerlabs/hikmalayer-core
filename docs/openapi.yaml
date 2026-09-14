@@ -220,6 +220,44 @@ components:
         pq_signature: { $ref: "#/components/schemas/PostQuantumSignature" }
       required: [public_key, signature]
 
+    ChainHead:
+      type: object
+      description: |
+        A peer's chain summary. Small by design: it is polled continuously by
+        automatic sync, so producing and moving it must cost far less than the
+        chain it describes.
+      properties:
+        chain_id:
+          type: string
+          description: Network identifier. A mismatch means a different network.
+          examples: ["hikmalayer-mainnet"]
+        root_hash:
+          type: string
+          description: |
+            Hash of `blocks[0]` — genesis, or the checkpoint anchor on a pruned
+            node. With `base_height` this is the chain's root identity, and it
+            must match before any block is exchanged.
+        base_height:
+          type: integer
+          format: int64
+          description: Absolute height of `blocks[0]`; 0 for a genesis-rooted chain.
+        height:
+          type: integer
+          format: int64
+          description: Absolute height of the tip.
+        tip_hash: { type: string }
+        finalized_height:
+          type: integer
+          format: int64
+          description: Below this height, history is irreversible.
+        cumulative_work:
+          type: string
+          pattern: "^[0-9]+$"
+          description: |
+            Total expected PoW work, as decimal digits. A string because it is
+            a `u128`, which a JSON number cannot carry exactly.
+      required: [chain_id, root_hash, base_height, height, tip_hash]
+
     ApiResponse:
       type: object
       description: |
@@ -1158,5 +1196,68 @@ paths:
       operationId: getP2pChain
       tags: [P2P]
       summary: This node's chain, for peer comparison
+      description: |
+        The whole chain in one response. Used as the fork-choice fallback when
+        a peer's history diverges from ours; routine catch-up uses
+        `/p2p/head` and `/p2p/blocks/{from_height}` instead, which is far
+        cheaper.
       security: [{ p2pToken: [] }]
       responses: { "200": { description: OK } }
+
+  /p2p/head:
+    get:
+      operationId: getP2pHead
+      tags: [P2P]
+      summary: Where this node's chain stands, without sending the chain
+      description: |
+        Everything a peer needs to decide whether it is behind, and whether
+        this node is even on its network — without downloading anything.
+
+        Automatic sync polls this from every peer on every tick, so it is
+        deliberately small. A peer whose `chain_id`, `root_hash` or
+        `base_height` differ is on a different network and is ignored.
+      security: [{ p2pToken: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChainHead" }
+        "401": { description: Missing or invalid P2P token }
+
+  /p2p/blocks/{from_height}:
+    get:
+      operationId: getP2pBlocksFrom
+      tags: [P2P]
+      summary: Blocks from an absolute height, in a bounded batch
+      description: |
+        Lets a node reconstruct history in pieces instead of asking for one
+        JSON document the size of the whole ledger. A brand-new node walks the
+        chain with repeated calls to this endpoint, validating every block
+        itself as it goes.
+
+        **The cap is the server's.** `limit` may only ask for *fewer* than 256
+        blocks, never more, so one caller cannot turn a range request into a
+        memory-exhaustion request. The response is clamped to the blocks this
+        node actually holds and is empty past its tip.
+      security: [{ p2pToken: [] }]
+      parameters:
+        - name: from_height
+          in: path
+          required: true
+          description: Absolute height of the first block wanted.
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: limit
+          in: query
+          required: false
+          description: Blocks wanted, clamped to 1–256.
+          schema: { type: integer, minimum: 1, maximum: 256, default: 256 }
+      responses:
+        "200":
+          description: Blocks in ascending height order; empty past the tip.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: object }
+        "401": { description: Missing or invalid P2P token }

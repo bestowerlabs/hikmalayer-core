@@ -2,3 +2,8 @@
 node.hikmalayer.com {
      reverse_proxy bootnode:3000
 }
+
+dashboard.hikmalayer.com {
+     root * /srv/dashboard
+     file_server
+}

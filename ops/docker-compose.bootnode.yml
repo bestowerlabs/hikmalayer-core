@@ -13,7 +13,12 @@ services:
       ADMIN_TOKEN: ${ADMIN_TOKEN}
       P2P_ALLOWLIST: ${P2P_ALLOWLIST}
       P2P_REQUIRE_IDENTITY: "true"
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
+      GENESIS_CHAIN_ID: ${GENESIS_CHAIN_ID}
       RUST_LOG: info
+      HIKMALAYER_STATE_PATH: /app/data/state.json
+    volumes:
+      - /home/hikmalayer/hikmalayer-core/data:/app/data
     ports:
       - "3000:3000"
     restart: unless-stopped
@@ -60,6 +65,7 @@ services:
       - "80:80"
     volumes:
       - /home/hikmalayer/hikmalayer-core/ops/caddy/Caddyfile.mainnet:/etc/caddy/Caddyfile:ro
+      - /home/hikmalayer/hikmalayer-core/dashboard/dist:/srv/dashboard:ro
       - caddy_data:/data
     depends_on:
       - bootnode

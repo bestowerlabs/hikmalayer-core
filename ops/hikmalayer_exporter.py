@@ -24,6 +24,11 @@ COUNTER_METRICS = {
     "protocol_messages_rejected": "Total P2P messages rejected",
     "invalid_from_peers":         "Total invalid messages from peers",
 }
+# Remembers each token's total_supply from the previous poll, so we can
+# detect a drop (a burn) between one scrape and the next. This lives in
+# the exporter's own process memory — it resets if the exporter restarts,
+# which only means one missed comparison, not a wrong one.
+_last_seen_supply = {}
 
 class MetricsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -66,16 +71,37 @@ class MetricsHandler(BaseHTTPRequestHandler):
                 output.append(f'hikmalayer_chain_valid{{node="{node}"}} {chain_valid}')
             except Exception as e:
                 output.append(f"# ERROR scraping {node} overview: {e}")
-
+                 # Burn detection: compare each token's total_supply against what we
+        # saw last poll. A drop means units were burned since then. This is
+        # deliberately external to the chain's own consensus code — it
+        # observes public API output only, so it can never affect what the
+        # chain considers valid.
+        try:
+            with urllib.request.urlopen(f"{list(NODES.values())[0]}/assets", timeout=3) as r:
+                assets = json.loads(r.read())
+            total_burned_since_start = 0
+            for asset in assets:
+                token_id = asset.get("token_id")
+                supply = asset.get("total_supply", 0)
+                previous = _last_seen_supply.get(token_id)
+                if previous is not None and supply < previous:
+                    burned_this_poll = previous - supply
+                    output.append(f"# HELP hikmalayer_token_burn_detected A burn was detected this poll for this token")
+                    output.append(f"# TYPE hikmalayer_token_burn_detected gauge")
+                    output.append(f'hikmalayer_token_burn_detected{{token_id="{token_id}"}} {burned_this_poll}')
+                _last_seen_supply[token_id] = supply
+        except Exception as e:
+            output.append(f"# ERROR scraping /assets for burn detection: {e}")   
         body = "\n".join(output) + "\n"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; version=0.0.4")
         self.end_headers()
         self.wfile.write(body.encode())
-
+    
     def log_message(self, format, *args):
         pass
 
 if __name__ == "__main__":
     print("Hikmalayer Prometheus exporter running on :8000")
     HTTPServer(("0.0.0.0", 8000), MetricsHandler).serve_forever()
+  

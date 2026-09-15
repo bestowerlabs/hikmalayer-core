@@ -405,3 +405,53 @@ groups:
           description: "Over 100 transactions per minute. Possible mempool DoS attack."
         labels:
           severity: warning
+
+      - uid: hkm-large-burn
+        title: "Large or Unusual Token Burn Detected"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: sum by(token_id) (hikmalayer_token_burn_detected)
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings:
+                mode: dropNN
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [0]
+                    type: gt
+                  query:
+                    params: [B]
+        noDataState: OK
+        execErrState: OK
+        for: 0s
+        annotations:
+          summary: "A token burn was detected"
+          description: "hikmalayer_token_burn_detected fired for at least one token in the last 5 minutes. Detected externally by the exporter polling GET /assets, not by the chain itself — investigate the specific token_id and amount."
+        labels:
+          severity: warning

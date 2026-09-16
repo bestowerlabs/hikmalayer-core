@@ -1508,8 +1508,13 @@ fn plan_block(
         );
         included_ids.push(tx.id.clone());
     }
-
-    let reward = Transaction::new_reward(&validator, next_index);
+    
+    let reward_recipient = chain
+        .state
+        .founder_treasury
+        .clone()
+        .unwrap_or_else(|| validator.clone());
+    let reward = Transaction::new_reward(&reward_recipient, next_index);
     post_state
         .apply_verified(&reward, next_index)
         .map_err(|err| format!("Failed to apply reward: {}", err))?;

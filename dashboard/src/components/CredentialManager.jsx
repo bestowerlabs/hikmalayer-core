@@ -1,5 +1,4 @@
 import React, { useState } from "react";
-import { useWallet } from "../hooks/useWallet";
 import { useActiveSigner } from "../hooks/useActiveSigner";
 import { getAccountNonce, issueCredential, revokeCredential, getCredential, getCredentialProof } from "../api";
 import { getActiveChainId, scoped } from "../lib/hts";
@@ -9,7 +8,6 @@ import { getActiveChainId, scoped } from "../lib/hts";
 /// can be revoked by its issuer. Issuing and revoking are signed
 /// transactions from the connected wallet, same pattern as staking.
 const CredentialManager = () => {
-  const { account } = useWallet();
   const { canSign, authorize } = useActiveSigner();
 
   const [issueForm, setIssueForm] = useState({ id: "", subject: "", claim: "" });
@@ -154,7 +152,7 @@ const CredentialManager = () => {
             />
             <button
               type="submit"
-              disabled={busy || !account}
+              disabled={busy || !account || !canSign}
               className="w-full px-4 py-2 rounded-lg bg-gradient-to-r from-rose-500 to-pink-600 text-white text-sm font-medium hover:from-rose-400 hover:to-pink-500 transition disabled:opacity-40"
             >
               {busy ? "Issuing…" : "Issue"}
@@ -206,7 +204,7 @@ const CredentialManager = () => {
               ))}
               <button
                 onClick={() => revoke(credential.id ?? lookupId)}
-                disabled={!account}
+                disabled={!account || !canSign}
                 className="mt-2 px-3 py-1.5 rounded-lg bg-red-500/20 border border-red-500/40 text-red-300 text-xs font-medium hover:bg-red-500/30 transition disabled:opacity-40"
               >
                 Revoke

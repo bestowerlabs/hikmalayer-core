@@ -1508,12 +1508,12 @@ fn plan_block(
         );
         included_ids.push(tx.id.clone());
     }
-    
-    let reward_recipient = chain
-        .state
-        .founder_treasury
-        .clone()
-        .unwrap_or_else(|| validator.clone());
+  
+    let reward_recipient = if chain.genesis_treasury.is_empty() {
+        validator.clone()
+    } else {
+        chain.genesis_treasury.clone()
+    };
     let reward = Transaction::new_reward(&reward_recipient, next_index);
     post_state
         .apply_verified(&reward, next_index)

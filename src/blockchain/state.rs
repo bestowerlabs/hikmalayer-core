@@ -270,15 +270,7 @@ pub struct ChainState {
     /// field, including this one before the field was added.
     #[serde(default)]
     pub protocol_treasury: Option<String>,  
-    /// Founder/Company Treasury address — the fixed recipient of the
-    /// founder-side half of every block reward, regardless of which
-    /// validator actually produces the block. Stored here (not just used
-    /// transiently at genesis) so plan_block() can look it up when
-    /// constructing a Reward transaction. `None` means no explicit
-    /// treasury was configured, preserving old single-recipient behaviour
-    /// for any chain that predates this field.
-    #[serde(default)]
-    pub founder_treasury: Option<String>,
+    
     /// Cumulative HKM minted toward the Founder Treasury via block rewards,
     /// separate from its fixed genesis allocation. Tracked independently so
     /// this side's mining ceiling can be reached and stop without affecting
@@ -358,7 +350,6 @@ impl ChainState {
             validator_allowlist: validator_allowlist.iter().cloned().collect(),
             chain_id: chain_id.to_string(),
             protocol_treasury: protocol_treasury_address.map(|s| s.to_string()),
-            founder_treasury: Some(treasury_address.to_string()),
             ..Default::default()
         };
         // Genesis allocation: when a Protocol/Ecosystem Treasury is

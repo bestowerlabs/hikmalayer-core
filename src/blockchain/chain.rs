@@ -623,6 +623,7 @@ impl Blockchain {
         parent_randomness: &str,
         parent_timestamp: DateTime<Utc>,
         expected_difficulty: usize,
+        genesis_treasury: &str,
     ) -> Result<ChainState, BlockError> {
         if block.index != expected_index {
             return Err(BlockError::structural(
@@ -787,7 +788,12 @@ impl Blockchain {
         for tx_str in &block.transactions {
             let tx: Transaction = serde_json::from_str(tx_str)
                 .map_err(|_| BlockError::slashable("Block contains malformed transaction"))?;
-            tx.verify_for_block(validator)
+        let expected_reward_recipient = if genesis_treasury.is_empty() {
+                validator
+            } else {
+                genesis_treasury
+            };
+            tx.verify_for_block(expected_reward_recipient)
                 .map_err(BlockError::slashable)?;
             // Verified immediately above, so use the already-verified path
             // rather than checking every signature twice per block.
@@ -847,6 +853,7 @@ impl Blockchain {
             &self.randomness,
             parent_timestamp,
             self.current_difficulty,
+            &self.genesis_treasury,
         )
         .map_err(|err| err.reason)
     }
@@ -968,6 +975,7 @@ impl Blockchain {
                 &randomness,
                 previous.timestamp,
                 difficulty,
+                &self.genesis_treasury,
             )
             .map_err(|error| (i, error))?;
             randomness = vrf::next_randomness(
@@ -1303,7 +1311,12 @@ mod tests {
             post.apply_verified(tx, next_height)?;
             txs.push(serde_json::to_string(tx).unwrap());
         }
-        let reward = Transaction::new_reward(&validator, next_height);
+        let reward_recipient = if chain.genesis_treasury.is_empty() {
+            validator.clone()
+        } else {
+            chain.genesis_treasury.clone()
+        };
+        let reward = Transaction::new_reward(&reward_recipient, next_height);
         post.apply_transaction(&reward, next_height)?;
         txs.push(serde_json::to_string(&reward).unwrap());
         post.end_block(next_height, &validator);
@@ -1338,6 +1351,88 @@ mod tests {
         mine_block_with(chain, Vec::new()).expect("block should be valid");
     }
 
+    #[test]
+    fn block_reward_pays_the_genesis_treasury_not_whichever_validator_mines() {
+        // Regression test: on 16 September 2026, a live deploy paid the
+        // block reward's founder-side half to whichever validator actually
+        // produced the block, rather than always to the genesis treasury --
+        // invisible for months because the only miner (the bootnode) WAS
+        // the treasury, until a second, genuinely different validator
+        // started mining and kept the reward for itself.
+        let mut chain = Blockchain::default();
+        let (t_addr, t_pub, t_key) = treasury();
+        assert_eq!(
+            chain.genesis_treasury, t_addr,
+            "test setup assumption: default chain's treasury is the well-known dev treasury"
+        );
+
+        // Stake a SEPARATE wallet -- genuinely distinct from the treasury --
+        // so it can be selected to mine.
+        let (m_addr, m_pub, m_key) = wallet(7);
+        let stake_amount = crate::blockchain::state::MIN_VALIDATOR_STAKE * 4;
+        let fund = signed_transfer((&t_addr, &t_pub, &t_key), &m_addr, stake_amount * 2, 1);
+        mine_block_with(&mut chain, vec![fund]).unwrap();
+
+        let m_vrf = vrf::derive_vrf_public_key(&m_key).unwrap();
+        let mut stake = test_tx(
+            Some(m_addr.clone()),
+            STAKING_POOL_ACCOUNT.to_string(),
+            stake_amount,
+            TransactionType::Stake,
+        );
+        stake.nonce = 1;
+        stake.public_key = Some(m_pub);
+        stake.vrf_public_key = Some(m_vrf.clone());
+        let chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID;
+        let stake_message = Transaction::scoped_signing_message(
+            chain_id,
+            &Transaction::stake_signing_message(&m_addr, stake_amount, 1, &m_vrf),
+        );
+        stake.signature = Some(pos::sign_message(&stake_message, &m_key).unwrap());
+        mine_block_with(&mut chain, vec![stake]).unwrap();
+
+        let treasury_balance_before = chain.state.balance_of(&t_addr);
+
+        // Force the separately-staked wallet to be the one that mines, by
+        // exiting the treasury's own stake first so it cannot be selected.
+        let treasury_stake = chain.state.stakers[&t_addr].stake;
+        let mut exit = test_tx(
+            Some(t_addr.clone()),
+            t_addr.clone(),
+            treasury_stake,
+            TransactionType::Withdraw,
+        );
+        let exit_nonce = chain.state.nonces.get(&t_addr).copied().unwrap_or(0) + 1;
+        exit.nonce = exit_nonce;
+        let exit_message = Transaction::scoped_signing_message(
+            chain_id,
+            &Transaction::withdraw_signing_message(&t_addr, treasury_stake, exit_nonce),
+        );
+        exit.signature = Some(pos::sign_message(&exit_message, &t_key).unwrap());
+        mine_block_with(&mut chain, vec![exit]).unwrap();
+
+        // Mine one more block -- the wallet, not the treasury, must be the
+        // one producing it now.
+        mine_block_with(&mut chain, vec![]).unwrap();
+        let last_block = chain.blocks.last().unwrap();
+        assert_eq!(
+            last_block.validator.as_deref(),
+            Some(m_addr.as_str()),
+            "test setup assumption: the separately-staked wallet mined this block, not the treasury"
+        );
+
+        let treasury_balance_after = chain.state.balance_of(&t_addr);
+        let miner_balance = chain.state.balance_of(&m_addr);
+
+        assert!(
+            treasury_balance_after > treasury_balance_before,
+            "the treasury must receive its share of the reward even though it did not mine this block"
+        );
+        assert_eq!(
+            miner_balance, stake_amount * 2 - stake_amount - 1000,
+            "the mining wallet must receive NOTHING from the reward -- only its own pre-existing balance minus the stake and fee"
+        );
+    }
     fn signed_transfer(
         from: (&str, &str, &str), // address, public_key, private_key
         to: &str,
@@ -1635,7 +1730,12 @@ stake.chain_id = crate::blockchain::state::DEFAULT_CHAIN_ID.to_string();
     ) -> Block {
         let height = chain.next_index();
         let mut post = chain.state.clone();
-        let reward = Transaction::new_reward(validator, height);
+        let reward_recipient = if chain.genesis_treasury.is_empty() {
+            validator
+        } else {
+            chain.genesis_treasury.as_str()
+        };
+        let reward = Transaction::new_reward(reward_recipient, height);
         post.apply_transaction(&reward, height).unwrap();
         post.end_block(height, validator);
         let public_key = chain.state.stakers.get(validator).unwrap().public_key.clone();

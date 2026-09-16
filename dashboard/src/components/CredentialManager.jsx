@@ -8,7 +8,7 @@ import { getActiveChainId, scoped } from "../lib/hts";
 /// can be revoked by its issuer. Issuing and revoking are signed
 /// transactions from the connected wallet, same pattern as staking.
 const CredentialManager = () => {
-  const { canSign, authorize } = useActiveSigner();
+  const { canSign, authorize, account } = useActiveSigner();
 
   const [issueForm, setIssueForm] = useState({ id: "", subject: "", claim: "" });
   const [lookupId, setLookupId] = useState("");
